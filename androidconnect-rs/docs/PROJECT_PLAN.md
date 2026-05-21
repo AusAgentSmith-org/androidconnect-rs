@@ -2,9 +2,11 @@
 
 ## Product Goal
 
-Build a Rust-first alternative for Android to desktop mirroring with input control.
+Build an open, local-first, Rust-based Android screen mirroring and desktop control stack for non-rooted Android devices.
 
 The product should let a user launch the Android app, approve screen capture and input permissions, connect from a desktop app on the same LAN, view the Android display in real time, and control the Android device with desktop mouse and keyboard input.
+
+This is not a Phone Link clone and not a KDE Connect port. The target is broad Android compatibility, a permissive MIT/Apache-2.0 licence, and no dependency on Windows, Microsoft accounts, or GPL boundaries. See `docs/FEATURE_POSITIONING.md` for the full product thesis and feature-slice roadmap.
 
 ## MVP 1 Scope
 
@@ -43,16 +45,24 @@ Implemented:
 - Android shell at `apps/android`.
 - Android `MediaProjection` foreground service and H.264 encoder (working, validated).
 - Android to desktop TCP transport — `DeviceHello`, `VideoFormat`, `VideoFrame` streaming end-to-end.
-- Android accessibility service with tap, drag, and global action helpers.
+- Desktop to Android input transport over the existing TCP connection for MVP validation.
+- Ephemeral pairing-code challenge/response using HMAC-SHA256. Android ignores desktop input until
+  pairing succeeds.
+- Android accessibility service with tap, drag, scroll, basic text edit, and global action helpers.
+- Desktop coordinate mapping from letterboxed window pixels to Android frame pixels.
+- Desktop window-title status for listening, connected, paired, video format, disconnected, and
+  error states.
+- Android status text for capture, desktop connection, pairing, input service, counters, and last
+  error.
 - Gradle wrapper added to `apps/android` (copied from kdeconnect-android reference tree).
 
 Not implemented yet:
 
-- Desktop input capture and return transport.
-- Android inbound input dispatch from Rust/network to Java accessibility APIs.
-- Pairing and session authentication.
+- End-to-end input validation on a physical Android device (emulator pass does not substitute).
+- Persistent paired desktop identity, durable trust state, and encrypted/authenticated session
+  transport. The current pairing-code gate is not the final security model.
+- Reconnect/session recovery and clear connection status reporting.
 - Rotation/resolution renegotiation beyond initial format metadata.
-- Physical device validation (emulator only so far).
 
 ## Architecture
 
@@ -71,10 +81,11 @@ Android video pipeline
   VirtualDisplay -> MediaCodec H.264 encoder -> JNI -> Rust protocol sender
 
 Android input pipeline
-  Rust inbound input receiver -> Java dispatch bridge -> AccessibilityService / IME
+  Rust inbound input receiver -> Java dispatch bridge -> AccessibilityService
 
 Shared Rust protocol
   DeviceHello
+  AuthChallenge / AuthResponse / AuthResult
   VideoFormat
   VideoFrame
   InputEvent
@@ -113,15 +124,19 @@ Transport:
 Input:
 
 - Accessibility is the MVP input mechanism because it works without root.
-- Pointer down/up/move should be accumulated into tap or drag gestures on Android.
-- Scroll should map to accessibility scroll actions against the active window.
-- Text input should use an Android IME service once basic pointer control is proven.
+- Pointer down/up/move is accumulated into tap or drag gestures on Android.
+- Scroll maps to accessibility scroll actions against the active window.
+- Text input currently uses accessibility `ACTION_SET_TEXT` and should move to an Android IME service
+  before MVP polish for reliable cursor, selection, and composition behavior.
+- The detailed input reference and QA checklist live in `docs/INPUT_CONTROL.md`.
 
 Pairing and security:
 
-- MVP can start with a manual pairing code displayed by Android and entered on desktop.
-- A paired session should derive a shared session key before accepting input.
-- Unauthenticated input packets must be ignored.
+- MVP starts with a manual pairing code printed by the desktop and entered on Android.
+- The current implementation uses an HMAC-SHA256 challenge/response and ignores input until Android
+  verifies that proof.
+- A persistent paired session should still store trusted desktop identity and derive per-session keys.
+- Unauthenticated input packets must continue to be ignored.
 - LAN discovery must not imply trust.
 
 ## Milestones
@@ -159,7 +174,7 @@ Tasks:
 - Add Android UI fields for desktop host and port. Done.
 - Add connection status and error reporting to Android UI. Partial.
 - Add desktop receiver validation for protocol version and capabilities. Partial.
-- Validate the path on a physical Android device. Done (emulator).
+- Validate the path on a physical Android device. Emulator only — physical device validation pending.
 
 Known fixes applied during validation:
 
@@ -198,40 +213,54 @@ Exit criteria:
 
 Goal: control Android from the desktop window.
 
+Status: **implemented, pending device validation**. Desktop captures pointer, wheel, text, and
+navigation shortcuts; Android receives `InputEvent` messages over the current TCP stream after
+pairing authentication and dispatches them through `RemoteControlAccessibilityService`.
+
 Tasks:
 
-- Capture mouse position, button, drag, wheel, and keyboard events in desktop app.
-- Convert desktop coordinates to Android display coordinates.
-- Send `InputEvent` messages over reliable control transport.
-- Add Rust inbound input receiver on Android.
-- Add Java dispatch bridge from native input events to `RemoteControlAccessibilityService`.
-- Add basic keyboard text input.
-- Add back/home/recents shortcuts in desktop app.
+- Capture mouse position, button, drag, wheel, and keyboard events in desktop app. Done.
+- Convert desktop coordinates to Android display coordinates. Done.
+- Send `InputEvent` messages over reliable control transport. Done over the existing TCP connection.
+- Add Rust inbound input receiver on Android. Done.
+- Add Java dispatch bridge from native input events to `RemoteControlAccessibilityService`. Done.
+- Add basic keyboard text input. Partial — accessibility `ACTION_SET_TEXT`, IME deferred.
+- Add back/home/recents shortcuts in desktop app. Done.
+- Validate on emulator and physical Android device. Pending.
 
 Exit criteria:
 
-- Desktop click taps Android at the correct location.
-- Desktop drag performs Android drag/swipe.
-- Desktop wheel scrolls the active Android content where accessibility permits it.
-- Desktop keyboard can enter text into a focused Android field.
-- Back/home/recents work from desktop controls.
+- Desktop click taps Android at the correct location. Pending validation.
+- Desktop drag performs Android drag/swipe. Pending validation.
+- Desktop wheel scrolls the active Android content where accessibility permits it. Pending validation.
+- Desktop keyboard can enter text into a focused Android field. Pending validation.
+- Back/home/recents work from desktop controls. Pending validation.
 
 ### M4: Pairing, Trust, And Session Recovery
 
 Goal: make the MVP safe enough for repeated local use.
 
+Status: **partial**. Ephemeral pairing-code authentication gates input for each connection. Durable
+paired identity storage, per-session keys, encrypted transport, and reconnect recovery are not
+implemented yet.
+
 Tasks:
 
-- Add manual pairing code flow.
+- Add manual pairing code flow. Partial — desktop prints a code; Android enters it.
 - Store paired desktop identity on Android.
-- Authenticate each session before accepting video or input traffic.
+- Authenticate each session before accepting video or input traffic. Partial — input is gated;
+  video remains available during pairing.
 - Add heartbeat and reconnect behavior.
-- Stop input processing immediately when a session is unauthenticated or disconnected.
-- Add visible Android status for connected desktop identity.
+- Stop input processing immediately when a session is unauthenticated or disconnected. Done for the
+  current connection.
+- Add visible Android status for connected desktop identity. Partial — current status shows address
+  and pairing state; persisted desktop identity is pending.
+- Add desktop status line for connected/disconnected/authenticated state. Done in the window title.
 
 Exit criteria:
 
-- Unknown clients cannot send input.
+- Unknown clients cannot send input. Partial — true for the current pairing-code gate; persistent
+  trust is pending.
 - Previously paired desktop can reconnect without repeating full setup.
 - Revoking permissions or dropping the network produces clear user-visible state.
 
@@ -301,33 +330,41 @@ Android device variance:
 
 ## Suggested Implementation Order
 
-1. Wire Android native sender to desktop receiver over TCP.
-2. Prove real-device frame delivery with logs.
-3. Add desktop decode/render for H.264.
-4. Add desktop-to-Android input transport.
-5. Add Android input dispatch bridge.
-6. Add pairing/authentication.
-7. Replace or extend TCP transport with QUIC.
-8. Add QA scripts and polish.
+1. Wire Android native sender to desktop receiver over TCP. ✓
+2. Prove real-device frame delivery with logs. ✓ (emulator)
+3. Add desktop decode/render for H.264. ✓
+4. Add desktop-to-Android input transport. ✓
+5. Add Android input dispatch bridge. ✓
+6. Add ephemeral pairing-code input authentication. ✓
+7. Validate input end-to-end on a physical Android device.
+8. Persist paired desktop identity and derive per-session keys.
+9. Add reconnect/session recovery.
+10. Add rotation/resolution renegotiation.
+11. Replace accessibility text with IME-backed input path.
+12. Replace or extend TCP transport with QUIC.
+13. Add QA scripts and polish.
 
-This order keeps the highest-risk pipeline visible early: capture, network delivery, decode, render, and input.
+Input authentication comes before QUIC because unauthenticated input is the higher-risk exposure on
+LAN. QUIC and persistent session keys are still needed before public testing.
 
 ## Target Manual QA Script
 
 1. Install Android debug APK on a physical Android device.
 2. Start desktop app on the same LAN.
-3. Start Android app and connect to desktop host.
-4. Grant screen capture.
-5. Enable accessibility service.
-6. Confirm desktop receives `DeviceHello`, `VideoFormat`, and frames.
-7. Confirm desktop renders live screen.
-8. Rotate Android device and confirm desktop updates.
-9. Click an Android button from desktop.
+3. Start Android app, enter the desktop host and pairing code, then connect to desktop.
+4. Confirm desktop logs pairing success.
+5. Grant screen capture.
+6. Enable accessibility service.
+7. Confirm desktop receives `DeviceHello`, `VideoFormat`, and frames.
+8. Confirm desktop renders live screen.
+9. Click an Android button from desktop and confirm the tap coordinate.
 10. Drag across a scrollable list.
-11. Type into a text field.
-12. Trigger back, home, and recents.
-13. Stop mirroring from Android notification.
-14. Restart mirroring and reconnect.
+11. Use wheel or touchpad scroll over scrollable content.
+12. Type into a focused text field, including Backspace, Delete, Enter, and Tab.
+13. Trigger Back, Home, Recents, and Lock from desktop controls.
+14. Rotate Android device and confirm the desktop video path remains usable.
+15. Stop mirroring from Android notification.
+16. Restart mirroring and reconnect.
 
 ## Open Questions
 

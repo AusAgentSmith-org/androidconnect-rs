@@ -4,11 +4,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const DEFAULT_CONTROL_PORT: u16 = 48172;
 pub const DEFAULT_VIDEO_PORT: u16 = 48173;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 256 * 1024;
 pub const MAX_VIDEO_FRAME_BYTES: usize = 32 * 1024 * 1024;
+pub const AUTH_CHALLENGE_BYTES: usize = 32;
+pub const AUTH_RESPONSE_BYTES: usize = 32;
+const AUTH_CONTEXT: &[u8] = b"AndroidConnect pairing v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Envelope {
@@ -38,6 +41,9 @@ pub enum Payload {
     Ping { nonce: u64 },
     Pong { nonce: u64 },
     Error { message: String },
+    AuthChallenge(AuthChallenge),
+    AuthResponse(AuthResponse),
+    AuthResult(AuthResult),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,6 +184,22 @@ pub enum SystemAction {
     LockScreen,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthChallenge {
+    pub challenge: [u8; AUTH_CHALLENGE_BYTES],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthResponse {
+    pub response: [u8; AUTH_RESPONSE_BYTES],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthResult {
+    pub accepted: bool,
+    pub message: String,
+}
+
 #[derive(Debug, Error)]
 pub enum WireError {
     #[error("codec error: {0}")]
@@ -237,11 +259,172 @@ pub fn video_flags_from_android_media_codec(flags: i32) -> VideoFrameFlags {
     }
 }
 
+pub fn normalize_pairing_code(code: &str) -> String {
+    code.chars()
+        .filter(|ch| !ch.is_whitespace())
+        .flat_map(|ch| ch.to_uppercase())
+        .collect()
+}
+
+pub fn pairing_auth_response(
+    pairing_code: &str,
+    challenge: &[u8; AUTH_CHALLENGE_BYTES],
+) -> [u8; AUTH_RESPONSE_BYTES] {
+    let normalized = normalize_pairing_code(pairing_code);
+    let mut message = Vec::with_capacity(AUTH_CONTEXT.len() + challenge.len());
+    message.extend_from_slice(AUTH_CONTEXT);
+    message.extend_from_slice(challenge);
+    hmac_sha256(normalized.as_bytes(), &message)
+}
+
+pub fn auth_responses_equal(
+    expected: &[u8; AUTH_RESPONSE_BYTES],
+    actual: &[u8; AUTH_RESPONSE_BYTES],
+) -> bool {
+    let mut diff = 0_u8;
+    for (left, right) in expected.iter().zip(actual.iter()) {
+        diff |= left ^ right;
+    }
+    diff == 0
+}
+
 fn now_micros() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_micros() as u64)
         .unwrap_or_default()
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; AUTH_RESPONSE_BYTES] {
+    const BLOCK_BYTES: usize = 64;
+
+    let mut key_block = [0_u8; BLOCK_BYTES];
+    if key.len() > BLOCK_BYTES {
+        key_block[..AUTH_RESPONSE_BYTES].copy_from_slice(&sha256(key));
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut inner_pad = [0x36_u8; BLOCK_BYTES];
+    let mut outer_pad = [0x5c_u8; BLOCK_BYTES];
+    for index in 0..BLOCK_BYTES {
+        inner_pad[index] ^= key_block[index];
+        outer_pad[index] ^= key_block[index];
+    }
+
+    let mut inner = Vec::with_capacity(BLOCK_BYTES + data.len());
+    inner.extend_from_slice(&inner_pad);
+    inner.extend_from_slice(data);
+    let inner_hash = sha256(&inner);
+
+    let mut outer = Vec::with_capacity(BLOCK_BYTES + inner_hash.len());
+    outer.extend_from_slice(&outer_pad);
+    outer.extend_from_slice(&inner_hash);
+    sha256(&outer)
+}
+
+fn sha256(input: &[u8]) -> [u8; AUTH_RESPONSE_BYTES] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+
+    let mut h0 = 0x6a09e667_u32;
+    let mut h1 = 0xbb67ae85_u32;
+    let mut h2 = 0x3c6ef372_u32;
+    let mut h3 = 0xa54ff53a_u32;
+    let mut h4 = 0x510e527f_u32;
+    let mut h5 = 0x9b05688c_u32;
+    let mut h6 = 0x1f83d9ab_u32;
+    let mut h7 = 0x5be0cd19_u32;
+
+    let bit_len = (input.len() as u64).wrapping_mul(8);
+    let mut padded = Vec::with_capacity(input.len() + 72);
+    padded.extend_from_slice(input);
+    padded.push(0x80);
+    while (padded.len() + 8) % 64 != 0 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in padded.chunks_exact(64) {
+        let mut w = [0_u32; 64];
+        for index in 0..16 {
+            let offset = index * 4;
+            w[index] = u32::from_be_bytes([
+                chunk[offset],
+                chunk[offset + 1],
+                chunk[offset + 2],
+                chunk[offset + 3],
+            ]);
+        }
+        for index in 16..64 {
+            let s0 = w[index - 15].rotate_right(7)
+                ^ w[index - 15].rotate_right(18)
+                ^ (w[index - 15] >> 3);
+            let s1 = w[index - 2].rotate_right(17)
+                ^ w[index - 2].rotate_right(19)
+                ^ (w[index - 2] >> 10);
+            w[index] = w[index - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[index - 7])
+                .wrapping_add(s1);
+        }
+
+        let mut a = h0;
+        let mut b = h1;
+        let mut c = h2;
+        let mut d = h3;
+        let mut e = h4;
+        let mut f = h5;
+        let mut g = h6;
+        let mut h = h7;
+
+        for index in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = h
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[index])
+                .wrapping_add(w[index]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+
+        h0 = h0.wrapping_add(a);
+        h1 = h1.wrapping_add(b);
+        h2 = h2.wrapping_add(c);
+        h3 = h3.wrapping_add(d);
+        h4 = h4.wrapping_add(e);
+        h5 = h5.wrapping_add(f);
+        h6 = h6.wrapping_add(g);
+        h7 = h7.wrapping_add(h);
+    }
+
+    let mut output = [0_u8; AUTH_RESPONSE_BYTES];
+    for (index, value) in [h0, h1, h2, h3, h4, h5, h6, h7].iter().enumerate() {
+        output[index * 4..index * 4 + 4].copy_from_slice(&value.to_be_bytes());
+    }
+    output
 }
 
 #[cfg(test)]
@@ -273,5 +456,53 @@ mod tests {
             error,
             WireError::FrameTooLarge { size: 1024, max: 4 }
         ));
+    }
+
+    #[test]
+    fn normalizes_pairing_codes() {
+        assert_eq!(normalize_pairing_code(" 12 ab\ncd "), "12ABCD");
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc_4231_case_1() {
+        let key = [0x0b_u8; 20];
+        let actual = hmac_sha256(&key, b"Hi There");
+        let expected = hex_bytes(
+            "b0344c61d8db38535ca8afceaf0bf12b\
+                                  881dc200c9833da726e9376c2e32cff7",
+        );
+        assert_eq!(actual, expected.as_slice());
+    }
+
+    #[test]
+    fn pairing_auth_response_changes_with_code() {
+        let challenge = [7_u8; AUTH_CHALLENGE_BYTES];
+        let first = pairing_auth_response("123456", &challenge);
+        let second = pairing_auth_response("654321", &challenge);
+        assert!(auth_responses_equal(&first, &first));
+        assert!(!auth_responses_equal(&first, &second));
+    }
+
+    fn hex_bytes(input: &str) -> Vec<u8> {
+        let clean: String = input.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert_eq!(clean.len() % 2, 0);
+        clean
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let high = hex_digit(pair[0]);
+                let low = hex_digit(pair[1]);
+                (high << 4) | low
+            })
+            .collect()
+    }
+
+    fn hex_digit(value: u8) -> u8 {
+        match value {
+            b'0'..=b'9' => value - b'0',
+            b'a'..=b'f' => value - b'a' + 10,
+            b'A'..=b'F' => value - b'A' + 10,
+            _ => panic!("invalid hex digit"),
+        }
     }
 }

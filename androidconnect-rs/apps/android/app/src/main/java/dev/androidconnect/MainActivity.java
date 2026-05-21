@@ -17,6 +17,9 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.json.JSONException;
+import org.json.JSONObject;
+
 public final class MainActivity extends Activity {
     private static final int REQUEST_MEDIA_PROJECTION = 1001;
     private static final int REQUEST_NOTIFICATIONS = 1002;
@@ -72,7 +75,7 @@ public final class MainActivity extends Activity {
         content.addView(portField, matchWrap());
 
         pairingField = new EditText(this);
-        pairingField.setHint("Pairing code");
+        pairingField.setHint("Pairing code from desktop");
         pairingField.setSingleLine(true);
         content.addView(pairingField, matchWrap());
 
@@ -138,6 +141,11 @@ public final class MainActivity extends Activity {
         }
 
         String pairingCode = pairingField.getText().toString().trim();
+        if (pairingCode.isEmpty()) {
+            showError("Enter the pairing code shown by the desktop viewer.");
+            return;
+        }
+
         updateStatus("Connecting to " + host + ":" + port + "...");
         new Thread(() -> {
             boolean connected = NativeBridge.connect(this, host, port, pairingCode);
@@ -199,15 +207,86 @@ public final class MainActivity extends Activity {
             return;
         }
 
-        String nativeState = NativeBridge.isAvailable()
-                ? NativeBridge.statsJson()
-                : "native library not packaged yet";
-        String inputState = RemoteControlAccessibilityService.isRunning()
-                ? "input service enabled"
-                : "input service disabled";
-
-        String status = "Capture: ready\nInput: " + inputState + "\nRust: " + nativeState;
+        String status = buildStatusText();
         statusView.setText(prefix == null ? status : prefix + "\n" + status);
+    }
+
+    private String buildStatusText() {
+        String inputState = RemoteControlAccessibilityService.isRunning()
+                ? "enabled"
+                : "disabled";
+        if (!NativeBridge.isAvailable()) {
+            return "Capture: ready\nDesktop: disconnected\nPairing: unavailable"
+                    + "\nInput service: " + inputState
+                    + "\nRust: native library not packaged yet";
+        }
+
+        String stats = NativeBridge.statsJson();
+        try {
+            JSONObject json = new JSONObject(stats);
+            boolean running = json.optBoolean("running", false);
+            boolean connected = json.optBoolean("connected", false);
+            boolean inputAuthenticated = json.optBoolean("input_authenticated", false);
+            long encodedFrames = json.optLong("encoded_frames", 0);
+            long sentBytes = json.optLong("sent_bytes", 0);
+            String connectedTo = json.optString("connected_to", "");
+            String lastError = json.optString("last_error", "");
+
+            StringBuilder status = new StringBuilder();
+            status.append("Capture: ");
+            status.append(running ? "running" : "ready");
+            status.append(" (");
+            status.append(encodedFrames);
+            status.append(" frames)");
+
+            status.append("\nDesktop: ");
+            if (connected) {
+                status.append("connected");
+                if (!connectedTo.isEmpty()) {
+                    status.append(" to ");
+                    status.append(connectedTo);
+                }
+            } else {
+                status.append("disconnected");
+            }
+
+            status.append("\nPairing: ");
+            if (inputAuthenticated) {
+                status.append("authenticated");
+            } else if (connected) {
+                status.append("pending");
+            } else {
+                status.append("not connected");
+            }
+
+            status.append("\nInput service: ");
+            status.append(inputState);
+            status.append("\nSent: ");
+            status.append(formatBytes(sentBytes));
+
+            if (!lastError.isEmpty()) {
+                status.append("\nLast error: ");
+                status.append(lastError);
+            }
+
+            return status.toString();
+        } catch (JSONException error) {
+            return "Capture: ready\nDesktop: unknown\nPairing: unknown"
+                    + "\nInput service: " + inputState
+                    + "\nRust: " + stats;
+        }
+    }
+
+    private String formatBytes(long bytes) {
+        if (bytes < 1024) {
+            return bytes + " B";
+        }
+        long kib = bytes / 1024;
+        if (kib < 1024) {
+            return kib + " KiB";
+        }
+        long mib = kib / 1024;
+        return mib + " MiB";
     }
 
     private void showError(String message) {
