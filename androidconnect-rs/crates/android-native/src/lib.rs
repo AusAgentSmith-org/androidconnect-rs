@@ -472,8 +472,10 @@ fn input_reader_loop(
                     return Err(format!("desktop rejected pairing: {}", result.message));
                 }
             }
-            Payload::Ping { .. }
-            | Payload::Pong { .. }
+            Payload::Ping { nonce } => {
+                send_payload_if_generation(generation, Payload::Pong { nonce })?;
+            }
+            Payload::Pong { .. }
             | Payload::Error { .. }
             | Payload::Hello(_)
             | Payload::VideoFormat(_)

@@ -7,6 +7,8 @@ import android.content.Intent;
 import android.media.projection.MediaProjectionManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.Settings;
 import android.view.Gravity;
 import android.view.ViewGroup;
@@ -24,11 +26,20 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_MEDIA_PROJECTION = 1001;
     private static final int REQUEST_NOTIFICATIONS = 1002;
     private static final int DEFAULT_PORT = 48172;
+    private static final long STATUS_REFRESH_MS = 1_000L;
 
     private TextView statusView;
     private EditText hostField;
     private EditText portField;
     private EditText pairingField;
+    private final Handler statusHandler = new Handler(Looper.getMainLooper());
+    private final Runnable statusRefresh = new Runnable() {
+        @Override
+        public void run() {
+            updateStatus();
+            statusHandler.postDelayed(this, STATUS_REFRESH_MS);
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -42,6 +53,14 @@ public final class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         updateStatus();
+        statusHandler.removeCallbacks(statusRefresh);
+        statusHandler.postDelayed(statusRefresh, STATUS_REFRESH_MS);
+    }
+
+    @Override
+    protected void onPause() {
+        statusHandler.removeCallbacks(statusRefresh);
+        super.onPause();
     }
 
     private ScrollView createContentView() {

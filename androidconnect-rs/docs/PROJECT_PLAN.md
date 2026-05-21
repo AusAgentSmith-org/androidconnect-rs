@@ -53,7 +53,8 @@ Implemented:
 - Desktop window-title status for listening, connected, paired, video format, disconnected, and
   error states.
 - Android status text for capture, desktop connection, pairing, input service, counters, and last
-  error.
+  error. It refreshes while the activity is visible.
+- Desktop heartbeat pings and Android pong replies over the existing TCP connection.
 - Gradle wrapper added to `apps/android` (copied from kdeconnect-android reference tree).
 
 Not implemented yet:
@@ -61,7 +62,7 @@ Not implemented yet:
 - End-to-end input validation on a physical Android device (emulator pass does not substitute).
 - Persistent paired desktop identity, durable trust state, and encrypted/authenticated session
   transport. The current pairing-code gate is not the final security model.
-- Reconnect/session recovery and clear connection status reporting.
+- Reconnect/session recovery and native connection status callbacks beyond the current polling UI.
 - Rotation/resolution renegotiation beyond initial format metadata.
 
 ## Architecture
@@ -250,7 +251,7 @@ Tasks:
 - Store paired desktop identity on Android.
 - Authenticate each session before accepting video or input traffic. Partial — input is gated;
   video remains available during pairing.
-- Add heartbeat and reconnect behavior.
+- Add heartbeat and reconnect behavior. Partial — heartbeat is implemented; reconnect is pending.
 - Stop input processing immediately when a session is unauthenticated or disconnected. Done for the
   current connection.
 - Add visible Android status for connected desktop identity. Partial — current status shows address

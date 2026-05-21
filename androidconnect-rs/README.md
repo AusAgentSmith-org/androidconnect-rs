@@ -8,7 +8,7 @@ Open, local-first, Rust-based Android screen mirroring and desktop control for n
 
 - `crates/protocol`: length-prefixed binary protocol, video metadata/frame messages, input event schemas, and pairing challenge/response messages.
 - `crates/android-native`: JNI bridge loaded by the Android app. It connects to the desktop receiver, sends video protocol envelopes, reads inbound authenticated input envelopes, and tracks capture stats.
-- `apps/android`: Android app using `MediaProjection`, a foreground service, `MediaCodec` H.264 surface encoding, and an `AccessibilityService` for remote input. End-to-end frame streaming validated on emulator; input path is implemented and pending device validation.
+- `apps/android`: Android app using `MediaProjection`, a foreground service, `MediaCodec` H.264 surface encoding, and an `AccessibilityService` for remote input. End-to-end frame streaming validated on emulator; input path is implemented and pending device validation. The status panel refreshes while visible.
 - `apps/desktop-viewer`: Rust desktop viewer that decodes incoming H.264 frames with OpenH264, renders them live in a native window (`winit` + `pixels`), letterbox-scales the Android screen, displays pairing/connection state in the window title, and sends desktop input back to Android only after pairing succeeds.
 
 ## Planning Docs
@@ -95,7 +95,7 @@ See `docs/INPUT_CONTROL.md` for the full control reference, limitations, and val
 
 1. Validate desktop input control end-to-end on a physical Android device (emulator pass does not count).
 2. Persist paired desktop identity and derive per-session keys beyond the current pairing-code input gate.
-3. Add reconnect/session recovery and clear connection status reporting.
+3. Add reconnect/session recovery and native connection status callbacks beyond current polling.
 4. Add rotation/resolution renegotiation.
 5. Replace accessibility `ACTION_SET_TEXT` with an IME-backed text input path.
 6. Replace TCP with authenticated QUIC streams.

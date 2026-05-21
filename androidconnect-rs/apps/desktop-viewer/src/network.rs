@@ -1,7 +1,7 @@
 use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use androidconnect_protocol::{
     AuthResponse, Envelope, InputEvent, MAX_VIDEO_FRAME_BYTES, PROTOCOL_VERSION, Payload,
@@ -13,6 +13,9 @@ use openh264::decoder::Decoder;
 use openh264::formats::YUVSource;
 
 use crate::RgbaFrame;
+
+const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkStatus {
@@ -140,9 +143,26 @@ fn write_input_loop(
     reader_done_rx: Receiver<Result<()>>,
     writer_command_rx: Receiver<WriterCommand>,
 ) -> Result<()> {
+    write_input_loop_with_heartbeat(
+        &mut stream,
+        input_rx,
+        reader_done_rx,
+        writer_command_rx,
+        HEARTBEAT_INTERVAL,
+    )
+}
+
+fn write_input_loop_with_heartbeat(
+    mut stream: &mut TcpStream,
+    input_rx: &Receiver<InputEvent>,
+    reader_done_rx: Receiver<Result<()>>,
+    writer_command_rx: Receiver<WriterCommand>,
+    heartbeat_interval: Duration,
+) -> Result<()> {
     let mut sequence = 1_u64;
     let mut input_authenticated = false;
     let mut logged_unauthenticated_input = false;
+    let mut last_heartbeat = Instant::now();
 
     loop {
         if let Ok(result) = reader_done_rx.try_recv() {
@@ -155,8 +175,12 @@ fn write_input_loop(
             &writer_command_rx,
             &mut input_authenticated,
         )?;
+        if heartbeat_interval > Duration::ZERO && last_heartbeat.elapsed() >= heartbeat_interval {
+            write_ping(stream, &mut sequence)?;
+            last_heartbeat = Instant::now();
+        }
 
-        match input_rx.recv_timeout(Duration::from_millis(10)) {
+        match input_rx.recv_timeout(INPUT_POLL_INTERVAL) {
             Ok(event) => {
                 drain_writer_commands(
                     &mut stream,
@@ -184,6 +208,11 @@ fn write_input_loop(
 
 fn write_input(stream: &mut TcpStream, sequence: &mut u64, event: InputEvent) -> Result<()> {
     write_payload(stream, sequence, Payload::Input(event))
+}
+
+fn write_ping(stream: &mut TcpStream, sequence: &mut u64) -> Result<()> {
+    let nonce = *sequence;
+    write_payload(stream, sequence, Payload::Ping { nonce })
 }
 
 fn write_payload(stream: &mut TcpStream, sequence: &mut u64, payload: Payload) -> Result<()> {
@@ -380,6 +409,39 @@ mod tests {
             envelope.payload,
             Payload::Input(InputEvent::Pointer(PointerEvent { x: 30, y: 40, .. }))
         ));
+
+        reader_done_tx.send(Ok(()))?;
+        let _ = server.shutdown(Shutdown::Both);
+        writer.join().expect("writer thread join")?;
+        Ok(())
+    }
+
+    #[test]
+    fn writer_sends_periodic_ping() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let client = TcpStream::connect(address)?;
+        let (mut server, _) = listener.accept()?;
+        server.set_read_timeout(Some(Duration::from_secs(1)))?;
+
+        let (input_tx, input_rx) = mpsc::sync_channel(4);
+        let (reader_done_tx, reader_done_rx) = mpsc::sync_channel(1);
+        let (_writer_command_tx, writer_command_rx) = mpsc::channel();
+
+        let writer = std::thread::spawn(move || {
+            let mut client = client;
+            write_input_loop_with_heartbeat(
+                &mut client,
+                &input_rx,
+                reader_done_rx,
+                writer_command_rx,
+                Duration::from_millis(25),
+            )
+        });
+
+        let _keep_input_channel_open = input_tx;
+        let envelope = read_length_prefixed(&mut server, MAX_CONTROL_FRAME_BYTES)?;
+        assert!(matches!(envelope.payload, Payload::Ping { nonce: 1 }));
 
         reader_done_tx.send(Ok(()))?;
         let _ = server.shutdown(Shutdown::Both);
