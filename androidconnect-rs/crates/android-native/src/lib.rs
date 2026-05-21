@@ -30,6 +30,8 @@ struct AppState {
     input_authenticated: bool,
     sent_envelopes: u64,
     sent_bytes: u64,
+    received_pings: u64,
+    sent_pongs: u64,
 }
 
 impl Default for AppState {
@@ -46,6 +48,8 @@ impl Default for AppState {
             input_authenticated: false,
             sent_envelopes: 0,
             sent_bytes: 0,
+            received_pings: 0,
+            sent_pongs: 0,
         }
     }
 }
@@ -210,6 +214,8 @@ pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativeConnect(
     guard.connected_to = Some(address.clone());
     guard.pairing_code_set = true;
     guard.input_authenticated = false;
+    guard.received_pings = 0;
+    guard.sent_pongs = 0;
     guard.last_error = None;
     let generation = guard.connection_generation;
     let auth_challenge = make_auth_challenge();
@@ -372,6 +378,8 @@ pub fn current_stats_json() -> String {
         "encoded_bytes": capture.map(|capture| capture.encoded_bytes).unwrap_or_default(),
         "sent_envelopes": guard.sent_envelopes,
         "sent_bytes": guard.sent_bytes,
+        "received_pings": guard.received_pings,
+        "sent_pongs": guard.sent_pongs,
         "pairing_code_set": guard.pairing_code_set,
         "input_authenticated": guard.input_authenticated,
         "uptime_ms": capture.map(|capture| capture.started_at.elapsed().as_millis()).unwrap_or_default(),
@@ -473,7 +481,7 @@ fn input_reader_loop(
                 }
             }
             Payload::Ping { nonce } => {
-                send_payload_if_generation(generation, Payload::Pong { nonce })?;
+                send_pong_if_generation(generation, nonce)?;
             }
             Payload::Pong { .. }
             | Payload::Error { .. }
@@ -738,6 +746,19 @@ fn send_payload_if_generation(generation: u64, payload: Payload) -> Result<(), S
     guard.send_payload(payload)
 }
 
+fn send_pong_if_generation(generation: u64, nonce: u64) -> Result<(), String> {
+    let mut guard = state()
+        .lock()
+        .map_err(|_| "state lock poisoned while sending pong".to_owned())?;
+    if guard.connection_generation != generation {
+        return Err("stale connection generation".to_owned());
+    }
+    guard.received_pings += 1;
+    guard.send_payload(Payload::Pong { nonce })?;
+    guard.sent_pongs += 1;
+    Ok(())
+}
+
 fn configure_stream(stream: &TcpStream) -> io::Result<()> {
     stream.set_nodelay(true)
 }
@@ -779,5 +800,24 @@ fn fill_fallback_challenge(output: &mut [u8]) {
         seed = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
         let bytes = seed.to_le_bytes();
         chunk.copy_from_slice(&bytes[..chunk.len()]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stats_json_exposes_heartbeat_counters() {
+        let mut guard = state().lock().expect("state lock");
+        *guard = AppState::default();
+        guard.received_pings = 3;
+        guard.sent_pongs = 2;
+        drop(guard);
+
+        let stats: serde_json::Value =
+            serde_json::from_str(&current_stats_json()).expect("valid stats json");
+        assert_eq!(stats["received_pings"], 3);
+        assert_eq!(stats["sent_pongs"], 2);
     }
 }

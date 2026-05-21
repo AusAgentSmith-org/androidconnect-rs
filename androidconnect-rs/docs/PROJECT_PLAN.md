@@ -50,11 +50,12 @@ Implemented:
   pairing succeeds.
 - Android accessibility service with tap, drag, scroll, basic text edit, and global action helpers.
 - Desktop coordinate mapping from letterboxed window pixels to Android frame pixels.
-- Desktop window-title status for listening, connected, paired, video format, disconnected, and
-  error states.
+- Desktop window-title status for listening, connected, paired, video format, heartbeat,
+  disconnected, and error states.
 - Android status text for capture, desktop connection, pairing, input service, counters, and last
-  error. It refreshes while the activity is visible.
-- Desktop heartbeat pings and Android pong replies over the existing TCP connection.
+  error. It refreshes while the activity is visible and includes heartbeat counters.
+- Desktop heartbeat pings and Android pong replies over the existing TCP connection, with visible
+  heartbeat health on both sides.
 - Gradle wrapper added to `apps/android` (copied from kdeconnect-android reference tree).
 
 Not implemented yet:
@@ -251,7 +252,8 @@ Tasks:
 - Store paired desktop identity on Android.
 - Authenticate each session before accepting video or input traffic. Partial — input is gated;
   video remains available during pairing.
-- Add heartbeat and reconnect behavior. Partial — heartbeat is implemented; reconnect is pending.
+- Add heartbeat and reconnect behavior. Partial — heartbeat is implemented and visible; reconnect is
+  pending.
 - Stop input processing immediately when a session is unauthenticated or disconnected. Done for the
   current connection.
 - Add visible Android status for connected desktop identity. Partial — current status shows address

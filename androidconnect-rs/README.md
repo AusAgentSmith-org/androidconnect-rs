@@ -7,9 +7,9 @@ Open, local-first, Rust-based Android screen mirroring and desktop control for n
 ## What Exists
 
 - `crates/protocol`: length-prefixed binary protocol, video metadata/frame messages, input event schemas, and pairing challenge/response messages.
-- `crates/android-native`: JNI bridge loaded by the Android app. It connects to the desktop receiver, sends video protocol envelopes, reads inbound authenticated input envelopes, and tracks capture stats.
-- `apps/android`: Android app using `MediaProjection`, a foreground service, `MediaCodec` H.264 surface encoding, and an `AccessibilityService` for remote input. End-to-end frame streaming validated on emulator; input path is implemented and pending device validation. The status panel refreshes while visible.
-- `apps/desktop-viewer`: Rust desktop viewer that decodes incoming H.264 frames with OpenH264, renders them live in a native window (`winit` + `pixels`), letterbox-scales the Android screen, displays pairing/connection state in the window title, and sends desktop input back to Android only after pairing succeeds.
+- `crates/android-native`: JNI bridge loaded by the Android app. It connects to the desktop receiver, sends video protocol envelopes, reads inbound authenticated input envelopes, and tracks capture/heartbeat stats.
+- `apps/android`: Android app using `MediaProjection`, a foreground service, `MediaCodec` H.264 surface encoding, and an `AccessibilityService` for remote input. End-to-end frame streaming validated on emulator; input path is implemented and pending device validation. The status panel refreshes while visible and includes heartbeat counters.
+- `apps/desktop-viewer`: Rust desktop viewer that decodes incoming H.264 frames with OpenH264, renders them live in a native window (`winit` + `pixels`), letterbox-scales the Android screen, displays pairing/connection/video/heartbeat state in the window title, and sends desktop input back to Android only after pairing succeeds.
 
 ## Planning Docs
 

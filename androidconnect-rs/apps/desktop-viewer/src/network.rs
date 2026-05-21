@@ -38,6 +38,9 @@ pub enum NetworkStatus {
         frame_rate: u32,
         rotation_degrees: u16,
     },
+    HeartbeatPong {
+        nonce: u64,
+    },
     ClientDisconnected,
     ClientError {
         message: String,
@@ -310,7 +313,10 @@ fn read_client_loop(
                 }
             }
             Payload::Ping { nonce } => info!("ping {nonce}"),
-            Payload::Pong { nonce } => info!("pong {nonce}"),
+            Payload::Pong { nonce } => {
+                info!("pong {nonce}");
+                send_status(&status_tx, NetworkStatus::HeartbeatPong { nonce });
+            }
             Payload::Error { message } => error!("peer error: {message}"),
             Payload::AuthChallenge(challenge) => {
                 let response = AuthResponse {
@@ -446,6 +452,36 @@ mod tests {
         reader_done_tx.send(Ok(()))?;
         let _ = server.shutdown(Shutdown::Both);
         writer.join().expect("writer thread join")?;
+        Ok(())
+    }
+
+    #[test]
+    fn reader_reports_pong_status() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let mut client = TcpStream::connect(address)?;
+        let (server, _) = listener.accept()?;
+
+        let (frame_tx, _frame_rx) = mpsc::channel();
+        let (writer_command_tx, _writer_command_rx) = mpsc::channel();
+        let (status_tx, status_rx) = mpsc::channel();
+
+        let reader = std::thread::spawn(move || {
+            read_client_loop(
+                server,
+                frame_tx,
+                "123456".to_owned(),
+                writer_command_tx,
+                status_tx,
+            )
+        });
+
+        write_length_prefixed(&mut client, &Envelope::new(1, Payload::Pong { nonce: 42 }))?;
+        let status = status_rx.recv_timeout(Duration::from_secs(1))?;
+        assert_eq!(status, NetworkStatus::HeartbeatPong { nonce: 42 });
+
+        let _ = client.shutdown(Shutdown::Both);
+        let _ = reader.join().expect("reader thread join");
         Ok(())
     }
 

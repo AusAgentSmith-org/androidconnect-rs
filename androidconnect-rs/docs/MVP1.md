@@ -17,10 +17,11 @@ The detailed desktop input-control reference lives in `docs/INPUT_CONTROL.md`.
 - Desktop has a Rust receiver that decodes H.264 and renders frames live in a native window. ✓
 - Desktop rejects unsupported protocol versions. ✓
 - Desktop letterbox-scales incoming frames to fit the window at any size. ✓
-- Desktop window title reports listening, connected, paired, video format, and error states. ✓
+- Desktop window title reports listening, connected, paired, video format, heartbeat, and error states. ✓
 - Android status text summarizes capture, desktop connection, pairing, input service, counters, and
   last error, and refreshes while the activity is visible. ✓
-- Desktop sends periodic TCP heartbeat pings and Android replies with pongs. ✓
+- Desktop sends periodic TCP heartbeat pings, Android replies with pongs, and both surfaces report
+  heartbeat health. ✓
 
 Validated on emulator: Pixel 7 Pro AVD, API 36 (`google_apis_playstore`), streaming H.264 at 1080×2340/30fps, rendered live on desktop. Physical-device validation is still pending.
 

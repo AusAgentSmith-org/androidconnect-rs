@@ -315,6 +315,7 @@ struct DesktopStatus {
     device_name: Option<String>,
     input_authenticated: bool,
     video_format: Option<String>,
+    last_pong_nonce: Option<u64>,
     last_error: Option<String>,
 }
 
@@ -328,6 +329,7 @@ impl DesktopStatus {
             device_name: None,
             input_authenticated: false,
             video_format: None,
+            last_pong_nonce: None,
             last_error: None,
         }
     }
@@ -341,6 +343,7 @@ impl DesktopStatus {
                 self.device_name = None;
                 self.input_authenticated = false;
                 self.video_format = None;
+                self.last_pong_nonce = None;
                 self.last_error = None;
             }
             network::NetworkStatus::ClientConnected { peer } => {
@@ -349,6 +352,7 @@ impl DesktopStatus {
                 self.device_name = None;
                 self.input_authenticated = false;
                 self.video_format = None;
+                self.last_pong_nonce = None;
                 self.last_error = None;
             }
             network::NetworkStatus::DeviceHello { device_name } => {
@@ -377,17 +381,24 @@ impl DesktopStatus {
                 ));
                 self.connection = ConnectionState::Connected;
             }
+            network::NetworkStatus::HeartbeatPong { nonce } => {
+                self.last_pong_nonce = Some(nonce);
+                self.connection = ConnectionState::Connected;
+                self.last_error = None;
+            }
             network::NetworkStatus::ClientDisconnected => {
                 self.connection = ConnectionState::Listening;
                 self.peer = None;
                 self.device_name = None;
                 self.input_authenticated = false;
                 self.video_format = None;
+                self.last_pong_nonce = None;
                 self.last_error = None;
             }
             network::NetworkStatus::ClientError { message } => {
                 self.connection = ConnectionState::Error;
                 self.input_authenticated = false;
+                self.last_pong_nonce = None;
                 self.last_error = Some(message);
             }
         }
@@ -412,6 +423,9 @@ impl DesktopStatus {
                 if let Some(video) = &self.video_format {
                     state.push_str(" - ");
                     state.push_str(video);
+                }
+                if let Some(nonce) = self.last_pong_nonce {
+                    state.push_str(&format!(" - heartbeat ok #{nonce}"));
                 }
                 state
             }
@@ -793,6 +807,12 @@ mod tests {
         assert_eq!(
             status.window_title(),
             "AndroidConnect - code 123 456 - connected to Pixel - input paired - 1080x2340@30fps rot 0"
+        );
+
+        status.apply(network::NetworkStatus::HeartbeatPong { nonce: 7 });
+        assert_eq!(
+            status.window_title(),
+            "AndroidConnect - code 123 456 - connected to Pixel - input paired - 1080x2340@30fps rot 0 - heartbeat ok #7"
         );
     }
 }

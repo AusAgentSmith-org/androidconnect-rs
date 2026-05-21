@@ -248,6 +248,8 @@ public final class MainActivity extends Activity {
             boolean inputAuthenticated = json.optBoolean("input_authenticated", false);
             long encodedFrames = json.optLong("encoded_frames", 0);
             long sentBytes = json.optLong("sent_bytes", 0);
+            long receivedPings = json.optLong("received_pings", 0);
+            long sentPongs = json.optLong("sent_pongs", 0);
             String connectedTo = json.optString("connected_to", "");
             String lastError = json.optString("last_error", "");
 
@@ -280,6 +282,11 @@ public final class MainActivity extends Activity {
 
             status.append("\nInput service: ");
             status.append(inputState);
+            status.append("\nHeartbeat: ");
+            status.append(receivedPings);
+            status.append(" pings / ");
+            status.append(sentPongs);
+            status.append(" pongs");
             status.append("\nSent: ");
             status.append(formatBytes(sentBytes));
 
