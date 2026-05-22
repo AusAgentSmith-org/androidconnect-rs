@@ -156,7 +156,7 @@ fn write_input_loop(
 }
 
 fn write_input_loop_with_heartbeat(
-    mut stream: &mut TcpStream,
+    stream: &mut TcpStream,
     input_rx: &Receiver<InputEvent>,
     reader_done_rx: Receiver<Result<()>>,
     writer_command_rx: Receiver<WriterCommand>,
@@ -173,7 +173,7 @@ fn write_input_loop_with_heartbeat(
             return result;
         }
         drain_writer_commands(
-            &mut stream,
+            stream,
             &mut sequence,
             &writer_command_rx,
             &mut input_authenticated,
@@ -186,20 +186,20 @@ fn write_input_loop_with_heartbeat(
         match input_rx.recv_timeout(INPUT_POLL_INTERVAL) {
             Ok(event) => {
                 drain_writer_commands(
-                    &mut stream,
+                    stream,
                     &mut sequence,
                     &writer_command_rx,
                     &mut input_authenticated,
                 )?;
                 if input_authenticated {
-                    write_input(&mut stream, &mut sequence, event)?;
+                    write_input(stream, &mut sequence, event)?;
                 } else if !logged_unauthenticated_input {
                     warn!("dropping desktop input until pairing succeeds");
                     logged_unauthenticated_input = true;
                 }
                 while let Ok(event) = input_rx.try_recv() {
                     if input_authenticated {
-                        write_input(&mut stream, &mut sequence, event)?;
+                        write_input(stream, &mut sequence, event)?;
                     }
                 }
             }

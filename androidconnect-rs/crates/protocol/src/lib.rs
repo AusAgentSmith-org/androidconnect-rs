@@ -357,9 +357,9 @@ fn sha256(input: &[u8]) -> [u8; AUTH_RESPONSE_BYTES] {
 
     for chunk in padded.chunks_exact(64) {
         let mut w = [0_u32; 64];
-        for index in 0..16 {
+        for (index, word) in w.iter_mut().take(16).enumerate() {
             let offset = index * 4;
-            w[index] = u32::from_be_bytes([
+            *word = u32::from_be_bytes([
                 chunk[offset],
                 chunk[offset + 1],
                 chunk[offset + 2],
