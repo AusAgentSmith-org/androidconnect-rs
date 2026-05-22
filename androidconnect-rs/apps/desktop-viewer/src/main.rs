@@ -1,7 +1,9 @@
 mod network;
 mod trust;
 
+use std::fs::File;
 use std::io::Read;
+use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,8 +19,10 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
 use androidconnect_protocol::{
-    DEFAULT_CONTROL_PORT, InputEvent, MediaControl, MediaControlAction, Modifiers, Payload,
-    PointerButton, PointerEvent, PointerPhase, SystemAction, TextInput, normalize_pairing_code,
+    DEFAULT_CONTROL_PORT, FileTransferChunk, FileTransferComplete, FileTransferStart, InputEvent,
+    MediaControl, MediaControlAction, Modifiers, Payload, PointerButton, PointerEvent,
+    PointerPhase, SystemAction, TextInput, TransferDirection, TransferStatus,
+    normalize_pairing_code,
 };
 
 pub struct RgbaFrame {
@@ -82,6 +86,15 @@ impl App {
         let _ = self
             .command_tx
             .try_send(network::DesktopCommand::Utility(payload));
+    }
+
+    fn send_file_to_android(&self, path: PathBuf) {
+        let command_tx = self.command_tx.clone();
+        thread::spawn(move || {
+            if let Err(error) = send_file_to_android(command_tx, path) {
+                error!("send file to Android failed: {error:#}");
+            }
+        });
     }
 
     fn current_modifiers(&self) -> Modifiers {
@@ -274,6 +287,7 @@ impl ApplicationHandler for App {
                 self.handle_mouse_button(state, button);
             }
             WindowEvent::MouseWheel { delta, .. } => self.handle_mouse_wheel(delta),
+            WindowEvent::DroppedFile(path) => self.send_file_to_android(path),
             WindowEvent::KeyboardInput {
                 event,
                 is_synthetic,
@@ -331,6 +345,18 @@ struct DesktopStatus {
     video_format: Option<String>,
     last_pong_nonce: Option<u64>,
     last_error: Option<String>,
+    battery_status: Option<String>,
+    feature_summary: Option<String>,
+    media_summary: Option<String>,
+    notification_summary: Option<String>,
+    transfer_summary: Option<String>,
+    file_browser_summary: Option<String>,
+    photo_summary: Option<String>,
+    message_summary: Option<String>,
+    call_summary: Option<String>,
+    relay_summary: Option<String>,
+    client_summary: Option<String>,
+    clipboard_summary: Option<String>,
 }
 
 impl DesktopStatus {
@@ -345,6 +371,18 @@ impl DesktopStatus {
             video_format: None,
             last_pong_nonce: None,
             last_error: None,
+            battery_status: None,
+            feature_summary: None,
+            media_summary: None,
+            notification_summary: None,
+            transfer_summary: None,
+            file_browser_summary: None,
+            photo_summary: None,
+            message_summary: None,
+            call_summary: None,
+            relay_summary: None,
+            client_summary: None,
+            clipboard_summary: None,
         }
     }
 
@@ -359,6 +397,7 @@ impl DesktopStatus {
                 self.video_format = None;
                 self.last_pong_nonce = None;
                 self.last_error = None;
+                self.clear_utility_status();
             }
             network::NetworkStatus::ClientConnected { peer } => {
                 self.connection = ConnectionState::Connected;
@@ -368,6 +407,7 @@ impl DesktopStatus {
                 self.video_format = None;
                 self.last_pong_nonce = None;
                 self.last_error = None;
+                self.clear_utility_status();
             }
             network::NetworkStatus::DeviceHello { device_name } => {
                 self.device_name = Some(device_name);
@@ -408,12 +448,112 @@ impl DesktopStatus {
                 self.video_format = None;
                 self.last_pong_nonce = None;
                 self.last_error = None;
+                self.clear_utility_status();
             }
             network::NetworkStatus::ClientError { message } => {
                 self.connection = ConnectionState::Error;
                 self.input_authenticated = false;
                 self.last_pong_nonce = None;
                 self.last_error = Some(message);
+            }
+            network::NetworkStatus::DeviceStatus {
+                battery_percent,
+                charging,
+                feature_summary,
+            } => {
+                self.battery_status = battery_percent.map(|percent| {
+                    if charging.unwrap_or(false) {
+                        format!("{percent}% charging")
+                    } else {
+                        format!("{percent}%")
+                    }
+                });
+                self.feature_summary = Some(feature_summary);
+                self.connection = ConnectionState::Connected;
+            }
+            network::NetworkStatus::MediaStatus { active, summary } => {
+                self.media_summary = Some(if active {
+                    summary
+                } else if summary.is_empty() {
+                    "no media".to_owned()
+                } else {
+                    summary
+                });
+            }
+            network::NetworkStatus::ClipboardText { source, characters } => {
+                self.clipboard_summary = Some(format!("{source:?} clipboard {characters} chars"));
+            }
+            network::NetworkStatus::NotificationPosted {
+                app_name,
+                title,
+                sensitive,
+            } => {
+                self.notification_summary = Some(if sensitive {
+                    format!("{app_name}: hidden")
+                } else {
+                    format!(
+                        "{app_name}: {}",
+                        title.unwrap_or_else(|| "notification".to_owned())
+                    )
+                });
+            }
+            network::NetworkStatus::NotificationRemoved { notification_id } => {
+                self.notification_summary = Some(format!(
+                    "notification removed {}",
+                    truncate_title(&notification_id, 24)
+                ));
+            }
+            network::NetworkStatus::FileTransfer {
+                transfer_id: _,
+                file_name,
+                bytes,
+                status,
+            } => {
+                self.transfer_summary = Some(format!(
+                    "{} {} {}",
+                    truncate_title(&file_name, 32),
+                    format_bytes_short(bytes),
+                    status
+                ));
+            }
+            network::NetworkStatus::FileBrowse {
+                path,
+                entries,
+                state,
+            } => {
+                self.file_browser_summary = Some(format!("{path}: {entries} entries {state}"));
+            }
+            network::NetworkStatus::PhotoAssets { count, state } => {
+                self.photo_summary = Some(format!("{count} media assets {state}"));
+            }
+            network::NetworkStatus::MessageThreads { count, state } => {
+                self.message_summary = Some(format!("{count} message threads {state}"));
+            }
+            network::NetworkStatus::CallState { state, status } => {
+                self.call_summary = Some(format!("call {state} {status}"));
+            }
+            network::NetworkStatus::RelayStatus {
+                enabled,
+                connected,
+                state,
+            } => {
+                self.relay_summary = Some(format!(
+                    "relay {} {} {state}",
+                    if enabled { "on" } else { "off" },
+                    if connected { "connected" } else { "idle" }
+                ));
+            }
+            network::NetworkStatus::ClientList {
+                clients,
+                input_owner,
+            } => {
+                self.client_summary = Some(format!(
+                    "{clients} client{}{}",
+                    if clients == 1 { "" } else { "s" },
+                    input_owner
+                        .map(|owner| format!(" owner {}", truncate_title(&owner, 16)))
+                        .unwrap_or_default()
+                ));
             }
         }
     }
@@ -441,6 +581,10 @@ impl DesktopStatus {
                 if let Some(nonce) = self.last_pong_nonce {
                     state.push_str(&format!(" - heartbeat ok #{nonce}"));
                 }
+                if let Some(utilities) = self.utility_summary() {
+                    state.push_str(" - ");
+                    state.push_str(&truncate_title(&utilities, 120));
+                }
                 state
             }
             ConnectionState::Error => {
@@ -453,6 +597,48 @@ impl DesktopStatus {
             "AndroidConnect - code {} - {state}",
             format_pairing_code(&self.pairing_code)
         )
+    }
+
+    fn clear_utility_status(&mut self) {
+        self.battery_status = None;
+        self.feature_summary = None;
+        self.media_summary = None;
+        self.notification_summary = None;
+        self.transfer_summary = None;
+        self.file_browser_summary = None;
+        self.photo_summary = None;
+        self.message_summary = None;
+        self.call_summary = None;
+        self.relay_summary = None;
+        self.client_summary = None;
+        self.clipboard_summary = None;
+    }
+
+    fn utility_summary(&self) -> Option<String> {
+        let parts = [
+            self.battery_status.as_deref(),
+            self.feature_summary.as_deref(),
+            self.media_summary.as_deref(),
+            self.notification_summary.as_deref(),
+            self.transfer_summary.as_deref(),
+            self.file_browser_summary.as_deref(),
+            self.photo_summary.as_deref(),
+            self.message_summary.as_deref(),
+            self.call_summary.as_deref(),
+            self.relay_summary.as_deref(),
+            self.client_summary.as_deref(),
+            self.clipboard_summary.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|part| !part.is_empty())
+        .take(5)
+        .collect::<Vec<_>>();
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" - "))
+        }
     }
 }
 
@@ -469,6 +655,16 @@ fn format_pairing_code(code: &str) -> String {
         format!("{} {}", &clean[..3], &clean[3..])
     } else {
         clean
+    }
+}
+
+fn format_bytes_short(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes}B")
+    } else if bytes < 1024 * 1024 {
+        format!("{}KiB", bytes / 1024)
+    } else {
+        format!("{}MiB", bytes / 1024 / 1024)
     }
 }
 
@@ -636,6 +832,83 @@ fn text_from_key(event: &winit::event::KeyEvent) -> Option<String> {
         Key::Named(NamedKey::Tab) => Some("\t".to_owned()),
         _ => None,
     }
+}
+
+fn send_file_to_android(
+    command_tx: mpsc::SyncSender<network::DesktopCommand>,
+    path: PathBuf,
+) -> Result<()> {
+    let mut file = File::open(&path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        bail!("only individual files can be sent");
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(sanitize_file_name)
+        .unwrap_or_else(|| "file".to_owned());
+    let transfer_id = format!("desktop-{}-{}", now_micros(), std::process::id());
+    command_tx.send(network::DesktopCommand::Utility(
+        Payload::FileTransferStart(FileTransferStart {
+            transfer_id: transfer_id.clone(),
+            direction: TransferDirection::DesktopToAndroid,
+            file_name,
+            mime_type: None,
+            size_bytes: Some(metadata.len()),
+            target_path: None,
+        }),
+    ))?;
+
+    let mut offset = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        command_tx.send(network::DesktopCommand::Utility(
+            Payload::FileTransferChunk(FileTransferChunk {
+                transfer_id: transfer_id.clone(),
+                offset,
+                data: buffer[..read].to_vec(),
+            }),
+        ))?;
+        offset += read as u64;
+    }
+
+    command_tx.send(network::DesktopCommand::Utility(
+        Payload::FileTransferComplete(FileTransferComplete {
+            transfer_id,
+            status: TransferStatus::Completed,
+            message: None,
+        }),
+    ))?;
+    Ok(())
+}
+
+fn sanitize_file_name(path: &str) -> String {
+    let clean: String = path
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' | '\0' => '_',
+            ch if ch.is_control() => '_',
+            ch => ch,
+        })
+        .collect();
+    let clean = clean.trim_matches('.').trim();
+    if clean.is_empty() {
+        "file".to_owned()
+    } else {
+        clean.to_owned()
+    }
+}
+
+fn now_micros() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_micros())
+        .unwrap_or_default()
 }
 
 fn main() -> Result<()> {

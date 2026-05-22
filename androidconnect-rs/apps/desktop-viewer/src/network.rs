@@ -1,14 +1,18 @@
-use std::io;
+use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use androidconnect_protocol::{
-    AUTH_CHALLENGE_BYTES, AuthMethod, AuthResponse, Envelope, InputEvent, MAX_VIDEO_FRAME_BYTES,
-    PAIRED_SECRET_BYTES, PROTOCOL_VERSION, Payload, WireError, bytes_to_hex, derive_session_key,
-    paired_secret_from_pairing_code, pairing_auth_response, read_length_prefixed,
-    session_key_fingerprint, trusted_session_auth_response, write_length_prefixed,
+    AUTH_CHALLENGE_BYTES, AuthMethod, AuthResponse, ClipboardSource, Envelope, FeatureStatus,
+    FileTransferChunk, FileTransferComplete, FileTransferStart, InputEvent, MAX_VIDEO_FRAME_BYTES,
+    MediaStatus, PAIRED_SECRET_BYTES, PROTOCOL_VERSION, Payload, TransferDirection, TransferStatus,
+    WireError, bytes_to_hex, derive_session_key, paired_secret_from_pairing_code,
+    pairing_auth_response, read_length_prefixed, session_key_fingerprint,
+    trusted_session_auth_response, write_length_prefixed,
 };
 use anyhow::{Result, bail};
 use log::{error, info, warn};
@@ -51,6 +55,59 @@ pub enum NetworkStatus {
     ClientDisconnected,
     ClientError {
         message: String,
+    },
+    DeviceStatus {
+        battery_percent: Option<u8>,
+        charging: Option<bool>,
+        feature_summary: String,
+    },
+    MediaStatus {
+        active: bool,
+        summary: String,
+    },
+    ClipboardText {
+        source: ClipboardSource,
+        characters: usize,
+    },
+    NotificationPosted {
+        app_name: String,
+        title: Option<String>,
+        sensitive: bool,
+    },
+    NotificationRemoved {
+        notification_id: String,
+    },
+    FileTransfer {
+        transfer_id: String,
+        file_name: String,
+        bytes: u64,
+        status: String,
+    },
+    FileBrowse {
+        path: String,
+        entries: usize,
+        state: String,
+    },
+    PhotoAssets {
+        count: usize,
+        state: String,
+    },
+    MessageThreads {
+        count: usize,
+        state: String,
+    },
+    CallState {
+        state: String,
+        status: String,
+    },
+    RelayStatus {
+        enabled: bool,
+        connected: bool,
+        state: String,
+    },
+    ClientList {
+        clients: usize,
+        input_owner: Option<String>,
     },
 }
 
@@ -315,6 +372,7 @@ fn read_client_loop(
     let desktop_identity = trust_store.identity();
     let mut current_device: Option<RemoteDevice> = None;
     let mut pending_auth: Option<PendingAuth> = None;
+    let mut incoming_transfers: HashMap<String, DesktopIncomingTransfer> = HashMap::new();
 
     loop {
         let envelope = read_length_prefixed(&mut stream, MAX_VIDEO_FRAME_BYTES)?;
@@ -496,19 +554,46 @@ fn read_client_loop(
             }
             Payload::AuthResponse(_) => {}
             Payload::Input(_) => {}
-            Payload::DeviceStatus(_)
-            | Payload::MediaStatus(_)
-            | Payload::MediaControl(_)
-            | Payload::ClipboardText(_)
-            | Payload::ClipboardImage(_)
-            | Payload::FileTransferStart(_)
-            | Payload::FileTransferChunk(_)
-            | Payload::FileTransferComplete(_)
-            | Payload::FileBrowseRequest(_)
-            | Payload::FileBrowseResponse(_)
+            Payload::DeviceStatus(status) => {
+                send_status(
+                    &status_tx,
+                    NetworkStatus::DeviceStatus {
+                        battery_percent: status.battery_percent,
+                        charging: status.charging,
+                        feature_summary: feature_summary(&status.features),
+                    },
+                );
+            }
+            Payload::MediaStatus(status) => {
+                send_status(
+                    &status_tx,
+                    NetworkStatus::MediaStatus {
+                        active: status.active,
+                        summary: media_summary(&status),
+                    },
+                );
+            }
+            Payload::MediaControl(_) | Payload::ClipboardImage(_) => {}
+            Payload::ClipboardText(clipboard) => {
+                send_status(
+                    &status_tx,
+                    NetworkStatus::ClipboardText {
+                        source: clipboard.source,
+                        characters: clipboard.text.chars().count(),
+                    },
+                );
+            }
+            Payload::FileTransferStart(start) => {
+                handle_incoming_file_start(&mut incoming_transfers, &status_tx, start)?;
+            }
+            Payload::FileTransferChunk(chunk) => {
+                handle_incoming_file_chunk(&mut incoming_transfers, &status_tx, chunk)?;
+            }
+            Payload::FileTransferComplete(complete) => {
+                handle_incoming_file_complete(&mut incoming_transfers, &status_tx, complete);
+            }
+            Payload::FileBrowseRequest(_)
             | Payload::FileMutation(_)
-            | Payload::NotificationPosted(_)
-            | Payload::NotificationRemoved(_)
             | Payload::NotificationAction(_)
             | Payload::AudioFormat(_)
             | Payload::AudioFrame(_)
@@ -516,19 +601,94 @@ fn read_client_loop(
             | Payload::AppWindowOpen(_)
             | Payload::AppWindowClose(_)
             | Payload::AppWindowInput(_)
-            | Payload::MessageThreadList(_)
             | Payload::MessageEvent(_)
             | Payload::MessageSendRequest(_)
-            | Payload::CallState(_)
             | Payload::CallAction(_)
-            | Payload::PhotoAssetList(_)
             | Payload::PhotoAssetTransfer(_)
             | Payload::RelayOffer(_)
-            | Payload::RelayStatus(_)
-            | Payload::ClientList(_)
             | Payload::ClientRoleUpdate(_) => {}
+            Payload::FileBrowseResponse(response) => {
+                send_status(
+                    &status_tx,
+                    NetworkStatus::FileBrowse {
+                        path: response.path,
+                        entries: response.entries.len(),
+                        state: format!("{:?}", response.status.state),
+                    },
+                );
+            }
+            Payload::NotificationPosted(notification) => {
+                send_status(
+                    &status_tx,
+                    NetworkStatus::NotificationPosted {
+                        app_name: notification.app_name,
+                        title: notification.title,
+                        sensitive: notification.sensitive,
+                    },
+                );
+            }
+            Payload::NotificationRemoved(removed) => {
+                send_status(
+                    &status_tx,
+                    NetworkStatus::NotificationRemoved {
+                        notification_id: removed.notification_id,
+                    },
+                );
+            }
+            Payload::MessageThreadList(list) => {
+                send_status(
+                    &status_tx,
+                    NetworkStatus::MessageThreads {
+                        count: list.threads.len(),
+                        state: format!("{:?}", list.status.state),
+                    },
+                );
+            }
+            Payload::CallState(call) => {
+                send_status(
+                    &status_tx,
+                    NetworkStatus::CallState {
+                        state: format!("{:?}", call.state),
+                        status: format!("{:?}", call.status.state),
+                    },
+                );
+            }
+            Payload::PhotoAssetList(list) => {
+                send_status(
+                    &status_tx,
+                    NetworkStatus::PhotoAssets {
+                        count: list.assets.len(),
+                        state: format!("{:?}", list.status.state),
+                    },
+                );
+            }
+            Payload::RelayStatus(relay) => {
+                send_status(
+                    &status_tx,
+                    NetworkStatus::RelayStatus {
+                        enabled: relay.enabled,
+                        connected: relay.connected,
+                        state: format!("{:?}", relay.status.state),
+                    },
+                );
+            }
+            Payload::ClientList(list) => {
+                send_status(
+                    &status_tx,
+                    NetworkStatus::ClientList {
+                        clients: list.clients.len(),
+                        input_owner: list.input_owner_desktop_id,
+                    },
+                );
+            }
         }
     }
+}
+
+struct DesktopIncomingTransfer {
+    file_name: String,
+    path: PathBuf,
+    bytes: u64,
 }
 
 enum WriterCommand {
@@ -552,6 +712,174 @@ struct PendingAuth {
 
 fn send_status(status_tx: &Sender<NetworkStatus>, status: NetworkStatus) {
     let _ = status_tx.send(status);
+}
+
+fn feature_summary(features: &[FeatureStatus]) -> String {
+    let available = features
+        .iter()
+        .filter(|feature| {
+            matches!(
+                feature.state,
+                androidconnect_protocol::FeatureState::Available
+            )
+        })
+        .count();
+    format!("{available}/{} available", features.len())
+}
+
+fn media_summary(status: &MediaStatus) -> String {
+    if !status.active {
+        return status.status.message.clone();
+    }
+    let title = status.title.as_deref().unwrap_or("active media");
+    let artist = status.artist.as_deref().unwrap_or("");
+    if artist.is_empty() {
+        format!("{:?}: {title}", status.playback_state)
+    } else {
+        format!("{:?}: {title} - {artist}", status.playback_state)
+    }
+}
+
+fn handle_incoming_file_start(
+    transfers: &mut HashMap<String, DesktopIncomingTransfer>,
+    status_tx: &Sender<NetworkStatus>,
+    start: FileTransferStart,
+) -> Result<()> {
+    if start.direction != TransferDirection::AndroidToDesktop {
+        return Ok(());
+    }
+    let dir = desktop_download_dir()?;
+    fs::create_dir_all(&dir)?;
+    let path = unique_child_path(&dir, &sanitize_file_name(&start.file_name));
+    File::create(&path)?;
+    transfers.insert(
+        start.transfer_id.clone(),
+        DesktopIncomingTransfer {
+            file_name: start.file_name.clone(),
+            path,
+            bytes: 0,
+        },
+    );
+    send_status(
+        status_tx,
+        NetworkStatus::FileTransfer {
+            transfer_id: start.transfer_id,
+            file_name: start.file_name,
+            bytes: 0,
+            status: "started".to_owned(),
+        },
+    );
+    Ok(())
+}
+
+fn handle_incoming_file_chunk(
+    transfers: &mut HashMap<String, DesktopIncomingTransfer>,
+    status_tx: &Sender<NetworkStatus>,
+    chunk: FileTransferChunk,
+) -> Result<()> {
+    let Some(transfer) = transfers.get_mut(&chunk.transfer_id) else {
+        return Ok(());
+    };
+    if transfer.bytes != chunk.offset {
+        bail!(
+            "transfer {} offset mismatch: got {}, expected {}",
+            chunk.transfer_id,
+            chunk.offset,
+            transfer.bytes
+        );
+    }
+    let mut file = OpenOptions::new().write(true).open(&transfer.path)?;
+    file.seek(SeekFrom::Start(chunk.offset))?;
+    file.write_all(&chunk.data)?;
+    transfer.bytes += chunk.data.len() as u64;
+    send_status(
+        status_tx,
+        NetworkStatus::FileTransfer {
+            transfer_id: chunk.transfer_id,
+            file_name: transfer.file_name.clone(),
+            bytes: transfer.bytes,
+            status: "receiving".to_owned(),
+        },
+    );
+    Ok(())
+}
+
+fn handle_incoming_file_complete(
+    transfers: &mut HashMap<String, DesktopIncomingTransfer>,
+    status_tx: &Sender<NetworkStatus>,
+    complete: FileTransferComplete,
+) {
+    let Some(transfer) = transfers.remove(&complete.transfer_id) else {
+        return;
+    };
+    if complete.status != TransferStatus::Completed {
+        let _ = fs::remove_file(&transfer.path);
+    }
+    send_status(
+        status_tx,
+        NetworkStatus::FileTransfer {
+            transfer_id: complete.transfer_id,
+            file_name: transfer.file_name,
+            bytes: transfer.bytes,
+            status: format!("{:?}", complete.status),
+        },
+    );
+}
+
+fn desktop_download_dir() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("ANDROIDCONNECT_DOWNLOAD_DIR") {
+        return Ok(PathBuf::from(path));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return Ok(PathBuf::from(home).join("Downloads").join("AndroidConnect"));
+    }
+    Ok(std::env::current_dir()?.join("androidconnect-downloads"))
+}
+
+fn unique_child_path(parent: &std::path::Path, file_name: &str) -> PathBuf {
+    let mut candidate = parent.join(file_name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let path = std::path::Path::new(file_name);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("file");
+    let extension = path.extension().and_then(|value| value.to_str());
+    for index in 1..10_000 {
+        let name = if let Some(extension) = extension {
+            format!("{stem}-{index}.{extension}")
+        } else {
+            format!("{stem}-{index}")
+        };
+        candidate = parent.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    parent.join(format!(
+        "{}-{}",
+        Instant::now().elapsed().as_nanos(),
+        file_name
+    ))
+}
+
+fn sanitize_file_name(value: &str) -> String {
+    let clean: String = value
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' | '\0' => '_',
+            ch if ch.is_control() => '_',
+            ch => ch,
+        })
+        .collect();
+    let clean = clean.trim_matches('.').trim();
+    if clean.is_empty() {
+        "file".to_owned()
+    } else {
+        clean.to_owned()
+    }
 }
 
 fn is_clean_disconnect(e: &anyhow::Error) -> bool {
