@@ -1,5 +1,6 @@
-use std::fs;
-use std::io::{self, Read};
+use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::{Shutdown, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -7,13 +8,17 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use androidconnect_protocol::{
-    AUTH_CHALLENGE_BYTES, AuthChallenge, AuthMethod, AuthResult, DeviceHello, Envelope, InputEvent,
-    MAX_CONTROL_FRAME_BYTES, PAIRED_SECRET_BYTES, PROTOCOL_VERSION, Payload, PointerButton,
-    PointerEvent, PointerPhase, SESSION_KEY_FINGERPRINT_BYTES, SystemAction, VideoCodec,
-    VideoFormat, VideoFrame, auth_responses_equal, bytes_to_hex, derive_session_key, hex_to_fixed,
-    normalize_pairing_code, paired_secret_from_pairing_code, pairing_auth_response,
-    read_length_prefixed, session_key_fingerprint, trusted_session_auth_response,
-    video_flags_from_android_media_codec, write_length_prefixed,
+    AUTH_CHALLENGE_BYTES, AuthChallenge, AuthMethod, AuthResult, ClipboardSource, ClipboardText,
+    DeviceHello, DeviceStatus, Envelope, FeatureStatus, FileBrowseRequest, FileBrowseResponse,
+    FileEntry, FileEntryType, FileMutation, FileMutationKind, FileTransferChunk,
+    FileTransferComplete, FileTransferStart, InputEvent, MAX_CONTROL_FRAME_BYTES,
+    MediaControlAction, PAIRED_SECRET_BYTES, PROTOCOL_VERSION, Payload, PointerButton,
+    PointerEvent, PointerPhase, SESSION_KEY_FINGERPRINT_BYTES, SystemAction, TransferDirection,
+    TransferStatus, UtilityFeature, VideoCodec, VideoFormat, VideoFrame, auth_responses_equal,
+    bytes_to_hex, derive_session_key, hex_to_fixed, normalize_pairing_code,
+    paired_secret_from_pairing_code, pairing_auth_response, read_length_prefixed,
+    session_key_fingerprint, trusted_session_auth_response, video_flags_from_android_media_codec,
+    write_length_prefixed,
 };
 use jni::objects::{GlobalRef, JByteArray, JClass, JString, JValue};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong, jstring};
@@ -40,6 +45,7 @@ struct AppState {
     paired_desktop_name: Option<String>,
     session_key_fingerprint: Option<[u8; SESSION_KEY_FINGERPRINT_BYTES]>,
     trusted_desktop_count: usize,
+    android_device_id: Option<String>,
     reconnect_config: Option<SessionConnectConfig>,
     reconnect_callbacks: Option<SessionCallbacks>,
     reconnect_generation: u64,
@@ -50,7 +56,10 @@ struct AppState {
     sent_bytes: u64,
     received_pings: u64,
     sent_pongs: u64,
+    sent_utility_envelopes: u64,
     status_revision: u64,
+    clipboard_sequence: u64,
+    incoming_transfers: HashMap<String, IncomingTransfer>,
 }
 
 impl Default for AppState {
@@ -69,6 +78,7 @@ impl Default for AppState {
             paired_desktop_name: None,
             session_key_fingerprint: None,
             trusted_desktop_count: 0,
+            android_device_id: None,
             reconnect_config: None,
             reconnect_callbacks: None,
             reconnect_generation: 0,
@@ -79,7 +89,10 @@ impl Default for AppState {
             sent_bytes: 0,
             received_pings: 0,
             sent_pongs: 0,
+            sent_utility_envelopes: 0,
             status_revision: 0,
+            clipboard_sequence: 1,
+            incoming_transfers: HashMap::new(),
         }
     }
 }
@@ -104,6 +117,15 @@ impl AppState {
         Ok(())
     }
 
+    fn send_utility_payload(&mut self, payload: Payload) -> Result<(), String> {
+        if !self.input_authenticated {
+            return Err("desktop is not authenticated".to_owned());
+        }
+        self.send_payload(payload)?;
+        self.sent_utility_envelopes += 1;
+        Ok(())
+    }
+
     fn clear_connection(&mut self, error: impl Into<String>) {
         self.connection_generation += 1;
         close_stream(self.stream.take());
@@ -112,6 +134,7 @@ impl AppState {
         self.paired_desktop_id = None;
         self.paired_desktop_name = None;
         self.session_key_fingerprint = None;
+        self.incoming_transfers.clear();
         self.last_error = Some(error.into());
         self.mark_status_changed();
     }
@@ -124,6 +147,7 @@ impl AppState {
         self.paired_desktop_id = None;
         self.paired_desktop_name = None;
         self.session_key_fingerprint = None;
+        self.incoming_transfers.clear();
     }
 
     fn is_connected(&self) -> bool {
@@ -133,6 +157,12 @@ impl AppState {
     fn mark_status_changed(&mut self) {
         self.status_revision = self.status_revision.wrapping_add(1);
     }
+}
+
+#[derive(Debug)]
+struct IncomingTransfer {
+    path: PathBuf,
+    next_offset: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -442,6 +472,209 @@ pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativeStatsJson(
     }
 }
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativePushDeviceStatus(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    status_json: JString<'_>,
+) -> jboolean {
+    let status_json = match jstring_to_string(&mut env, status_json, "device status") {
+        Ok(value) => value,
+        Err(error) => {
+            set_last_error(error);
+            notify_native_status_changed(&mut env);
+            return JNI_FALSE;
+        }
+    };
+
+    match push_device_status_json(&status_json) {
+        Ok(()) => JNI_TRUE,
+        Err(error) => {
+            set_last_error(error);
+            notify_native_status_changed(&mut env);
+            JNI_FALSE
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativePushMediaStatus(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    status_json: JString<'_>,
+) -> jboolean {
+    push_json_payload::<androidconnect_protocol::MediaStatus>(
+        &mut env,
+        status_json,
+        "media status",
+        Payload::MediaStatus,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativePushNotificationPosted(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    notification_json: JString<'_>,
+) -> jboolean {
+    push_json_payload::<androidconnect_protocol::NotificationPosted>(
+        &mut env,
+        notification_json,
+        "notification",
+        Payload::NotificationPosted,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativePushNotificationRemoved(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    notification_id: JString<'_>,
+) -> jboolean {
+    let notification_id = match jstring_to_string(&mut env, notification_id, "notification id") {
+        Ok(value) => value,
+        Err(error) => {
+            set_last_error(error);
+            notify_native_status_changed(&mut env);
+            return JNI_FALSE;
+        }
+    };
+    send_utility_payload(Payload::NotificationRemoved(
+        androidconnect_protocol::NotificationRemoved { notification_id },
+    ))
+    .map(|()| JNI_TRUE)
+    .unwrap_or_else(|error| {
+        set_last_error(error);
+        notify_native_status_changed(&mut env);
+        JNI_FALSE
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativePushClipboardText(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    text: JString<'_>,
+) -> jboolean {
+    let text = match jstring_to_string(&mut env, text, "clipboard text") {
+        Ok(value) => value,
+        Err(error) => {
+            set_last_error(error);
+            notify_native_status_changed(&mut env);
+            return JNI_FALSE;
+        }
+    };
+
+    match push_android_clipboard_text(text) {
+        Ok(()) => JNI_TRUE,
+        Err(error) => {
+            set_last_error(error);
+            notify_native_status_changed(&mut env);
+            JNI_FALSE
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativePushSharedFile(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    file_name: JString<'_>,
+    mime_type: JString<'_>,
+    path: JString<'_>,
+    size_bytes: jlong,
+) -> jboolean {
+    let file_name = match jstring_to_string(&mut env, file_name, "shared file name") {
+        Ok(value) => value,
+        Err(error) => {
+            set_last_error(error);
+            notify_native_status_changed(&mut env);
+            return JNI_FALSE;
+        }
+    };
+    let mime_type = match jstring_to_string(&mut env, mime_type, "shared mime type") {
+        Ok(value) => value,
+        Err(error) => {
+            set_last_error(error);
+            notify_native_status_changed(&mut env);
+            return JNI_FALSE;
+        }
+    };
+    let path = match jstring_to_string(&mut env, path, "shared file path") {
+        Ok(value) => value,
+        Err(error) => {
+            set_last_error(error);
+            notify_native_status_changed(&mut env);
+            return JNI_FALSE;
+        }
+    };
+
+    match push_shared_file(file_name, mime_type, PathBuf::from(path), size_bytes) {
+        Ok(()) => JNI_TRUE,
+        Err(error) => {
+            set_last_error(error);
+            notify_native_status_changed(&mut env);
+            JNI_FALSE
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativePushPhotoAssetList(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    list_json: JString<'_>,
+) -> jboolean {
+    push_json_payload::<androidconnect_protocol::PhotoAssetList>(
+        &mut env,
+        list_json,
+        "photo asset list",
+        Payload::PhotoAssetList,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativePushMessageThreadList(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    list_json: JString<'_>,
+) -> jboolean {
+    push_json_payload::<androidconnect_protocol::MessageThreadList>(
+        &mut env,
+        list_json,
+        "message thread list",
+        Payload::MessageThreadList,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativePushCallState(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    state_json: JString<'_>,
+) -> jboolean {
+    push_json_payload::<androidconnect_protocol::CallState>(
+        &mut env,
+        state_json,
+        "call state",
+        Payload::CallState,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativePushRelayStatus(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    status_json: JString<'_>,
+) -> jboolean {
+    push_json_payload::<androidconnect_protocol::RelayStatus>(
+        &mut env,
+        status_json,
+        "relay status",
+        Payload::RelayStatus,
+    )
+}
+
 pub fn current_stats_json() -> String {
     let Ok(guard) = state().lock() else {
         return r#"{"running":false,"error":"lock_poisoned"}"#.to_owned();
@@ -456,6 +689,7 @@ pub fn current_stats_json() -> String {
         "encoded_bytes": capture.map(|capture| capture.encoded_bytes).unwrap_or_default(),
         "sent_envelopes": guard.sent_envelopes,
         "sent_bytes": guard.sent_bytes,
+        "sent_utility_envelopes": guard.sent_utility_envelopes,
         "received_pings": guard.received_pings,
         "sent_pongs": guard.sent_pongs,
         "pairing_code_set": guard.pairing_code_set,
@@ -464,6 +698,8 @@ pub fn current_stats_json() -> String {
         "paired_desktop_name": guard.paired_desktop_name.clone(),
         "session_key_fingerprint": guard.session_key_fingerprint.map(|fingerprint| bytes_to_hex(&fingerprint)),
         "trusted_desktop_count": guard.trusted_desktop_count,
+        "android_device_id": guard.android_device_id.clone(),
+        "incoming_transfer_count": guard.incoming_transfers.len(),
         "reconnecting": guard.reconnecting,
         "reconnect_attempts": guard.reconnect_attempts,
         "last_reconnect_error": guard.last_reconnect_error.clone(),
@@ -472,6 +708,153 @@ pub fn current_stats_json() -> String {
         "last_error": guard.last_error,
     })
     .to_string()
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceStatusUpdate {
+    device_name: String,
+    manufacturer: String,
+    model: String,
+    android_sdk: u32,
+    battery_percent: Option<u8>,
+    charging: Option<bool>,
+    interactive: Option<bool>,
+    features: Vec<FeatureStatus>,
+}
+
+fn push_json_payload<T>(
+    env: &mut JNIEnv<'_>,
+    json: JString<'_>,
+    label: &str,
+    wrap: impl FnOnce(T) -> Payload,
+) -> jboolean
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let json = match jstring_to_string(env, json, label) {
+        Ok(value) => value,
+        Err(error) => {
+            set_last_error(error);
+            notify_native_status_changed(env);
+            return JNI_FALSE;
+        }
+    };
+    let payload = match serde_json::from_str::<T>(&json) {
+        Ok(value) => wrap(value),
+        Err(error) => {
+            set_last_error(format!("parse {label} JSON failed: {error}"));
+            notify_native_status_changed(env);
+            return JNI_FALSE;
+        }
+    };
+    match send_utility_payload(payload) {
+        Ok(()) => JNI_TRUE,
+        Err(error) => {
+            set_last_error(error);
+            notify_native_status_changed(env);
+            JNI_FALSE
+        }
+    }
+}
+
+fn push_device_status_json(json: &str) -> Result<(), String> {
+    let update: DeviceStatusUpdate = serde_json::from_str(json)
+        .map_err(|error| format!("parse device status failed: {error}"))?;
+    let mut guard = state()
+        .lock()
+        .map_err(|_| "state lock poisoned while sending device status".to_owned())?;
+    let device_id = guard
+        .android_device_id
+        .clone()
+        .unwrap_or_else(|| "android-unpaired".to_owned());
+    guard.send_utility_payload(Payload::DeviceStatus(DeviceStatus {
+        device_id,
+        device_name: update.device_name,
+        manufacturer: update.manufacturer,
+        model: update.model,
+        android_sdk: update.android_sdk,
+        battery_percent: update.battery_percent,
+        charging: update.charging,
+        interactive: update.interactive,
+        features: update.features,
+    }))
+}
+
+fn push_android_clipboard_text(text: String) -> Result<(), String> {
+    let mut guard = state()
+        .lock()
+        .map_err(|_| "state lock poisoned while sending clipboard text".to_owned())?;
+    let sequence = guard.clipboard_sequence;
+    guard.clipboard_sequence = guard.clipboard_sequence.wrapping_add(1);
+    guard.send_utility_payload(Payload::ClipboardText(ClipboardText {
+        sequence,
+        text,
+        source: ClipboardSource::Android,
+    }))
+}
+
+fn push_shared_file(
+    file_name: String,
+    mime_type: String,
+    path: PathBuf,
+    size_bytes: jlong,
+) -> Result<(), String> {
+    let mut file = File::open(&path)
+        .map_err(|error| format!("open shared file {} failed: {error}", path.display()))?;
+    let size = if size_bytes >= 0 {
+        Some(size_bytes as u64)
+    } else {
+        file.metadata().ok().map(|metadata| metadata.len())
+    };
+    let transfer_id = format!("android-share-{}-{}", now_unix_ms(), generate_hex_id(4));
+    send_utility_payload(Payload::FileTransferStart(FileTransferStart {
+        transfer_id: transfer_id.clone(),
+        direction: TransferDirection::AndroidToDesktop,
+        file_name: sanitize_file_name(&file_name),
+        mime_type: empty_to_none(mime_type),
+        size_bytes: size,
+        target_path: None,
+    }))?;
+
+    let mut offset = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("read shared file {} failed: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        send_utility_payload(Payload::FileTransferChunk(FileTransferChunk {
+            transfer_id: transfer_id.clone(),
+            offset,
+            data: buffer[..read].to_vec(),
+        }))?;
+        offset += read as u64;
+    }
+
+    send_utility_payload(Payload::FileTransferComplete(FileTransferComplete {
+        transfer_id,
+        status: TransferStatus::Completed,
+        message: None,
+    }))
+}
+
+fn send_utility_payload(payload: Payload) -> Result<(), String> {
+    let mut guard = state()
+        .lock()
+        .map_err(|_| "state lock poisoned while sending utility payload".to_owned())?;
+    guard.send_utility_payload(payload)
+}
+
+fn jstring_to_string(
+    env: &mut JNIEnv<'_>,
+    value: JString<'_>,
+    label: &str,
+) -> Result<String, String> {
+    env.get_string(&value)
+        .map(|value| value.to_string_lossy().into_owned())
+        .map_err(|error| format!("invalid {label} string: {error}"))
 }
 
 fn connect_session(
@@ -521,6 +904,7 @@ fn connect_session(
     guard.paired_desktop_name = None;
     guard.session_key_fingerprint = None;
     guard.trusted_desktop_count = trusted_desktop_count;
+    guard.android_device_id = Some(android_device_id.clone());
     guard.reconnect_config = Some(config.clone());
     guard.reconnect_callbacks = Some(callbacks.clone());
     guard.received_pings = 0;
@@ -698,7 +1082,12 @@ fn input_reader_loop(
             payload => {
                 if is_desktop_utility_payload(&payload) {
                     if desktop_authenticated {
-                        handle_desktop_utility_payload(&mut env, payload);
+                        handle_desktop_utility_payload(
+                            &mut env,
+                            &callbacks.status_class,
+                            generation,
+                            payload,
+                        );
                     } else {
                         set_last_error("utility command ignored before pairing authentication");
                     }
@@ -732,7 +1121,360 @@ fn is_desktop_utility_payload(payload: &Payload) -> bool {
     )
 }
 
-fn handle_desktop_utility_payload(_env: &mut JNIEnv<'_>, _payload: Payload) {}
+fn handle_desktop_utility_payload(
+    env: &mut JNIEnv<'_>,
+    bridge_class: &GlobalRef,
+    generation: u64,
+    payload: Payload,
+) {
+    let result = match payload {
+        Payload::MediaControl(control) => call_static_void_string(
+            env,
+            bridge_class,
+            "onMediaControl",
+            media_control_action_name(control.action),
+        ),
+        Payload::ClipboardText(clipboard) => call_static_void_string(
+            env,
+            bridge_class,
+            "onClipboardTextFromDesktop",
+            clipboard.text,
+        ),
+        Payload::FileTransferStart(start) => handle_file_transfer_start(start),
+        Payload::FileTransferChunk(chunk) => handle_file_transfer_chunk(chunk),
+        Payload::FileTransferComplete(complete) => handle_file_transfer_complete(complete),
+        Payload::FileBrowseRequest(request) => handle_file_browse_request(generation, request),
+        Payload::FileMutation(mutation) => handle_file_mutation(generation, mutation),
+        Payload::AudioControl(control) => call_static_void_string(
+            env,
+            bridge_class,
+            "onAudioControl",
+            format!("{:?}", control.command),
+        ),
+        Payload::AppWindowOpen(open) => call_static_void_strings(
+            env,
+            bridge_class,
+            "onAppWindowOpen",
+            &open.package_name,
+            open.activity_name.as_deref().unwrap_or(""),
+        ),
+        Payload::CallAction(action) => call_static_void_strings(
+            env,
+            bridge_class,
+            "onCallAction",
+            &format!("{:?}", action.action),
+            action.phone_number.as_deref().unwrap_or(""),
+        ),
+        Payload::MessageSendRequest(request) => call_static_void_string(
+            env,
+            bridge_class,
+            "onMessageSendRequest",
+            serde_json::to_string(&request).unwrap_or_default(),
+        ),
+        Payload::NotificationAction(action) => call_static_void_string(
+            env,
+            bridge_class,
+            "onNotificationAction",
+            serde_json::to_string(&action).unwrap_or_default(),
+        ),
+        Payload::PhotoAssetTransfer(transfer) => call_static_void_string(
+            env,
+            bridge_class,
+            "onPhotoAssetTransfer",
+            serde_json::to_string(&transfer).unwrap_or_default(),
+        ),
+        Payload::RelayOffer(offer) => call_static_void_string(
+            env,
+            bridge_class,
+            "onRelayOffer",
+            serde_json::to_string(&offer).unwrap_or_default(),
+        ),
+        Payload::ClientRoleUpdate(update) => call_static_void_string(
+            env,
+            bridge_class,
+            "onClientRoleUpdate",
+            serde_json::to_string(&update).unwrap_or_default(),
+        ),
+        _ => Ok(()),
+    };
+
+    if let Err(error) = result {
+        set_last_error(error);
+    }
+}
+
+fn media_control_action_name(action: MediaControlAction) -> &'static str {
+    match action {
+        MediaControlAction::Play => "Play",
+        MediaControlAction::Pause => "Pause",
+        MediaControlAction::PlayPause => "PlayPause",
+        MediaControlAction::Previous => "Previous",
+        MediaControlAction::Next => "Next",
+        MediaControlAction::Stop => "Stop",
+    }
+}
+
+fn handle_file_transfer_start(start: FileTransferStart) -> Result<(), String> {
+    if start.direction != TransferDirection::DesktopToAndroid {
+        return Err("Android can only receive DesktopToAndroid file transfers".to_owned());
+    }
+    let storage_dir = active_storage_dir()?;
+    let received_dir = storage_dir.join("received");
+    fs::create_dir_all(&received_dir)
+        .map_err(|error| format!("create {} failed: {error}", received_dir.display()))?;
+    let path = unique_child_path(&received_dir, &sanitize_file_name(&start.file_name));
+    File::create(&path).map_err(|error| format!("create {} failed: {error}", path.display()))?;
+
+    let mut guard = state()
+        .lock()
+        .map_err(|_| "state lock poisoned while starting file transfer".to_owned())?;
+    guard.incoming_transfers.insert(
+        start.transfer_id,
+        IncomingTransfer {
+            path,
+            next_offset: 0,
+        },
+    );
+    guard.mark_status_changed();
+    Ok(())
+}
+
+fn handle_file_transfer_chunk(chunk: FileTransferChunk) -> Result<(), String> {
+    let (path, expected_offset) = {
+        let guard = state()
+            .lock()
+            .map_err(|_| "state lock poisoned while writing file transfer".to_owned())?;
+        let transfer = guard
+            .incoming_transfers
+            .get(&chunk.transfer_id)
+            .ok_or_else(|| format!("unknown transfer {}", chunk.transfer_id))?;
+        (transfer.path.clone(), transfer.next_offset)
+    };
+    if chunk.offset != expected_offset {
+        return Err(format!(
+            "transfer {} offset mismatch: got {}, expected {}",
+            chunk.transfer_id, chunk.offset, expected_offset
+        ));
+    }
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .map_err(|error| format!("open {} failed: {error}", path.display()))?;
+    file.seek(SeekFrom::Start(chunk.offset))
+        .map_err(|error| format!("seek {} failed: {error}", path.display()))?;
+    file.write_all(&chunk.data)
+        .map_err(|error| format!("write {} failed: {error}", path.display()))?;
+
+    let mut guard = state()
+        .lock()
+        .map_err(|_| "state lock poisoned while updating file transfer".to_owned())?;
+    if let Some(transfer) = guard.incoming_transfers.get_mut(&chunk.transfer_id) {
+        transfer.next_offset = chunk.offset + chunk.data.len() as u64;
+    }
+    guard.mark_status_changed();
+    Ok(())
+}
+
+fn handle_file_transfer_complete(complete: FileTransferComplete) -> Result<(), String> {
+    let removed = {
+        let mut guard = state()
+            .lock()
+            .map_err(|_| "state lock poisoned while completing file transfer".to_owned())?;
+        let transfer = guard.incoming_transfers.remove(&complete.transfer_id);
+        guard.mark_status_changed();
+        transfer
+    };
+    if complete.status != TransferStatus::Completed
+        && let Some(transfer) = removed
+    {
+        let _ = fs::remove_file(transfer.path);
+    }
+    Ok(())
+}
+
+fn handle_file_browse_request(generation: u64, request: FileBrowseRequest) -> Result<(), String> {
+    let root = active_storage_dir()?;
+    let path = resolve_storage_path(&root, &request.path)?;
+    let mut entries = Vec::new();
+    for entry in
+        fs::read_dir(&path).map_err(|error| format!("read {} failed: {error}", path.display()))?
+    {
+        let entry = entry.map_err(|error| format!("read directory entry failed: {error}"))?;
+        let metadata = entry
+            .metadata()
+            .map_err(|error| format!("metadata {} failed: {error}", entry.path().display()))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let child_path = relative_storage_path(&root, &entry.path());
+        entries.push(FileEntry {
+            name,
+            path: child_path,
+            entry_type: if metadata.is_dir() {
+                FileEntryType::Directory
+            } else {
+                FileEntryType::File
+            },
+            size_bytes: if metadata.is_file() {
+                Some(metadata.len())
+            } else {
+                None
+            },
+            modified_unix_ms: metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis() as u64),
+            mime_type: None,
+        });
+    }
+    entries.sort_by(|left, right| {
+        file_entry_type_rank(left.entry_type)
+            .cmp(&file_entry_type_rank(right.entry_type))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    send_payload_if_generation(
+        generation,
+        Payload::FileBrowseResponse(FileBrowseResponse {
+            request_id: request.request_id,
+            path: relative_storage_path(&root, &path),
+            entries,
+            status: FeatureStatus::available(UtilityFeature::FileBrowser),
+        }),
+    )
+}
+
+fn handle_file_mutation(generation: u64, mutation: FileMutation) -> Result<(), String> {
+    let root = active_storage_dir()?;
+    let path = resolve_storage_path(&root, &mutation.path)?;
+    match mutation.mutation {
+        FileMutationKind::CreateFolder => {
+            fs::create_dir_all(&path)
+                .map_err(|error| format!("create {} failed: {error}", path.display()))?;
+        }
+        FileMutationKind::Delete => {
+            if path.is_dir() {
+                fs::remove_dir_all(&path)
+            } else {
+                fs::remove_file(&path)
+            }
+            .map_err(|error| format!("delete {} failed: {error}", path.display()))?;
+        }
+        FileMutationKind::Rename => {
+            let new_path = mutation
+                .new_path
+                .as_deref()
+                .ok_or_else(|| "rename requires new_path".to_owned())
+                .and_then(|new_path| resolve_storage_path(&root, new_path))?;
+            fs::rename(&path, &new_path).map_err(|error| {
+                format!(
+                    "rename {} to {} failed: {error}",
+                    path.display(),
+                    new_path.display()
+                )
+            })?;
+        }
+    }
+    let parent = path
+        .parent()
+        .map(|parent| relative_storage_path(&root, parent))
+        .unwrap_or_default();
+    handle_file_browse_request(
+        generation,
+        FileBrowseRequest {
+            request_id: mutation.request_id,
+            path: parent,
+            include_thumbnails: false,
+        },
+    )
+}
+
+fn active_storage_dir() -> Result<PathBuf, String> {
+    state()
+        .lock()
+        .map_err(|_| "state lock poisoned while reading storage dir".to_owned())?
+        .reconnect_config
+        .as_ref()
+        .map(|config| config.storage_dir.clone())
+        .ok_or_else(|| "storage dir unavailable until connected".to_owned())
+}
+
+fn file_entry_type_rank(entry_type: FileEntryType) -> u8 {
+    match entry_type {
+        FileEntryType::Directory => 0,
+        FileEntryType::Media => 1,
+        FileEntryType::File => 2,
+    }
+}
+
+fn resolve_storage_path(root: &Path, path: &str) -> Result<PathBuf, String> {
+    let mut output = root.to_path_buf();
+    for component in Path::new(path).components() {
+        match component {
+            std::path::Component::Normal(part) => output.push(part),
+            std::path::Component::CurDir => {}
+            std::path::Component::RootDir => {}
+            _ => return Err("path escapes AndroidConnect storage".to_owned()),
+        }
+    }
+    Ok(output)
+}
+
+fn relative_storage_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn unique_child_path(parent: &Path, file_name: &str) -> PathBuf {
+    let mut candidate = parent.join(file_name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let path = Path::new(file_name);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("file");
+    let extension = path.extension().and_then(|value| value.to_str());
+    for index in 1..10_000 {
+        let name = if let Some(extension) = extension {
+            format!("{stem}-{index}.{extension}")
+        } else {
+            format!("{stem}-{index}")
+        };
+        candidate = parent.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    parent.join(format!("{}-{}", now_unix_ms(), file_name))
+}
+
+fn sanitize_file_name(value: &str) -> String {
+    let clean: String = value
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' | '\0' => '_',
+            ch if ch.is_control() => '_',
+            ch => ch,
+        })
+        .collect();
+    let clean = clean.trim_matches('.').trim();
+    if clean.is_empty() {
+        "file".to_owned()
+    } else {
+        clean.to_owned()
+    }
+}
+
+fn empty_to_none(value: String) -> Option<String> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
 
 fn cancel_active_reconnect_and_connection() {
     if let Ok(mut guard) = state().lock() {
@@ -1337,6 +2079,54 @@ fn call_static_bool(
             false
         }
     }
+}
+
+fn call_static_void_string(
+    env: &mut JNIEnv<'_>,
+    class: &GlobalRef,
+    name: &str,
+    value: impl AsRef<str>,
+) -> Result<(), String> {
+    let jvalue = env
+        .new_string(value.as_ref())
+        .map_err(|error| format!("{name} JNI string failed: {error}"))?;
+    env.call_static_method(
+        class,
+        name,
+        "(Ljava/lang/String;)V",
+        &[JValue::from(&jvalue)],
+    )
+    .map(|_| ())
+    .map_err(|error| {
+        clear_pending_exception(env);
+        format!("{name} dispatch failed: {error}")
+    })
+}
+
+fn call_static_void_strings(
+    env: &mut JNIEnv<'_>,
+    class: &GlobalRef,
+    name: &str,
+    first: &str,
+    second: &str,
+) -> Result<(), String> {
+    let jfirst = env
+        .new_string(first)
+        .map_err(|error| format!("{name} first JNI string failed: {error}"))?;
+    let jsecond = env
+        .new_string(second)
+        .map_err(|error| format!("{name} second JNI string failed: {error}"))?;
+    env.call_static_method(
+        class,
+        name,
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        &[JValue::from(&jfirst), JValue::from(&jsecond)],
+    )
+    .map(|_| ())
+    .map_err(|error| {
+        clear_pending_exception(env);
+        format!("{name} dispatch failed: {error}")
+    })
 }
 
 fn clear_pending_exception(env: &mut JNIEnv<'_>) {

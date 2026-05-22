@@ -4,7 +4,9 @@ import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.media.projection.MediaProjectionManager;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -25,6 +27,8 @@ import org.json.JSONObject;
 public final class MainActivity extends Activity {
     private static final int REQUEST_MEDIA_PROJECTION = 1001;
     private static final int REQUEST_NOTIFICATIONS = 1002;
+    private static final int REQUEST_PICK_FILE = 1003;
+    private static final int REQUEST_MEDIA_READ = 1004;
     private static final int DEFAULT_PORT = 48172;
     private static final long STATUS_REFRESH_MS = 1_000L;
 
@@ -53,6 +57,8 @@ public final class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         setContentView(createContentView());
         requestNotificationsIfNeeded();
+        AndroidUtilityBridge.rememberContext(this);
+        AndroidUtilityBridge.handleShareIntent(this, getIntent());
         updateStatus();
     }
 
@@ -60,6 +66,7 @@ public final class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         NativeBridge.addStatusListener(nativeStatusListener);
+        AndroidUtilityBridge.rememberContext(this);
         updateStatus();
         statusHandler.removeCallbacks(statusRefresh);
         statusHandler.postDelayed(statusRefresh, STATUS_REFRESH_MS);
@@ -70,6 +77,14 @@ public final class MainActivity extends Activity {
         NativeBridge.removeStatusListener(nativeStatusListener);
         statusHandler.removeCallbacks(statusRefresh);
         super.onPause();
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        AndroidUtilityBridge.handleShareIntent(this, intent);
+        updateStatus();
     }
 
     private ScrollView createContentView() {
@@ -130,6 +145,38 @@ public final class MainActivity extends Activity {
         input.setOnClickListener(view ->
                 startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)));
         content.addView(input, matchWrap());
+
+        Button utilityRefresh = new Button(this);
+        utilityRefresh.setText(getString(R.string.refresh_utilities));
+        utilityRefresh.setOnClickListener(view -> {
+            NativeBridge.refreshUtilities(this);
+            updateStatus();
+        });
+        content.addView(utilityRefresh, matchWrap());
+
+        Button notificationAccess = new Button(this);
+        notificationAccess.setText(getString(R.string.open_notification_access));
+        notificationAccess.setOnClickListener(view ->
+                startActivity(new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)));
+        content.addView(notificationAccess, matchWrap());
+
+        Button clipboard = new Button(this);
+        clipboard.setText(getString(R.string.sync_clipboard));
+        clipboard.setOnClickListener(view -> {
+            AndroidUtilityBridge.pushForegroundClipboard(this);
+            updateStatus();
+        });
+        content.addView(clipboard, matchWrap());
+
+        Button pickFile = new Button(this);
+        pickFile.setText(getString(R.string.send_file));
+        pickFile.setOnClickListener(view -> pickFileForDesktop());
+        content.addView(pickFile, matchWrap());
+
+        Button mediaPermission = new Button(this);
+        mediaPermission.setText(getString(R.string.grant_media_access));
+        mediaPermission.setOnClickListener(view -> requestMediaReadIfNeeded());
+        content.addView(mediaPermission, matchWrap());
 
         Button stop = new Button(this);
         stop.setText(getString(R.string.stop_mirroring));
@@ -196,6 +243,11 @@ public final class MainActivity extends Activity {
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode != REQUEST_MEDIA_PROJECTION) {
+            if (requestCode == REQUEST_PICK_FILE && resultCode == RESULT_OK && data != null) {
+                Uri uri = data.getData();
+                AndroidUtilityBridge.handlePickedUri(this, uri);
+                updateStatus();
+            }
             return;
         }
         if (resultCode != RESULT_OK || data == null) {
@@ -214,10 +266,34 @@ public final class MainActivity extends Activity {
         updateStatus();
     }
 
+    private void pickFileForDesktop() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("*/*");
+        startActivityForResult(intent, REQUEST_PICK_FILE);
+    }
+
     private void requestNotificationsIfNeeded() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             requestPermissions(new String[] { Manifest.permission.POST_NOTIFICATIONS },
                     REQUEST_NOTIFICATIONS);
+        }
+    }
+
+    private void requestMediaReadIfNeeded() {
+        if (Build.VERSION.SDK_INT >= 33) {
+            requestPermissions(new String[] {
+                            Manifest.permission.READ_MEDIA_IMAGES,
+                            Manifest.permission.READ_MEDIA_VIDEO
+                    },
+                    REQUEST_MEDIA_READ);
+        } else if (Build.VERSION.SDK_INT >= 23
+                && checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE)
+                != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[] { Manifest.permission.READ_EXTERNAL_STORAGE },
+                    REQUEST_MEDIA_READ);
+        } else {
+            AndroidUtilityBridge.pushPhotosPermissionStatus();
         }
     }
 
@@ -255,6 +331,8 @@ public final class MainActivity extends Activity {
             long sentBytes = json.optLong("sent_bytes", 0);
             long receivedPings = json.optLong("received_pings", 0);
             long sentPongs = json.optLong("sent_pongs", 0);
+            long sentUtilities = json.optLong("sent_utility_envelopes", 0);
+            long incomingTransfers = json.optLong("incoming_transfer_count", 0);
             long reconnectAttempts = json.optLong("reconnect_attempts", 0);
             String connectedTo = json.optString("connected_to", "");
             String pairedDesktopName = json.optString("paired_desktop_name", "");
@@ -316,6 +394,12 @@ public final class MainActivity extends Activity {
             status.append(" pongs");
             status.append("\nSent: ");
             status.append(formatBytes(sentBytes));
+            status.append(" / ");
+            status.append(sentUtilities);
+            status.append(" utility messages");
+            status.append("\nTransfers: ");
+            status.append(incomingTransfers);
+            status.append(" active incoming");
 
             if (!lastError.isEmpty()) {
                 status.append("\nLast error: ");

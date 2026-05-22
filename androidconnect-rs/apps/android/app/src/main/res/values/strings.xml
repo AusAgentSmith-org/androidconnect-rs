@@ -6,6 +6,11 @@
     <string name="connect_desktop">Connect desktop</string>
     <string name="disconnect_desktop">Disconnect desktop</string>
     <string name="open_accessibility">Open input permissions</string>
+    <string name="refresh_utilities">Refresh utilities</string>
+    <string name="open_notification_access">Open notification and media access</string>
+    <string name="sync_clipboard">Sync current clipboard</string>
+    <string name="send_file">Send file to desktop</string>
+    <string name="grant_media_access">Grant photo and video access</string>
     <string name="notification_channel">Mirroring</string>
     <string name="notification_title">AndroidConnect mirroring</string>
     <string name="notification_text">Screen capture is running</string>
