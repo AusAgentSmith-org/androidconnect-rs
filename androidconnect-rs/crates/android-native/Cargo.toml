@@ -11,4 +11,5 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 androidconnect-protocol.workspace = true
 jni.workspace = true
+serde.workspace = true
 serde_json.workspace = true

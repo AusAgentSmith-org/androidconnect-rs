@@ -10,7 +10,7 @@ platform lock-in.
 
 ## Current Status
 
-AndroidConnect RS is in the MVP 1 / M3 slice:
+AndroidConnect RS is in the MVP 1 / M4 slice:
 
 - Screen capture is implemented with Android `MediaProjection`.
 - H.264 encoding is implemented with Android `MediaCodec`.
@@ -20,14 +20,14 @@ AndroidConnect RS is in the MVP 1 / M3 slice:
 - Desktop-to-Android input transport is implemented over the current TCP connection.
 - Android input dispatch is implemented through an accessibility service for tap, drag, scroll,
   text replacement, and global actions.
-- Ephemeral pairing-code authentication gates desktop input.
+- Identity-bound pairing and stored trusted-session authentication gate desktop input.
 - `cargo test` passes for the Rust workspace.
 
 The remaining MVP blockers are product-critical:
 
-- Validate input end-to-end on emulator and physical Android devices.
-- Persist paired desktop identity, derive per-session keys, and move to encrypted/authenticated
-  transport beyond the current input gate.
+- Validate input end-to-end on emulator and physical Android devices. The physical-device pass is
+  deferred for the current development order, not completed.
+- Move to encrypted/authenticated transport beyond the current trusted-session input gate.
 - Add reconnect/session recovery and clearer status/error reporting.
 - Add rotation/resolution renegotiation.
 - Replace accessibility `ACTION_SET_TEXT` with an IME-backed text path for reliable editing.
@@ -61,7 +61,7 @@ AndroidConnect should be:
 | Capability | AndroidConnect target | Current status | Phone Link | KDE Connect | Decision |
 | --- | --- | --- | --- | --- | --- |
 | LAN/manual connection | Required | Manual host/port implemented | Supported, plus Microsoft account pairing and device cloud plumbing | Supported with LAN discovery and manual IP | Keep local-first; add discovery after auth |
-| Pairing/authentication | Required | Partial: ephemeral pairing-code input gate | Required through Microsoft account/QR/manual code | Required pair request/accept | Persist identity/session keys before public testing |
+| Pairing/authentication | Required | Partial: persistent identity and trusted-session input gate; TCP still unencrypted | Required through Microsoft account/QR/manual code | Required pair request/accept | Add encrypted/authenticated transport before public testing |
 | Android screen mirroring | Core differentiator | Implemented, emulator validated | Supported as "phone screen" on supported Android devices/markets | Android "Virtual Display" listed as missing | P0/P1; make this broadly Android-compatible |
 | Desktop mouse/touch control of Android | Core differentiator | Implemented, pending validation | Supported for phone screen/apps with mouse, trackpad, keyboard, pen, touch | Android mouse receiver exists, but no Android virtual display pairing | P0; accessibility first, optional advanced backends later |
 | Desktop keyboard text into Android | Required | Basic accessibility text replacement | Supported in phone screen/apps | Limited/feature-specific | P0/P1; move to IME path |

@@ -46,8 +46,8 @@ Implemented:
 - Android `MediaProjection` foreground service and H.264 encoder (working, validated).
 - Android to desktop TCP transport — `DeviceHello`, `VideoFormat`, `VideoFrame` streaming end-to-end.
 - Desktop to Android input transport over the existing TCP connection for MVP validation.
-- Ephemeral pairing-code challenge/response using HMAC-SHA256. Android ignores desktop input until
-  pairing succeeds.
+- Identity-bound pairing-code challenge/response and stored trusted-session authentication using
+  HMAC-SHA256. Android ignores desktop input until authentication succeeds.
 - Android accessibility service with tap, drag, scroll, basic text edit, and global action helpers.
 - Desktop coordinate mapping from letterboxed window pixels to Android frame pixels.
 - Desktop window-title status for listening, connected, paired, video format, heartbeat,
@@ -63,8 +63,8 @@ Implemented:
 Not implemented yet:
 
 - End-to-end input validation on a physical Android device (emulator pass does not substitute).
-- Persistent paired desktop identity, durable trust state, and encrypted/authenticated session
-  transport. The current pairing-code gate is not the final security model.
+- Encrypted/authenticated session transport. The current trusted-session input gate is not the final
+  security model because the TCP stream is still unencrypted.
 - Reconnect/session recovery beyond the current manual connect/disconnect flow.
 - Rotation/resolution renegotiation beyond initial format metadata.
 
@@ -136,10 +136,11 @@ Input:
 
 Pairing and security:
 
-- MVP starts with a manual pairing code printed by the desktop and entered on Android.
-- The current implementation uses an HMAC-SHA256 challenge/response and ignores input until Android
-  verifies that proof.
-- A persistent paired session should still store trusted desktop identity and derive per-session keys.
+- MVP starts with a manual pairing code printed by the desktop and entered on Android for first
+  pairing.
+- The current implementation stores trusted desktop identity after first pairing, derives
+  per-session keys, and ignores input until Android verifies either pairing-code proof or stored
+  trusted-session proof.
 - Unauthenticated input packets must continue to be ignored.
 - LAN discovery must not imply trust.
 
@@ -217,7 +218,7 @@ Exit criteria:
 
 Goal: control Android from the desktop window.
 
-Status: **implemented, pending device validation**. Desktop captures pointer, wheel, text, and
+Status: **implemented, physical-device validation deferred**. Desktop captures pointer, wheel, text, and
 navigation shortcuts; Android receives `InputEvent` messages over the current TCP stream after
 pairing authentication and dispatches them through `RemoteControlAccessibilityService`.
 
@@ -244,31 +245,30 @@ Exit criteria:
 
 Goal: make the MVP safe enough for repeated local use.
 
-Status: **partial**. Ephemeral pairing-code authentication gates input for each connection. Durable
-paired identity storage, per-session keys, encrypted transport, and reconnect recovery are not
-implemented yet.
+Status: **partial**. Persistent desktop trust and per-session key derivation are implemented for the
+input gate. Encrypted transport and reconnect recovery are not implemented yet.
 
 Tasks:
 
-- Add manual pairing code flow. Partial — desktop prints a code; Android enters it.
-- Store paired desktop identity on Android.
+- Add manual pairing code flow. Done — desktop prints a code; Android enters it for first pairing.
+- Store paired desktop identity on Android. Done.
 - Authenticate each session before accepting video or input traffic. Partial — input is gated;
   video remains available during pairing.
 - Add heartbeat and reconnect behavior. Partial — heartbeat is implemented and visible; reconnect is
   pending.
 - Stop input processing immediately when a session is unauthenticated or disconnected. Done for the
   current connection.
-- Add visible Android status for connected desktop identity. Partial — current status shows address
-  and pairing state; persisted desktop identity is pending.
+- Add visible Android status for connected desktop identity. Done.
 - Add desktop status line for connected/disconnected/authenticated state. Done in the window title.
 - Add native connection/session status callbacks to Android UI. Done for immediate visible-activity
   refresh; polling remains as fallback.
 
 Exit criteria:
 
-- Unknown clients cannot send input. Partial — true for the current pairing-code gate; persistent
-  trust is pending.
-- Previously paired desktop can reconnect without repeating full setup.
+- Unknown clients cannot send input. Partial — true for pairing/trusted-session auth; encrypted
+  transport is pending.
+- Previously paired desktop can reconnect without repeating full setup. Partial — authentication can
+  reuse stored trust, but connection recovery is still manual.
 - Revoking permissions or dropping the network produces clear user-visible state.
 
 ### M5: MVP Polish And Test Pass
@@ -342,9 +342,9 @@ Android device variance:
 3. Add desktop decode/render for H.264. ✓
 4. Add desktop-to-Android input transport. ✓
 5. Add Android input dispatch bridge. ✓
-6. Add ephemeral pairing-code input authentication. ✓
-7. Validate input end-to-end on a physical Android device.
-8. Persist paired desktop identity and derive per-session keys.
+6. Add identity-bound pairing-code input authentication. ✓
+7. Validate input end-to-end on a physical Android device. Deferred for current development order.
+8. Persist paired desktop identity and derive per-session keys. ✓
 9. Add reconnect/session recovery.
 10. Add rotation/resolution renegotiation.
 11. Replace accessibility text with IME-backed input path.
@@ -352,7 +352,7 @@ Android device variance:
 13. Add QA scripts and polish.
 
 Input authentication comes before QUIC because unauthenticated input is the higher-risk exposure on
-LAN. QUIC and persistent session keys are still needed before public testing.
+LAN. QUIC/encrypted transport is still needed before public testing.
 
 ## Target Manual QA Script
 

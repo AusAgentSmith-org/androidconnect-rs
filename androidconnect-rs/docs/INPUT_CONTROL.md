@@ -1,22 +1,24 @@
 # Desktop Input Control
 
-This document describes the current M3 input-control path. It is implemented but still needs
-end-to-end validation on emulator and physical Android devices.
+This document describes the current input-control path. It is implemented; the physical-device QA
+pass is deferred in the current development order.
 
 ## Security Note
 
-Input is gated by an ephemeral pairing-code challenge/response. The desktop viewer prints a pairing
-code, Android sends a challenge, and Android ignores input until the desktop proves knowledge of the
-same code with HMAC-SHA256.
+Input is gated by identity-bound authentication. On first connection, the desktop viewer prints a
+pairing code, Android sends a challenge, and Android ignores input until the desktop proves knowledge
+of the same code with HMAC-SHA256. After first pairing, Android stores the trusted desktop identity,
+the desktop stores the paired Android device secret, and later sessions can authenticate from stored
+trust without re-entering the code.
 
-This is still not the final security model. The TCP stream is not encrypted, paired desktop identity
-is not persisted, and this is not hardened against active man-in-the-middle attacks. Do not use this
-on an untrusted network.
+This is still not the final security model. The TCP stream is not encrypted and is not hardened
+against active man-in-the-middle attacks. Do not use this on an untrusted network.
 
 ## Requirements
 
 - Android screen mirroring must already be connected to the desktop viewer.
-- Android must be connected with the pairing code printed by the desktop viewer.
+- Android must be connected with the pairing code printed by the desktop viewer for first pairing,
+  or with previously stored desktop trust for reconnects.
 - Android accessibility service must be enabled from Android Settings.
 - The desktop viewer window must have keyboard focus for text and shortcuts.
 - The desktop window title should show `input paired` before input validation begins.
@@ -55,9 +57,9 @@ gesture.
 ```text
 winit window events
   -> desktop InputEvent channel
-  -> pairing-authenticated desktop TCP writer
+  -> pairing/trusted-session-authenticated desktop TCP writer
   -> Android native input reader thread
-  -> pairing gate
+  -> auth gate
   -> JNI static calls
   -> RemoteControlAccessibilityService
   -> Android accessibility gestures/globals/text actions
@@ -79,8 +81,8 @@ Key files:
 - Wheel scrolling depends on accessibility exposing a scrollable node in the active window.
 - Accessibility gestures can fail in secure screens, system permission prompts, and some custom UI.
 - Right/middle/back/forward mouse buttons are serialized but ignored by Android dispatch for now.
-- Pairing is ephemeral. Trusted desktop identity, encrypted transport, and per-session keys are not
-  implemented yet.
+- Trusted desktop identity and per-session key derivation are implemented, but transport encryption
+  is not.
 - Only one desktop client is expected.
 
 ## Validation Checklist
@@ -88,7 +90,8 @@ Key files:
 1. Start the desktop viewer on the LAN bind address.
 2. Build and install Android with the native library packaged.
 3. Enable the Android accessibility service.
-4. Connect Android to the desktop host with the desktop pairing code and start mirroring.
+4. Connect Android to the desktop host with the desktop pairing code and start mirroring. On a
+   trusted reconnect, leave the code blank.
 5. Confirm the desktop logs `pairing authenticated; desktop input enabled` and the window title
    shows `input paired`.
 6. Confirm the desktop renders the live Android frame.

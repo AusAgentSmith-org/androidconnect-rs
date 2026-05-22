@@ -54,7 +54,13 @@ public final class NativeBridge {
         if (!AVAILABLE) {
             return false;
         }
-        return nativeConnect(host, port, buildDeviceName(context), pairingCode);
+        return nativeConnect(
+                host,
+                port,
+                buildDeviceName(context),
+                context.getFilesDir().getAbsolutePath(),
+                pairingCode
+        );
     }
 
     public static void disconnect() {
@@ -128,6 +134,7 @@ public final class NativeBridge {
             String host,
             int port,
             String deviceName,
+            String storageDir,
             String pairingCode
     );
     private static native void nativeDisconnect();

@@ -103,7 +103,7 @@ public final class MainActivity extends Activity {
         content.addView(portField, matchWrap());
 
         pairingField = new EditText(this);
-        pairingField.setHint("Pairing code from desktop");
+        pairingField.setHint("Pairing code from desktop (first connection)");
         pairingField.setSingleLine(true);
         content.addView(pairingField, matchWrap());
 
@@ -169,11 +169,6 @@ public final class MainActivity extends Activity {
         }
 
         String pairingCode = pairingField.getText().toString().trim();
-        if (pairingCode.isEmpty()) {
-            showError("Enter the pairing code shown by the desktop viewer.");
-            return;
-        }
-
         updateStatus("Connecting to " + host + ":" + port + "...");
         new Thread(() -> {
             boolean connected = NativeBridge.connect(this, host, port, pairingCode);
@@ -260,6 +255,9 @@ public final class MainActivity extends Activity {
             long receivedPings = json.optLong("received_pings", 0);
             long sentPongs = json.optLong("sent_pongs", 0);
             String connectedTo = json.optString("connected_to", "");
+            String pairedDesktopName = json.optString("paired_desktop_name", "");
+            String pairedDesktopId = json.optString("paired_desktop_id", "");
+            long trustedDesktopCount = json.optLong("trusted_desktop_count", 0);
             String lastError = json.optString("last_error", "");
 
             StringBuilder status = new StringBuilder();
@@ -283,11 +281,21 @@ public final class MainActivity extends Activity {
             status.append("\nPairing: ");
             if (inputAuthenticated) {
                 status.append("authenticated");
+                if (!pairedDesktopName.isEmpty()) {
+                    status.append(" with ");
+                    status.append(pairedDesktopName);
+                } else if (!pairedDesktopId.isEmpty()) {
+                    status.append(" with ");
+                    status.append(pairedDesktopId);
+                }
             } else if (connected) {
                 status.append("pending");
             } else {
                 status.append("not connected");
             }
+            status.append(" (");
+            status.append(trustedDesktopCount);
+            status.append(" trusted)");
 
             status.append("\nInput service: ");
             status.append(inputState);

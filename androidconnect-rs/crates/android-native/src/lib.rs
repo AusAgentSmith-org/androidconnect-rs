@@ -1,19 +1,24 @@
+use std::fs;
 use std::io::{self, Read};
 use std::net::{Shutdown, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use androidconnect_protocol::{
-    AUTH_CHALLENGE_BYTES, AuthChallenge, AuthResult, DeviceHello, Envelope, InputEvent,
-    MAX_CONTROL_FRAME_BYTES, PROTOCOL_VERSION, Payload, PointerButton, PointerEvent, PointerPhase,
-    SystemAction, VideoCodec, VideoFormat, VideoFrame, auth_responses_equal,
-    normalize_pairing_code, pairing_auth_response, read_length_prefixed,
+    AUTH_CHALLENGE_BYTES, AuthChallenge, AuthMethod, AuthResult, DeviceHello, Envelope, InputEvent,
+    MAX_CONTROL_FRAME_BYTES, PAIRED_SECRET_BYTES, PROTOCOL_VERSION, Payload, PointerButton,
+    PointerEvent, PointerPhase, SESSION_KEY_FINGERPRINT_BYTES, SystemAction, VideoCodec,
+    VideoFormat, VideoFrame, auth_responses_equal, bytes_to_hex, derive_session_key, hex_to_fixed,
+    normalize_pairing_code, paired_secret_from_pairing_code, pairing_auth_response,
+    read_length_prefixed, session_key_fingerprint, trusted_session_auth_response,
     video_flags_from_android_media_codec, write_length_prefixed,
 };
 use jni::objects::{GlobalRef, JByteArray, JClass, JString, JValue};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong, jstring};
 use jni::{JNIEnv, JavaVM};
+use serde::{Deserialize, Serialize};
 
 static STATE: OnceLock<Mutex<AppState>> = OnceLock::new();
 
@@ -28,6 +33,10 @@ struct AppState {
     last_video_format: Option<VideoFormat>,
     pairing_code_set: bool,
     input_authenticated: bool,
+    paired_desktop_id: Option<String>,
+    paired_desktop_name: Option<String>,
+    session_key_fingerprint: Option<[u8; SESSION_KEY_FINGERPRINT_BYTES]>,
+    trusted_desktop_count: usize,
     sent_envelopes: u64,
     sent_bytes: u64,
     received_pings: u64,
@@ -47,6 +56,10 @@ impl Default for AppState {
             last_video_format: None,
             pairing_code_set: false,
             input_authenticated: false,
+            paired_desktop_id: None,
+            paired_desktop_name: None,
+            session_key_fingerprint: None,
+            trusted_desktop_count: 0,
             sent_envelopes: 0,
             sent_bytes: 0,
             received_pings: 0,
@@ -81,6 +94,9 @@ impl AppState {
         close_stream(self.stream.take());
         self.connected_to = None;
         self.input_authenticated = false;
+        self.paired_desktop_id = None;
+        self.paired_desktop_name = None;
+        self.session_key_fingerprint = None;
         self.last_error = Some(error.into());
         self.mark_status_changed();
     }
@@ -160,6 +176,7 @@ pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativeConnect(
     host: JString<'_>,
     port: jint,
     device_name: JString<'_>,
+    storage_dir: JString<'_>,
     pairing_code: JString<'_>,
 ) -> jboolean {
     let host = match env.get_string(&host) {
@@ -174,6 +191,14 @@ pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativeConnect(
         .get_string(&device_name)
         .map(|value| value.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "Android device".to_owned());
+    let storage_dir = match env.get_string(&storage_dir) {
+        Ok(value) => PathBuf::from(value.to_string_lossy().into_owned()),
+        Err(error) => {
+            set_last_error(format!("invalid storage dir string: {error}"));
+            notify_native_status_changed(&mut env);
+            return JNI_FALSE;
+        }
+    };
     let pairing_code = match env.get_string(&pairing_code) {
         Ok(value) => normalize_pairing_code(&value.to_string_lossy()),
         Err(error) => {
@@ -188,8 +213,18 @@ pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativeConnect(
         notify_native_status_changed(&mut env);
         return JNI_FALSE;
     }
-    if pairing_code.is_empty() {
-        set_last_error("pairing code required");
+    let trust_store = match AndroidTrustStore::load_or_create(&storage_dir) {
+        Ok(store) => store,
+        Err(error) => {
+            set_last_error(format!("trust store unavailable: {error}"));
+            notify_native_status_changed(&mut env);
+            return JNI_FALSE;
+        }
+    };
+    let android_device_id = trust_store.device_id().to_owned();
+    let trusted_desktop_count = trust_store.trusted_desktop_count();
+    if pairing_code.is_empty() && trusted_desktop_count == 0 {
+        set_last_error("pairing code required for first desktop");
         notify_native_status_changed(&mut env);
         return JNI_FALSE;
     }
@@ -248,20 +283,23 @@ pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativeConnect(
     guard.connection_generation += 1;
     guard.stream = Some(stream);
     guard.connected_to = Some(address.clone());
-    guard.pairing_code_set = true;
+    guard.pairing_code_set = !pairing_code.is_empty();
     guard.input_authenticated = false;
+    guard.paired_desktop_id = None;
+    guard.paired_desktop_name = None;
+    guard.session_key_fingerprint = None;
+    guard.trusted_desktop_count = trusted_desktop_count;
     guard.received_pings = 0;
     guard.sent_pongs = 0;
     guard.last_error = None;
     guard.mark_status_changed();
     let generation = guard.connection_generation;
     let auth_challenge = make_auth_challenge();
-    let expected_auth_response = pairing_auth_response(&pairing_code, &auth_challenge.challenge);
 
-    let hello = Payload::Hello(DeviceHello::android("android-local", device_name));
+    let hello = Payload::Hello(DeviceHello::android(android_device_id.clone(), device_name));
     let send_result = guard
         .send_payload(hello)
-        .and_then(|()| guard.send_payload(Payload::AuthChallenge(auth_challenge)));
+        .and_then(|()| guard.send_payload(Payload::AuthChallenge(auth_challenge.clone())));
     match send_result {
         Ok(()) => {
             if let Some(format) = guard.last_video_format.clone()
@@ -281,7 +319,12 @@ pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativeConnect(
                 input_stream,
                 generation,
                 address,
-                expected_auth_response,
+                AuthContext {
+                    trust_store,
+                    android_device_id,
+                    pairing_code,
+                    challenge: auth_challenge.challenge,
+                },
             );
             JNI_TRUE
         }
@@ -305,6 +348,9 @@ pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativeDisconnect(
         guard.connected_to = None;
         guard.pairing_code_set = false;
         guard.input_authenticated = false;
+        guard.paired_desktop_id = None;
+        guard.paired_desktop_name = None;
+        guard.session_key_fingerprint = None;
         guard.last_error = None;
         guard.mark_status_changed();
         true
@@ -436,6 +482,10 @@ pub fn current_stats_json() -> String {
         "sent_pongs": guard.sent_pongs,
         "pairing_code_set": guard.pairing_code_set,
         "input_authenticated": guard.input_authenticated,
+        "paired_desktop_id": guard.paired_desktop_id.clone(),
+        "paired_desktop_name": guard.paired_desktop_name.clone(),
+        "session_key_fingerprint": guard.session_key_fingerprint.map(|fingerprint| bytes_to_hex(&fingerprint)),
+        "trusted_desktop_count": guard.trusted_desktop_count,
         "status_revision": guard.status_revision,
         "uptime_ms": capture.map(|capture| capture.started_at.elapsed().as_millis()).unwrap_or_default(),
         "last_error": guard.last_error,
@@ -450,7 +500,7 @@ fn spawn_input_reader(
     stream: TcpStream,
     generation: u64,
     address: String,
-    expected_auth_response: [u8; androidconnect_protocol::AUTH_RESPONSE_BYTES],
+    auth_context: AuthContext,
 ) {
     let thread_address = address.clone();
     let spawn_result = thread::Builder::new()
@@ -462,7 +512,7 @@ fn spawn_input_reader(
                 &status_class,
                 stream,
                 generation,
-                expected_auth_response,
+                auth_context,
             );
             if let Err(error) = result {
                 let changed = clear_connection_if_generation(
@@ -489,7 +539,7 @@ fn input_reader_loop(
     status_class: &GlobalRef,
     mut stream: TcpStream,
     generation: u64,
-    expected_auth_response: [u8; androidconnect_protocol::AUTH_RESPONSE_BYTES],
+    mut auth_context: AuthContext,
 ) -> Result<(), String> {
     let mut env = java_vm
         .attach_current_thread()
@@ -518,25 +568,31 @@ fn input_reader_loop(
             }
             Payload::AuthChallenge(_) => {}
             Payload::AuthResponse(response) => {
-                let accepted = auth_responses_equal(&expected_auth_response, &response.response);
-                let message = if accepted {
-                    "paired".to_owned()
-                } else {
-                    "pairing authentication failed".to_owned()
-                };
-                let status_changed = set_input_authenticated_if_generation(generation, accepted);
+                let auth_result = authenticate_desktop(&mut auth_context, &response)?;
+                let status_changed = set_authenticated_desktop_if_generation(
+                    generation,
+                    auth_result.accepted,
+                    auth_result.desktop_id.clone(),
+                    auth_result.desktop_name.clone(),
+                    auth_result.session_key_fingerprint,
+                    auth_context.trust_store.trusted_desktop_count(),
+                );
                 send_payload_if_generation(
                     generation,
                     Payload::AuthResult(AuthResult {
-                        accepted,
-                        message: message.clone(),
+                        accepted: auth_result.accepted,
+                        message: auth_result.message.clone(),
+                        trusted: auth_result.trusted,
+                        desktop_id: auth_result.desktop_id.clone(),
+                        desktop_name: auth_result.desktop_name.clone(),
+                        session_key_fingerprint: auth_result.session_key_fingerprint,
                     }),
                 )?;
                 if status_changed {
                     notify_native_status_changed_with_class(&mut env, status_class);
                 }
-                if !accepted {
-                    return Err(message);
+                if !auth_result.accepted {
+                    return Err(auth_result.message);
                 }
                 desktop_authenticated = true;
             }
@@ -554,6 +610,247 @@ fn input_reader_loop(
             | Payload::VideoFormat(_)
             | Payload::VideoFrame(_) => {}
         }
+    }
+}
+
+struct AuthContext {
+    trust_store: AndroidTrustStore,
+    android_device_id: String,
+    pairing_code: String,
+    challenge: [u8; AUTH_CHALLENGE_BYTES],
+}
+
+struct AuthDecision {
+    accepted: bool,
+    message: String,
+    trusted: bool,
+    desktop_id: Option<String>,
+    desktop_name: Option<String>,
+    session_key_fingerprint: Option<[u8; SESSION_KEY_FINGERPRINT_BYTES]>,
+}
+
+fn authenticate_desktop(
+    context: &mut AuthContext,
+    response: &androidconnect_protocol::AuthResponse,
+) -> Result<AuthDecision, String> {
+    if response.desktop_id.trim().is_empty() {
+        return Ok(AuthDecision::rejected("desktop identity missing"));
+    }
+
+    let desktop_id = response.desktop_id.clone();
+    let desktop_name = if response.desktop_name.trim().is_empty() {
+        "Desktop".to_owned()
+    } else {
+        response.desktop_name.clone()
+    };
+
+    let paired_secret = match response.method {
+        AuthMethod::PairingCode => {
+            if context.pairing_code.is_empty() {
+                return Ok(AuthDecision::rejected(
+                    "pairing code required for new desktop",
+                ));
+            }
+            let expected = pairing_auth_response(
+                &context.pairing_code,
+                &context.android_device_id,
+                &desktop_id,
+                &context.challenge,
+            );
+            if !auth_responses_equal(&expected, &response.response) {
+                return Ok(AuthDecision::rejected("pairing authentication failed"));
+            }
+            let paired_secret = paired_secret_from_pairing_code(
+                &context.pairing_code,
+                &context.android_device_id,
+                &desktop_id,
+            );
+            context
+                .trust_store
+                .store_desktop(&desktop_id, &desktop_name, paired_secret)
+                .map_err(|error| format!("pairing persistence failed: {error}"))?;
+            paired_secret
+        }
+        AuthMethod::TrustedSession => {
+            let Some(paired_desktop) = context.trust_store.paired_desktop(&desktop_id) else {
+                return Ok(AuthDecision::rejected("desktop is not paired"));
+            };
+            let expected = trusted_session_auth_response(
+                &paired_desktop.paired_secret,
+                &context.android_device_id,
+                &desktop_id,
+                &context.challenge,
+            );
+            if !auth_responses_equal(&expected, &response.response) {
+                return Ok(AuthDecision::rejected(
+                    "trusted session authentication failed",
+                ));
+            }
+            context
+                .trust_store
+                .mark_authenticated(&desktop_id, &desktop_name)
+                .map_err(|error| format!("trusted session persistence failed: {error}"))?;
+            paired_desktop.paired_secret
+        }
+    };
+
+    let session_key = derive_session_key(
+        &paired_secret,
+        &context.android_device_id,
+        &desktop_id,
+        &context.challenge,
+    );
+    let fingerprint = session_key_fingerprint(&session_key);
+
+    Ok(AuthDecision {
+        accepted: true,
+        message: match response.method {
+            AuthMethod::PairingCode => "paired and trusted".to_owned(),
+            AuthMethod::TrustedSession => "trusted session authenticated".to_owned(),
+        },
+        trusted: matches!(response.method, AuthMethod::TrustedSession),
+        desktop_id: Some(desktop_id),
+        desktop_name: Some(desktop_name),
+        session_key_fingerprint: Some(fingerprint),
+    })
+}
+
+impl AuthDecision {
+    fn rejected(message: impl Into<String>) -> Self {
+        Self {
+            accepted: false,
+            message: message.into(),
+            trusted: false,
+            desktop_id: None,
+            desktop_name: None,
+            session_key_fingerprint: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AndroidTrustStore {
+    path: PathBuf,
+    data: AndroidTrustData,
+}
+
+#[derive(Debug, Clone)]
+struct PairedDesktop {
+    paired_secret: [u8; PAIRED_SECRET_BYTES],
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AndroidTrustData {
+    device_id: String,
+    paired_desktops: Vec<PairedDesktopRecord>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PairedDesktopRecord {
+    desktop_id: String,
+    desktop_name: String,
+    paired_secret_hex: String,
+    last_authenticated_unix_ms: u64,
+}
+
+impl AndroidTrustStore {
+    fn load_or_create(storage_dir: &Path) -> Result<Self, String> {
+        if storage_dir.as_os_str().is_empty() {
+            return Err("empty storage dir".to_owned());
+        }
+        let path = storage_dir.join("androidconnect-trust.json");
+        let data = if path.exists() {
+            let raw = fs::read_to_string(&path)
+                .map_err(|error| format!("read {} failed: {error}", path.display()))?;
+            serde_json::from_str(&raw)
+                .map_err(|error| format!("parse {} failed: {error}", path.display()))?
+        } else {
+            AndroidTrustData {
+                device_id: String::new(),
+                paired_desktops: Vec::new(),
+            }
+        };
+
+        let mut store = Self { path, data };
+        if store.data.device_id.trim().is_empty() {
+            store.data.device_id = format!("android-{}", generate_hex_id(16));
+            store.save()?;
+        }
+        Ok(store)
+    }
+
+    fn device_id(&self) -> &str {
+        &self.data.device_id
+    }
+
+    fn trusted_desktop_count(&self) -> usize {
+        self.data.paired_desktops.len()
+    }
+
+    fn paired_desktop(&self, desktop_id: &str) -> Option<PairedDesktop> {
+        self.data
+            .paired_desktops
+            .iter()
+            .find(|record| record.desktop_id == desktop_id)
+            .and_then(|record| {
+                let paired_secret = hex_to_fixed::<PAIRED_SECRET_BYTES>(&record.paired_secret_hex)?;
+                Some(PairedDesktop { paired_secret })
+            })
+    }
+
+    fn store_desktop(
+        &mut self,
+        desktop_id: &str,
+        desktop_name: &str,
+        paired_secret: [u8; PAIRED_SECRET_BYTES],
+    ) -> Result<(), String> {
+        let timestamp = now_unix_ms();
+        let paired_secret_hex = bytes_to_hex(&paired_secret);
+        if let Some(record) = self
+            .data
+            .paired_desktops
+            .iter_mut()
+            .find(|record| record.desktop_id == desktop_id)
+        {
+            record.desktop_name = desktop_name.to_owned();
+            record.paired_secret_hex = paired_secret_hex;
+            record.last_authenticated_unix_ms = timestamp;
+        } else {
+            self.data.paired_desktops.push(PairedDesktopRecord {
+                desktop_id: desktop_id.to_owned(),
+                desktop_name: desktop_name.to_owned(),
+                paired_secret_hex,
+                last_authenticated_unix_ms: timestamp,
+            });
+        }
+        self.save()
+    }
+
+    fn mark_authenticated(&mut self, desktop_id: &str, desktop_name: &str) -> Result<(), String> {
+        if let Some(record) = self
+            .data
+            .paired_desktops
+            .iter_mut()
+            .find(|record| record.desktop_id == desktop_id)
+        {
+            record.desktop_name = desktop_name.to_owned();
+            record.last_authenticated_unix_ms = now_unix_ms();
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    fn save(&self) -> Result<(), String> {
+        if let Some(parent) = self.path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("create {} failed: {error}", parent.display()))?;
+        }
+        let raw = serde_json::to_string_pretty(&self.data)
+            .map_err(|error| format!("encode trust store failed: {error}"))?;
+        fs::write(&self.path, raw)
+            .map_err(|error| format!("write {} failed: {error}", self.path.display()))
     }
 }
 
@@ -827,11 +1124,26 @@ fn clear_connection_if_generation(generation: u64, error: impl Into<String>) -> 
     }
 }
 
-fn set_input_authenticated_if_generation(generation: u64, authenticated: bool) -> bool {
+fn set_authenticated_desktop_if_generation(
+    generation: u64,
+    authenticated: bool,
+    desktop_id: Option<String>,
+    desktop_name: Option<String>,
+    session_key_fingerprint: Option<[u8; SESSION_KEY_FINGERPRINT_BYTES]>,
+    trusted_desktop_count: usize,
+) -> bool {
     if let Ok(mut guard) = state().lock()
         && guard.connection_generation == generation
     {
         guard.input_authenticated = authenticated;
+        guard.paired_desktop_id = if authenticated { desktop_id } else { None };
+        guard.paired_desktop_name = if authenticated { desktop_name } else { None };
+        guard.session_key_fingerprint = if authenticated {
+            session_key_fingerprint
+        } else {
+            None
+        };
+        guard.trusted_desktop_count = trusted_desktop_count;
         guard.mark_status_changed();
         true
     } else {
@@ -885,6 +1197,21 @@ fn make_auth_challenge() -> AuthChallenge {
         fill_fallback_challenge(&mut challenge);
     }
     AuthChallenge { challenge }
+}
+
+fn generate_hex_id(bytes: usize) -> String {
+    let mut raw = vec![0_u8; bytes];
+    if fill_random(&mut raw).is_err() {
+        fill_fallback_challenge(&mut raw);
+    }
+    bytes_to_hex(&raw)
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
 }
 
 fn fill_random(output: &mut [u8]) -> io::Result<()> {
@@ -941,8 +1268,97 @@ mod tests {
         assert_eq!(stats["last_error"], "connection failed");
     }
 
+    #[test]
+    fn android_trust_store_persists_device_and_desktop() {
+        let _guard = test_lock().lock().expect("test lock");
+        let dir = test_storage_dir("android-trust-store");
+        let secret = [5_u8; PAIRED_SECRET_BYTES];
+
+        let mut store = AndroidTrustStore::load_or_create(&dir).expect("create trust store");
+        let device_id = store.device_id().to_owned();
+        store
+            .store_desktop("desktop-1", "Desktop", secret)
+            .expect("store desktop");
+        drop(store);
+
+        let store = AndroidTrustStore::load_or_create(&dir).expect("reload trust store");
+        assert_eq!(store.device_id(), device_id);
+        assert_eq!(store.trusted_desktop_count(), 1);
+        assert_eq!(
+            store
+                .paired_desktop("desktop-1")
+                .map(|pairing| pairing.paired_secret),
+            Some(secret)
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn authenticate_desktop_accepts_pairing_then_trusted_session() {
+        let _guard = test_lock().lock().expect("test lock");
+        let dir = test_storage_dir("android-auth");
+        let store = AndroidTrustStore::load_or_create(&dir).expect("create trust store");
+        let android_device_id = store.device_id().to_owned();
+        let challenge = [11_u8; AUTH_CHALLENGE_BYTES];
+        let desktop_id = "desktop-1";
+        let desktop_name = "Test Desktop";
+        let pairing_code = "123456";
+        let mut context = AuthContext {
+            trust_store: store,
+            android_device_id: android_device_id.clone(),
+            pairing_code: pairing_code.to_owned(),
+            challenge,
+        };
+
+        let pairing_response = androidconnect_protocol::AuthResponse {
+            desktop_id: desktop_id.to_owned(),
+            desktop_name: desktop_name.to_owned(),
+            method: AuthMethod::PairingCode,
+            response: pairing_auth_response(
+                pairing_code,
+                &android_device_id,
+                desktop_id,
+                &challenge,
+            ),
+        };
+        let decision = authenticate_desktop(&mut context, &pairing_response).expect("pairing auth");
+        assert!(decision.accepted);
+        assert!(!decision.trusted);
+
+        let paired_secret = context
+            .trust_store
+            .paired_desktop(desktop_id)
+            .expect("stored desktop")
+            .paired_secret;
+        let trusted_response = androidconnect_protocol::AuthResponse {
+            desktop_id: desktop_id.to_owned(),
+            desktop_name: desktop_name.to_owned(),
+            method: AuthMethod::TrustedSession,
+            response: trusted_session_auth_response(
+                &paired_secret,
+                &android_device_id,
+                desktop_id,
+                &challenge,
+            ),
+        };
+        let decision = authenticate_desktop(&mut context, &trusted_response).expect("trusted auth");
+        assert!(decision.accepted);
+        assert!(decision.trusted);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn stats_value() -> serde_json::Value {
         serde_json::from_str(&current_stats_json()).expect("valid stats json")
+    }
+
+    fn test_storage_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "androidconnect-{name}-{}-{}",
+            std::process::id(),
+            now_unix_ms()
+        ))
     }
 
     fn test_lock() -> &'static Mutex<()> {

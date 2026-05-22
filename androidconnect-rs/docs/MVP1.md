@@ -12,7 +12,10 @@ The detailed desktop input-control reference lives in `docs/INPUT_CONTROL.md`.
 - `MediaCodec` encodes the full display to H.264 from a `VirtualDisplay` surface. ✓
 - Encoded frames are passed through JNI into Rust-owned protocol types. ✓
 - Android opens a TCP connection to the desktop receiver and sends `DeviceHello`, `VideoFormat`, and `VideoFrame` envelopes. ✓
-- Android and desktop perform an HMAC-SHA256 pairing-code challenge/response before input is accepted. ✓
+- Android and desktop perform an identity-bound HMAC-SHA256 pairing-code challenge/response before
+  input is accepted. ✓
+- Android persists trusted desktop identity, desktop persists paired Android trust, and both sides
+  derive a per-session key fingerprint for authenticated sessions. ✓
 - Android exposes an accessibility service with tap, drag, and global navigation helpers. ✓
 - Desktop has a Rust receiver that decodes H.264 and renders frames live in a native window. ✓
 - Desktop rejects unsupported protocol versions. ✓
@@ -25,7 +28,7 @@ The detailed desktop input-control reference lives in `docs/INPUT_CONTROL.md`.
 - Android native connection/session status changes notify the visible activity immediately, with
   polling kept as a fallback. ✓
 
-Validated on emulator: Pixel 7 Pro AVD, API 36 (`google_apis_playstore`), streaming H.264 at 1080×2340/30fps, rendered live on desktop. Physical-device validation is still pending.
+Validated on emulator: Pixel 7 Pro AVD, API 36 (`google_apis_playstore`), streaming H.264 at 1080×2340/30fps, rendered live on desktop. Physical-device validation is deferred for the current development pass.
 
 ## Current Slice — M3: Desktop Input Control
 
@@ -39,14 +42,15 @@ Capture desktop pointer and keyboard events and deliver them to the Android acce
 - Back/home/recents shortcuts from desktop keyboard. ✓
 - Validate input end-to-end on emulator/physical device.
 
-TCP is acceptable for local validation. The current pairing-code input gate is enough to stop
-accidental unauthenticated input, but persistent trust, encrypted transport, and session-key
-derivation are still required before public testing. QUIC should replace TCP after that hardening
-to give separate reliable/unreliable streams for control, input, and video.
+TCP is acceptable for local validation. The current trusted-session input gate stops accidental
+unauthenticated input, but the stream is still not encrypted or hardened against active
+man-in-the-middle attacks. QUIC should replace TCP after reconnect/session recovery to give separate
+reliable/unreliable streams for control, input, and video.
 
-The current pairing gate is ephemeral: the desktop prints a pairing code, Android sends a challenge,
-the desktop proves knowledge of the code, and Android ignores input until the proof succeeds. It
-does not persist trusted desktop identities and does not encrypt the TCP stream.
+The current trust model: the desktop has a persistent local identity, Android has a persistent
+app-install device id, first pairing derives and stores a shared secret on both sides, and later
+connections can authenticate with that stored trust without re-entering the code. It still does not
+encrypt the TCP stream.
 
 ## Input Path
 
@@ -74,24 +78,24 @@ Known shortcuts:
 - Accessibility must be explicitly enabled by the user before remote input can work.
 - Accessibility text input does not preserve cursor position, selection, or IME composition.
 - Scroll and gesture dispatch can fail where Android accessibility cannot act on the active UI.
-- Input is gated by the pairing-code challenge/response, but the TCP stream is not encrypted or
+- Input is gated by pairing/trusted-session authentication, but the TCP stream is not encrypted or
   hardened against active man-in-the-middle attacks. Do not expose it on an untrusted network.
 
 ## Immediate Backlog
 
-1. Validate desktop click/drag/wheel/text/global actions on a physical Android device.
-2. Persist paired desktop identity and derive per-session keys beyond the current ephemeral input gate.
-3. Add reconnect/session recovery beyond the current manual connect/disconnect flow.
-4. Add rotation/resolution renegotiation.
-5. Harden text input with an IME service instead of accessibility `ACTION_SET_TEXT`.
-6. Add desktop frame-rate and byte-rate counters.
-7. Replace single TCP stream with authenticated QUIC/control streams.
+1. Add reconnect/session recovery beyond the current manual connect/disconnect flow.
+2. Add rotation/resolution renegotiation.
+3. Harden text input with an IME service instead of accessibility `ACTION_SET_TEXT`.
+4. Add desktop frame-rate and byte-rate counters.
+5. Replace single TCP stream with encrypted/authenticated QUIC/control streams.
+6. Run the deferred physical-device input QA pass.
 
 ## Current Manual Run Flow
 
 1. Start `androidconnect-desktop-viewer` on the desktop and bind `0.0.0.0:48172`.
 2. Build and install the Android app with `libandroidconnect_android_native.so` packaged.
 3. Enter the desktop LAN IP and the pairing code printed by the desktop viewer in AndroidConnect.
+   On later reconnects to an already trusted desktop, the pairing code can be blank.
 4. Tap `Connect desktop`.
 5. Confirm the desktop logs `pairing authenticated; desktop input enabled` and the window title
    switches to `input paired`.

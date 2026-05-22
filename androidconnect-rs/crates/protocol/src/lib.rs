@@ -4,14 +4,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const DEFAULT_CONTROL_PORT: u16 = 48172;
 pub const DEFAULT_VIDEO_PORT: u16 = 48173;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 256 * 1024;
 pub const MAX_VIDEO_FRAME_BYTES: usize = 32 * 1024 * 1024;
 pub const AUTH_CHALLENGE_BYTES: usize = 32;
 pub const AUTH_RESPONSE_BYTES: usize = 32;
-const AUTH_CONTEXT: &[u8] = b"AndroidConnect pairing v1";
+pub const PAIRED_SECRET_BYTES: usize = 32;
+pub const SESSION_KEY_BYTES: usize = 32;
+pub const SESSION_KEY_FINGERPRINT_BYTES: usize = 8;
+const PAIRING_AUTH_CONTEXT: &[u8] = b"AndroidConnect pairing v2 auth";
+const PAIRED_SECRET_CONTEXT: &[u8] = b"AndroidConnect pairing v2 secret";
+const TRUSTED_AUTH_CONTEXT: &[u8] = b"AndroidConnect trusted session v1";
+const SESSION_KEY_CONTEXT: &[u8] = b"AndroidConnect session key v1";
+const SESSION_KEY_FINGERPRINT_CONTEXT: &[u8] = b"AndroidConnect session key fingerprint v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Envelope {
@@ -191,13 +198,26 @@ pub struct AuthChallenge {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthResponse {
+    pub desktop_id: String,
+    pub desktop_name: String,
+    pub method: AuthMethod,
     pub response: [u8; AUTH_RESPONSE_BYTES],
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthMethod {
+    PairingCode,
+    TrustedSession,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthResult {
     pub accepted: bool,
     pub message: String,
+    pub trusted: bool,
+    pub desktop_id: Option<String>,
+    pub desktop_name: Option<String>,
+    pub session_key_fingerprint: Option<[u8; SESSION_KEY_FINGERPRINT_BYTES]>,
 }
 
 #[derive(Debug, Error)]
@@ -268,13 +288,67 @@ pub fn normalize_pairing_code(code: &str) -> String {
 
 pub fn pairing_auth_response(
     pairing_code: &str,
+    android_device_id: &str,
+    desktop_id: &str,
     challenge: &[u8; AUTH_CHALLENGE_BYTES],
 ) -> [u8; AUTH_RESPONSE_BYTES] {
     let normalized = normalize_pairing_code(pairing_code);
-    let mut message = Vec::with_capacity(AUTH_CONTEXT.len() + challenge.len());
-    message.extend_from_slice(AUTH_CONTEXT);
+    let mut message = Vec::new();
+    message.extend_from_slice(PAIRING_AUTH_CONTEXT);
+    append_identity_part(&mut message, android_device_id);
+    append_identity_part(&mut message, desktop_id);
     message.extend_from_slice(challenge);
     hmac_sha256(normalized.as_bytes(), &message)
+}
+
+pub fn paired_secret_from_pairing_code(
+    pairing_code: &str,
+    android_device_id: &str,
+    desktop_id: &str,
+) -> [u8; PAIRED_SECRET_BYTES] {
+    let normalized = normalize_pairing_code(pairing_code);
+    let mut message = Vec::new();
+    message.extend_from_slice(PAIRED_SECRET_CONTEXT);
+    append_identity_part(&mut message, android_device_id);
+    append_identity_part(&mut message, desktop_id);
+    hmac_sha256(normalized.as_bytes(), &message)
+}
+
+pub fn trusted_session_auth_response(
+    paired_secret: &[u8; PAIRED_SECRET_BYTES],
+    android_device_id: &str,
+    desktop_id: &str,
+    challenge: &[u8; AUTH_CHALLENGE_BYTES],
+) -> [u8; AUTH_RESPONSE_BYTES] {
+    let mut message = Vec::new();
+    message.extend_from_slice(TRUSTED_AUTH_CONTEXT);
+    append_identity_part(&mut message, android_device_id);
+    append_identity_part(&mut message, desktop_id);
+    message.extend_from_slice(challenge);
+    hmac_sha256(paired_secret, &message)
+}
+
+pub fn derive_session_key(
+    paired_secret: &[u8; PAIRED_SECRET_BYTES],
+    android_device_id: &str,
+    desktop_id: &str,
+    challenge: &[u8; AUTH_CHALLENGE_BYTES],
+) -> [u8; SESSION_KEY_BYTES] {
+    let mut message = Vec::new();
+    message.extend_from_slice(SESSION_KEY_CONTEXT);
+    append_identity_part(&mut message, android_device_id);
+    append_identity_part(&mut message, desktop_id);
+    message.extend_from_slice(challenge);
+    hmac_sha256(paired_secret, &message)
+}
+
+pub fn session_key_fingerprint(
+    session_key: &[u8; SESSION_KEY_BYTES],
+) -> [u8; SESSION_KEY_FINGERPRINT_BYTES] {
+    let digest = hmac_sha256(session_key, SESSION_KEY_FINGERPRINT_CONTEXT);
+    let mut fingerprint = [0_u8; SESSION_KEY_FINGERPRINT_BYTES];
+    fingerprint.copy_from_slice(&digest[..SESSION_KEY_FINGERPRINT_BYTES]);
+    fingerprint
 }
 
 pub fn auth_responses_equal(
@@ -286,6 +360,46 @@ pub fn auth_responses_equal(
         diff |= left ^ right;
     }
     diff == 0
+}
+
+pub fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+pub fn hex_to_fixed<const N: usize>(value: &str) -> Option<[u8; N]> {
+    let clean: String = value.chars().filter(|ch| !ch.is_whitespace()).collect();
+    if clean.len() != N * 2 {
+        return None;
+    }
+
+    let mut output = [0_u8; N];
+    for (index, pair) in clean.as_bytes().chunks_exact(2).enumerate() {
+        let high = hex_digit(pair[0])?;
+        let low = hex_digit(pair[1])?;
+        output[index] = (high << 4) | low;
+    }
+    Some(output)
+}
+
+fn append_identity_part(message: &mut Vec<u8>, value: &str) {
+    let bytes = value.as_bytes();
+    message.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    message.extend_from_slice(bytes);
+}
+
+fn hex_digit(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn now_micros() -> u64 {
@@ -477,10 +591,44 @@ mod tests {
     #[test]
     fn pairing_auth_response_changes_with_code() {
         let challenge = [7_u8; AUTH_CHALLENGE_BYTES];
-        let first = pairing_auth_response("123456", &challenge);
-        let second = pairing_auth_response("654321", &challenge);
+        let first = pairing_auth_response("123456", "android-1", "desktop-1", &challenge);
+        let second = pairing_auth_response("654321", "android-1", "desktop-1", &challenge);
         assert!(auth_responses_equal(&first, &first));
         assert!(!auth_responses_equal(&first, &second));
+    }
+
+    #[test]
+    fn pairing_auth_response_binds_device_identities() {
+        let challenge = [7_u8; AUTH_CHALLENGE_BYTES];
+        let first = pairing_auth_response("123456", "android-1", "desktop-1", &challenge);
+        let second = pairing_auth_response("123456", "android-2", "desktop-1", &challenge);
+        let third = pairing_auth_response("123456", "android-1", "desktop-2", &challenge);
+
+        assert!(!auth_responses_equal(&first, &second));
+        assert!(!auth_responses_equal(&first, &third));
+    }
+
+    #[test]
+    fn trusted_auth_and_session_key_use_paired_secret() {
+        let challenge = [9_u8; AUTH_CHALLENGE_BYTES];
+        let paired_secret = paired_secret_from_pairing_code("123456", "android-1", "desktop-1");
+        let auth =
+            trusted_session_auth_response(&paired_secret, "android-1", "desktop-1", &challenge);
+        let session_key = derive_session_key(&paired_secret, "android-1", "desktop-1", &challenge);
+        let fingerprint = session_key_fingerprint(&session_key);
+
+        assert_eq!(auth.len(), AUTH_RESPONSE_BYTES);
+        assert_eq!(session_key.len(), SESSION_KEY_BYTES);
+        assert_eq!(fingerprint.len(), SESSION_KEY_FINGERPRINT_BYTES);
+        assert_ne!(auth, session_key);
+    }
+
+    #[test]
+    fn hex_helpers_round_trip_fixed_arrays() {
+        let bytes = [0xab_u8; PAIRED_SECRET_BYTES];
+        let encoded = bytes_to_hex(&bytes);
+        assert_eq!(hex_to_fixed::<PAIRED_SECRET_BYTES>(&encoded), Some(bytes));
+        assert_eq!(hex_to_fixed::<PAIRED_SECRET_BYTES>("not hex"), None);
     }
 
     fn hex_bytes(input: &str) -> Vec<u8> {

@@ -1,11 +1,14 @@
 use std::io;
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use androidconnect_protocol::{
-    AuthResponse, Envelope, InputEvent, MAX_VIDEO_FRAME_BYTES, PROTOCOL_VERSION, Payload,
-    WireError, pairing_auth_response, read_length_prefixed, write_length_prefixed,
+    AUTH_CHALLENGE_BYTES, AuthMethod, AuthResponse, Envelope, InputEvent, MAX_VIDEO_FRAME_BYTES,
+    PAIRED_SECRET_BYTES, PROTOCOL_VERSION, Payload, WireError, bytes_to_hex, derive_session_key,
+    paired_secret_from_pairing_code, pairing_auth_response, read_length_prefixed,
+    session_key_fingerprint, trusted_session_auth_response, write_length_prefixed,
 };
 use anyhow::{Result, bail};
 use log::{error, info, warn};
@@ -13,6 +16,7 @@ use openh264::decoder::Decoder;
 use openh264::formats::YUVSource;
 
 use crate::RgbaFrame;
+use crate::trust::TrustStore;
 
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
@@ -28,7 +32,10 @@ pub enum NetworkStatus {
     DeviceHello {
         device_name: String,
     },
-    PairingAuthenticated,
+    PairingAuthenticated {
+        trusted: bool,
+        session_key_fingerprint: Option<String>,
+    },
     PairingRejected {
         message: String,
     },
@@ -52,6 +59,7 @@ pub fn run(
     frame_sender: Sender<RgbaFrame>,
     input_rx: Receiver<InputEvent>,
     pairing_code: String,
+    trust_store_path: PathBuf,
     status_tx: Sender<NetworkStatus>,
 ) -> Result<()> {
     let listener = TcpListener::bind(bind)?;
@@ -75,12 +83,14 @@ pub fn run(
                     &status_tx,
                     NetworkStatus::ClientConnected { peer: peer.clone() },
                 );
+                let trust_store = TrustStore::load_or_create_at(&trust_store_path)?;
                 drain_stale_input(&input_rx);
                 if let Err(e) = handle_client(
                     stream,
                     frame_sender.clone(),
                     &input_rx,
                     &pairing_code,
+                    trust_store,
                     status_tx.clone(),
                 ) {
                     if is_clean_disconnect(&e) {
@@ -118,6 +128,7 @@ fn handle_client(
     frame_sender: Sender<RgbaFrame>,
     input_rx: &Receiver<InputEvent>,
     pairing_code: &str,
+    trust_store: TrustStore,
     status_tx: Sender<NetworkStatus>,
 ) -> Result<()> {
     stream.set_nodelay(true)?;
@@ -131,6 +142,7 @@ fn handle_client(
             stream,
             frame_sender,
             pairing_code,
+            trust_store,
             writer_command_tx,
             status_tx,
         );
@@ -253,10 +265,14 @@ fn read_client_loop(
     mut stream: TcpStream,
     sender: Sender<RgbaFrame>,
     pairing_code: String,
+    mut trust_store: TrustStore,
     writer_command_tx: Sender<WriterCommand>,
     status_tx: Sender<NetworkStatus>,
 ) -> Result<()> {
     let mut decoder = Decoder::new().map_err(|e| anyhow::anyhow!("decoder init failed: {e:?}"))?;
+    let desktop_identity = trust_store.identity();
+    let mut current_device: Option<RemoteDevice> = None;
+    let mut pending_auth: Option<PendingAuth> = None;
 
     loop {
         let envelope = read_length_prefixed(&mut stream, MAX_VIDEO_FRAME_BYTES)?;
@@ -274,6 +290,10 @@ fn read_client_loop(
                     "hello from {} ({}) protocol={}",
                     hello.device_name, hello.device_id, hello.protocol_version
                 );
+                current_device = Some(RemoteDevice {
+                    device_id: hello.device_id.clone(),
+                    device_name: hello.device_name.clone(),
+                });
                 send_status(
                     &status_tx,
                     NetworkStatus::DeviceHello {
@@ -319,17 +339,108 @@ fn read_client_loop(
             }
             Payload::Error { message } => error!("peer error: {message}"),
             Payload::AuthChallenge(challenge) => {
-                let response = AuthResponse {
-                    response: pairing_auth_response(&pairing_code, &challenge.challenge),
+                let device = current_device
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("auth challenge received before hello"))?;
+                let auth_challenge = challenge.challenge;
+                let trusted_pairing = trust_store.paired_android(&device.device_id);
+                let (method, response, paired_secret) = if let Some(pairing) = trusted_pairing {
+                    info!(
+                        "using stored trust for {} ({})",
+                        pairing.device_name, pairing.device_id
+                    );
+                    (
+                        AuthMethod::TrustedSession,
+                        trusted_session_auth_response(
+                            &pairing.paired_secret,
+                            &device.device_id,
+                            &desktop_identity.desktop_id,
+                            &auth_challenge,
+                        ),
+                        pairing.paired_secret,
+                    )
+                } else {
+                    let paired_secret = paired_secret_from_pairing_code(
+                        &pairing_code,
+                        &device.device_id,
+                        &desktop_identity.desktop_id,
+                    );
+                    (
+                        AuthMethod::PairingCode,
+                        pairing_auth_response(
+                            &pairing_code,
+                            &device.device_id,
+                            &desktop_identity.desktop_id,
+                            &auth_challenge,
+                        ),
+                        paired_secret,
+                    )
                 };
+                let response = AuthResponse {
+                    desktop_id: desktop_identity.desktop_id.clone(),
+                    desktop_name: desktop_identity.desktop_name.clone(),
+                    method,
+                    response,
+                };
+                pending_auth = Some(PendingAuth {
+                    device,
+                    method,
+                    challenge: auth_challenge,
+                    paired_secret,
+                });
                 let _ = writer_command_tx
                     .send(WriterCommand::SendPayload(Payload::AuthResponse(response)));
             }
             Payload::AuthResult(result) => {
                 if result.accepted {
-                    info!("pairing authenticated; desktop input enabled");
-                    send_status(&status_tx, NetworkStatus::PairingAuthenticated);
+                    let pending = pending_auth
+                        .take()
+                        .ok_or_else(|| anyhow::anyhow!("auth result received without challenge"))?;
+                    let session_key = derive_session_key(
+                        &pending.paired_secret,
+                        &pending.device.device_id,
+                        &desktop_identity.desktop_id,
+                        &pending.challenge,
+                    );
+                    let fingerprint = session_key_fingerprint(&session_key);
+                    if let Some(peer_fingerprint) = result.session_key_fingerprint
+                        && peer_fingerprint != fingerprint
+                    {
+                        bail!("session key fingerprint mismatch");
+                    }
+                    match pending.method {
+                        AuthMethod::PairingCode => {
+                            trust_store.store_pairing(
+                                &pending.device.device_id,
+                                &pending.device.device_name,
+                                pending.paired_secret,
+                            )?;
+                            info!(
+                                "stored trusted Android device {} ({})",
+                                pending.device.device_name, pending.device.device_id
+                            );
+                        }
+                        AuthMethod::TrustedSession => {
+                            trust_store.mark_authenticated(
+                                &pending.device.device_id,
+                                &pending.device.device_name,
+                            )?;
+                        }
+                    }
+                    let trusted = matches!(pending.method, AuthMethod::TrustedSession);
+                    info!(
+                        "pairing authenticated via {:?}; desktop input enabled",
+                        pending.method
+                    );
+                    send_status(
+                        &status_tx,
+                        NetworkStatus::PairingAuthenticated {
+                            trusted,
+                            session_key_fingerprint: Some(bytes_to_hex(&fingerprint)),
+                        },
+                    );
                 } else {
+                    pending_auth = None;
                     warn!("pairing rejected by Android: {}", result.message);
                     send_status(
                         &status_tx,
@@ -350,6 +461,20 @@ fn read_client_loop(
 enum WriterCommand {
     SendPayload(Payload),
     SetInputAuthenticated(bool),
+}
+
+#[derive(Debug, Clone)]
+struct RemoteDevice {
+    device_id: String,
+    device_name: String,
+}
+
+#[derive(Debug, Clone)]
+struct PendingAuth {
+    device: RemoteDevice,
+    method: AuthMethod,
+    challenge: [u8; AUTH_CHALLENGE_BYTES],
+    paired_secret: [u8; PAIRED_SECRET_BYTES],
 }
 
 fn send_status(status_tx: &Sender<NetworkStatus>, status: NetworkStatus) {
@@ -471,6 +596,7 @@ mod tests {
                 server,
                 frame_tx,
                 "123456".to_owned(),
+                test_trust_store("reader-reports-pong")?,
                 writer_command_tx,
                 status_tx,
             )
@@ -503,5 +629,17 @@ mod tests {
             WireError::Io(io)
                 if matches!(io.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
         )
+    }
+
+    fn test_trust_store(name: &str) -> Result<TrustStore> {
+        let path = std::env::temp_dir().join(format!(
+            "androidconnect-desktop-network-{name}-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default()
+        ));
+        TrustStore::load_or_create_at(path)
     }
 }

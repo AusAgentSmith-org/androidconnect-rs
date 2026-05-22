@@ -1,4 +1,5 @@
 mod network;
+mod trust;
 
 use std::io::Read;
 use std::sync::{Arc, mpsc};
@@ -360,7 +361,7 @@ impl DesktopStatus {
                 self.connection = ConnectionState::Connected;
                 self.last_error = None;
             }
-            network::NetworkStatus::PairingAuthenticated => {
+            network::NetworkStatus::PairingAuthenticated { .. } => {
                 self.input_authenticated = true;
                 self.connection = ConnectionState::Connected;
                 self.last_error = None;
@@ -616,6 +617,9 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let config = parse_config(std::env::args().skip(1))?;
+    let trust_store = trust::TrustStore::load_or_create()?;
+    let trust_store_path = trust_store.path().to_path_buf();
+    let desktop_identity = trust_store.identity();
 
     let (frame_tx, frame_rx) = mpsc::channel::<RgbaFrame>();
     let (input_tx, input_rx) = mpsc::sync_channel::<InputEvent>(1024);
@@ -623,6 +627,7 @@ fn main() -> Result<()> {
 
     let bind_for_thread = config.bind.clone();
     let pairing_code_for_thread = config.pairing_code.clone();
+    let trust_store_path_for_thread = trust_store_path.clone();
     let status_tx_for_error = status_tx.clone();
     thread::spawn(move || {
         if let Err(e) = network::run(
@@ -630,6 +635,7 @@ fn main() -> Result<()> {
             frame_tx,
             input_rx,
             pairing_code_for_thread,
+            trust_store_path_for_thread,
             status_tx,
         ) {
             error!("network thread: {e:#}");
@@ -641,6 +647,12 @@ fn main() -> Result<()> {
 
     log::info!("androidconnect desktop viewer — binding {}", config.bind);
     log::info!("pairing code: {}", config.pairing_code);
+    log::info!(
+        "desktop identity: {} ({})",
+        desktop_identity.desktop_name,
+        desktop_identity.desktop_id
+    );
+    log::info!("desktop trust store: {}", trust_store_path.display());
 
     let event_loop = EventLoop::new()?;
     event_loop.run_app(&mut App::new(
@@ -797,7 +809,10 @@ mod tests {
             "AndroidConnect - code 123 456 - connected to Pixel - pairing required"
         );
 
-        status.apply(network::NetworkStatus::PairingAuthenticated);
+        status.apply(network::NetworkStatus::PairingAuthenticated {
+            trusted: false,
+            session_key_fingerprint: None,
+        });
         status.apply(network::NetworkStatus::VideoFormat {
             width: 1080,
             height: 2340,
