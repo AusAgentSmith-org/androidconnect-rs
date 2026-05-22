@@ -56,6 +56,8 @@ Implemented:
   error. It refreshes while the activity is visible and includes heartbeat counters.
 - Desktop heartbeat pings and Android pong replies over the existing TCP connection, with visible
   heartbeat health on both sides.
+- Android native connection/session changes notify the visible activity immediately, with polling
+  kept as a fallback for counters and lifecycle recovery.
 - Gradle wrapper added to `apps/android` (copied from kdeconnect-android reference tree).
 
 Not implemented yet:
@@ -63,7 +65,7 @@ Not implemented yet:
 - End-to-end input validation on a physical Android device (emulator pass does not substitute).
 - Persistent paired desktop identity, durable trust state, and encrypted/authenticated session
   transport. The current pairing-code gate is not the final security model.
-- Reconnect/session recovery and native connection status callbacks beyond the current polling UI.
+- Reconnect/session recovery beyond the current manual connect/disconnect flow.
 - Rotation/resolution renegotiation beyond initial format metadata.
 
 ## Architecture
@@ -259,6 +261,8 @@ Tasks:
 - Add visible Android status for connected desktop identity. Partial — current status shows address
   and pairing state; persisted desktop identity is pending.
 - Add desktop status line for connected/disconnected/authenticated state. Done in the window title.
+- Add native connection/session status callbacks to Android UI. Done for immediate visible-activity
+  refresh; polling remains as fallback.
 
 Exit criteria:
 

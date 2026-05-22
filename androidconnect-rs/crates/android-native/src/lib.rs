@@ -32,6 +32,7 @@ struct AppState {
     sent_bytes: u64,
     received_pings: u64,
     sent_pongs: u64,
+    status_revision: u64,
 }
 
 impl Default for AppState {
@@ -50,6 +51,7 @@ impl Default for AppState {
             sent_bytes: 0,
             received_pings: 0,
             sent_pongs: 0,
+            status_revision: 0,
         }
     }
 }
@@ -80,10 +82,15 @@ impl AppState {
         self.connected_to = None;
         self.input_authenticated = false;
         self.last_error = Some(error.into());
+        self.mark_status_changed();
     }
 
     fn is_connected(&self) -> bool {
         self.stream.is_some()
+    }
+
+    fn mark_status_changed(&mut self) {
+        self.status_revision = self.status_revision.wrapping_add(1);
     }
 }
 
@@ -120,17 +127,29 @@ pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativeStartSession(
         encoded_bytes: 0,
     });
     guard.last_error = None;
+    guard.mark_status_changed();
+    drop(guard);
+    notify_native_status_changed(&mut env);
 
     1
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativeStopSession(
-    _env: JNIEnv<'_>,
+    mut env: JNIEnv<'_>,
     _class: JClass<'_>,
 ) {
-    if let Ok(mut guard) = state().lock() {
-        guard.capture = None;
+    let changed = if let Ok(mut guard) = state().lock() {
+        let changed = guard.capture.take().is_some();
+        if changed {
+            guard.mark_status_changed();
+        }
+        changed
+    } else {
+        false
+    };
+    if changed {
+        notify_native_status_changed(&mut env);
     }
 }
 
@@ -147,6 +166,7 @@ pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativeConnect(
         Ok(value) => value.to_string_lossy().into_owned(),
         Err(error) => {
             set_last_error(format!("invalid host string: {error}"));
+            notify_native_status_changed(&mut env);
             return JNI_FALSE;
         }
     };
@@ -158,16 +178,19 @@ pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativeConnect(
         Ok(value) => normalize_pairing_code(&value.to_string_lossy()),
         Err(error) => {
             set_last_error(format!("invalid pairing code string: {error}"));
+            notify_native_status_changed(&mut env);
             return JNI_FALSE;
         }
     };
 
     if host.trim().is_empty() || port <= 0 || port > u16::MAX as jint {
         set_last_error("invalid host or port");
+        notify_native_status_changed(&mut env);
         return JNI_FALSE;
     }
     if pairing_code.is_empty() {
         set_last_error("pairing code required");
+        notify_native_status_changed(&mut env);
         return JNI_FALSE;
     }
 
@@ -176,17 +199,20 @@ pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativeConnect(
         Ok(stream) => stream,
         Err(error) => {
             set_last_error(format!("connect to {address} failed: {error}"));
+            notify_native_status_changed(&mut env);
             return JNI_FALSE;
         }
     };
     if let Err(error) = configure_stream(&stream) {
         set_last_error(format!("configure {address} failed: {error}"));
+        notify_native_status_changed(&mut env);
         return JNI_FALSE;
     }
     let input_stream = match stream.try_clone() {
         Ok(stream) => stream,
         Err(error) => {
             set_last_error(format!("clone {address} stream failed: {error}"));
+            notify_native_status_changed(&mut env);
             return JNI_FALSE;
         }
     };
@@ -194,6 +220,15 @@ pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativeConnect(
         Ok(vm) => vm,
         Err(error) => {
             set_last_error(format!("JavaVM unavailable: {error}"));
+            notify_native_status_changed(&mut env);
+            return JNI_FALSE;
+        }
+    };
+    let status_class = match native_bridge_class(&mut env) {
+        Ok(class) => class,
+        Err(error) => {
+            set_last_error(error);
+            notify_native_status_changed(&mut env);
             return JNI_FALSE;
         }
     };
@@ -201,6 +236,7 @@ pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativeConnect(
         Ok(class) => class,
         Err(error) => {
             set_last_error(error);
+            notify_native_status_changed_with_class(&mut env, &status_class);
             return JNI_FALSE;
         }
     };
@@ -217,6 +253,7 @@ pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativeConnect(
     guard.received_pings = 0;
     guard.sent_pongs = 0;
     guard.last_error = None;
+    guard.mark_status_changed();
     let generation = guard.connection_generation;
     let auth_challenge = make_auth_challenge();
     let expected_auth_response = pairing_auth_response(&pairing_code, &auth_challenge.challenge);
@@ -231,12 +268,16 @@ pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativeConnect(
                 && let Err(error) = guard.send_payload(Payload::VideoFormat(format))
             {
                 guard.clear_connection(format!("format send to {address} failed: {error}"));
+                drop(guard);
+                notify_native_status_changed_with_class(&mut env, &status_class);
                 return JNI_FALSE;
             }
             drop(guard);
+            notify_native_status_changed_with_class(&mut env, &status_class);
             spawn_input_reader(
                 java_vm,
                 input_class,
+                status_class,
                 input_stream,
                 generation,
                 address,
@@ -246,6 +287,8 @@ pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativeConnect(
         }
         Err(error) => {
             guard.clear_connection(format!("hello send to {address} failed: {error}"));
+            drop(guard);
+            notify_native_status_changed_with_class(&mut env, &status_class);
             JNI_FALSE
         }
     }
@@ -253,22 +296,29 @@ pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativeConnect(
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativeDisconnect(
-    _env: JNIEnv<'_>,
+    mut env: JNIEnv<'_>,
     _class: JClass<'_>,
 ) {
-    if let Ok(mut guard) = state().lock() {
+    let changed = if let Ok(mut guard) = state().lock() {
         guard.connection_generation += 1;
         close_stream(guard.stream.take());
         guard.connected_to = None;
         guard.pairing_code_set = false;
         guard.input_authenticated = false;
         guard.last_error = None;
+        guard.mark_status_changed();
+        true
+    } else {
+        false
+    };
+    if changed {
+        notify_native_status_changed(&mut env);
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativePushVideoFormat(
-    _env: JNIEnv<'_>,
+    mut env: JNIEnv<'_>,
     _class: JClass<'_>,
     width: jint,
     height: jint,
@@ -303,6 +353,8 @@ pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativePushVideoForma
         Ok(()) => JNI_TRUE,
         Err(error) => {
             guard.clear_connection(error);
+            drop(guard);
+            notify_native_status_changed(&mut env);
             JNI_FALSE
         }
     }
@@ -310,7 +362,7 @@ pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativePushVideoForma
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativePushVideoFrame(
-    env: JNIEnv<'_>,
+    mut env: JNIEnv<'_>,
     _class: JClass<'_>,
     frame: JByteArray<'_>,
     presentation_time_us: jlong,
@@ -347,6 +399,8 @@ pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativePushVideoFrame
         Ok(()) => JNI_TRUE,
         Err(error) => {
             guard.clear_connection(error);
+            drop(guard);
+            notify_native_status_changed(&mut env);
             JNI_FALSE
         }
     }
@@ -382,6 +436,7 @@ pub fn current_stats_json() -> String {
         "sent_pongs": guard.sent_pongs,
         "pairing_code_set": guard.pairing_code_set,
         "input_authenticated": guard.input_authenticated,
+        "status_revision": guard.status_revision,
         "uptime_ms": capture.map(|capture| capture.started_at.elapsed().as_millis()).unwrap_or_default(),
         "last_error": guard.last_error,
     })
@@ -391,6 +446,7 @@ pub fn current_stats_json() -> String {
 fn spawn_input_reader(
     java_vm: JavaVM,
     input_class: GlobalRef,
+    status_class: GlobalRef,
     stream: TcpStream,
     generation: u64,
     address: String,
@@ -400,17 +456,22 @@ fn spawn_input_reader(
     let spawn_result = thread::Builder::new()
         .name("AndroidConnectInputReader".to_owned())
         .spawn(move || {
-            if let Err(error) = input_reader_loop(
-                java_vm,
+            let result = input_reader_loop(
+                &java_vm,
                 input_class,
+                &status_class,
                 stream,
                 generation,
                 expected_auth_response,
-            ) {
-                clear_connection_if_generation(
+            );
+            if let Err(error) = result {
+                let changed = clear_connection_if_generation(
                     generation,
                     format!("input reader from {thread_address} stopped: {error}"),
                 );
+                if changed {
+                    notify_native_status_changed_from_vm(&java_vm, &status_class);
+                }
             }
         });
 
@@ -423,8 +484,9 @@ fn spawn_input_reader(
 }
 
 fn input_reader_loop(
-    java_vm: JavaVM,
+    java_vm: &JavaVM,
     input_class: GlobalRef,
+    status_class: &GlobalRef,
     mut stream: TcpStream,
     generation: u64,
     expected_auth_response: [u8; androidconnect_protocol::AUTH_RESPONSE_BYTES],
@@ -462,7 +524,7 @@ fn input_reader_loop(
                 } else {
                     "pairing authentication failed".to_owned()
                 };
-                set_input_authenticated_if_generation(generation, accepted);
+                let status_changed = set_input_authenticated_if_generation(generation, accepted);
                 send_payload_if_generation(
                     generation,
                     Payload::AuthResult(AuthResult {
@@ -470,6 +532,9 @@ fn input_reader_loop(
                         message: message.clone(),
                     }),
                 )?;
+                if status_changed {
+                    notify_native_status_changed_with_class(&mut env, status_class);
+                }
                 if !accepted {
                     return Err(message);
                 }
@@ -712,6 +777,37 @@ fn clear_pending_exception(env: &mut JNIEnv<'_>) {
     }
 }
 
+fn notify_native_status_changed(env: &mut JNIEnv<'_>) {
+    let Ok(class) = native_bridge_class(env) else {
+        clear_pending_exception(env);
+        return;
+    };
+    notify_native_status_changed_with_class(env, &class);
+}
+
+fn notify_native_status_changed_with_class(env: &mut JNIEnv<'_>, class: &GlobalRef) {
+    if env
+        .call_static_method(class, "onNativeStatusChanged", "()V", &[])
+        .is_err()
+    {
+        clear_pending_exception(env);
+    }
+}
+
+fn notify_native_status_changed_from_vm(java_vm: &JavaVM, class: &GlobalRef) {
+    if let Ok(mut env) = java_vm.attach_current_thread() {
+        notify_native_status_changed_with_class(&mut env, class);
+    }
+}
+
+fn native_bridge_class(env: &mut JNIEnv<'_>) -> Result<GlobalRef, String> {
+    let class = env
+        .find_class("dev/androidconnect/NativeBridge")
+        .map_err(|error| format!("NativeBridge class unavailable: {error}"))?;
+    env.new_global_ref(class)
+        .map_err(|error| format!("NativeBridge global ref failed: {error}"))
+}
+
 fn remote_control_class(env: &mut JNIEnv<'_>) -> Result<GlobalRef, String> {
     let class = env
         .find_class("dev/androidconnect/RemoteControlAccessibilityService")
@@ -720,19 +816,26 @@ fn remote_control_class(env: &mut JNIEnv<'_>) -> Result<GlobalRef, String> {
         .map_err(|error| format!("RemoteControlAccessibilityService global ref failed: {error}"))
 }
 
-fn clear_connection_if_generation(generation: u64, error: impl Into<String>) {
+fn clear_connection_if_generation(generation: u64, error: impl Into<String>) -> bool {
     if let Ok(mut guard) = state().lock()
         && guard.connection_generation == generation
     {
         guard.clear_connection(error);
+        true
+    } else {
+        false
     }
 }
 
-fn set_input_authenticated_if_generation(generation: u64, authenticated: bool) {
+fn set_input_authenticated_if_generation(generation: u64, authenticated: bool) -> bool {
     if let Ok(mut guard) = state().lock()
         && guard.connection_generation == generation
     {
         guard.input_authenticated = authenticated;
+        guard.mark_status_changed();
+        true
+    } else {
+        false
     }
 }
 
@@ -772,6 +875,7 @@ fn close_stream(stream: Option<TcpStream>) {
 fn set_last_error(error: impl Into<String>) {
     if let Ok(mut guard) = state().lock() {
         guard.last_error = Some(error.into());
+        guard.mark_status_changed();
     }
 }
 
@@ -809,6 +913,7 @@ mod tests {
 
     #[test]
     fn stats_json_exposes_heartbeat_counters() {
+        let _guard = test_lock().lock().expect("test lock");
         let mut guard = state().lock().expect("state lock");
         *guard = AppState::default();
         guard.received_pings = 3;
@@ -819,5 +924,29 @@ mod tests {
             serde_json::from_str(&current_stats_json()).expect("valid stats json");
         assert_eq!(stats["received_pings"], 3);
         assert_eq!(stats["sent_pongs"], 2);
+    }
+
+    #[test]
+    fn status_revision_changes_with_native_status() {
+        let _guard = test_lock().lock().expect("test lock");
+        let mut guard = state().lock().expect("state lock");
+        *guard = AppState::default();
+        drop(guard);
+
+        assert_eq!(stats_value()["status_revision"], 0);
+        set_last_error("connection failed");
+
+        let stats = stats_value();
+        assert_eq!(stats["status_revision"], 1);
+        assert_eq!(stats["last_error"], "connection failed");
+    }
+
+    fn stats_value() -> serde_json::Value {
+        serde_json::from_str(&current_stats_json()).expect("valid stats json")
+    }
+
+    fn test_lock() -> &'static Mutex<()> {
+        static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        TEST_LOCK.get_or_init(|| Mutex::new(()))
     }
 }

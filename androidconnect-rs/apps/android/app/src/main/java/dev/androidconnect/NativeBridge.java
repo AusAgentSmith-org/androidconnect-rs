@@ -2,12 +2,19 @@ package dev.androidconnect;
 
 import android.content.Context;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import java.util.Set;
+import java.util.concurrent.CopyOnWriteArraySet;
+
 public final class NativeBridge {
     private static final boolean AVAILABLE;
+    private static final Handler MAIN_HANDLER = new Handler(Looper.getMainLooper());
+    private static final Set<StatusListener> STATUS_LISTENERS = new CopyOnWriteArraySet<>();
 
     static {
         boolean loaded = false;
@@ -23,8 +30,24 @@ public final class NativeBridge {
     private NativeBridge() {
     }
 
+    public interface StatusListener {
+        void onNativeStatusChanged();
+    }
+
     public static boolean isAvailable() {
         return AVAILABLE;
+    }
+
+    public static void addStatusListener(StatusListener listener) {
+        if (listener != null) {
+            STATUS_LISTENERS.add(listener);
+        }
+    }
+
+    public static void removeStatusListener(StatusListener listener) {
+        if (listener != null) {
+            STATUS_LISTENERS.remove(listener);
+        }
     }
 
     public static boolean connect(Context context, String host, int port, String pairingCode) {
@@ -72,6 +95,17 @@ public final class NativeBridge {
             return "{\"running\":false,\"native_loaded\":false}";
         }
         return nativeStatsJson();
+    }
+
+    static void onNativeStatusChanged() {
+        if (STATUS_LISTENERS.isEmpty()) {
+            return;
+        }
+        MAIN_HANDLER.post(() -> {
+            for (StatusListener listener : STATUS_LISTENERS) {
+                listener.onNativeStatusChanged();
+            }
+        });
     }
 
     private static String buildSessionConfig(Context context) {

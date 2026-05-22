@@ -22,6 +22,8 @@ The detailed desktop input-control reference lives in `docs/INPUT_CONTROL.md`.
   last error, and refreshes while the activity is visible. ✓
 - Desktop sends periodic TCP heartbeat pings, Android replies with pongs, and both surfaces report
   heartbeat health. ✓
+- Android native connection/session status changes notify the visible activity immediately, with
+  polling kept as a fallback. ✓
 
 Validated on emulator: Pixel 7 Pro AVD, API 36 (`google_apis_playstore`), streaming H.264 at 1080×2340/30fps, rendered live on desktop. Physical-device validation is still pending.
 
@@ -79,7 +81,7 @@ Known shortcuts:
 
 1. Validate desktop click/drag/wheel/text/global actions on a physical Android device.
 2. Persist paired desktop identity and derive per-session keys beyond the current ephemeral input gate.
-3. Add reconnect/session recovery and native connection status callbacks (replace status polling).
+3. Add reconnect/session recovery beyond the current manual connect/disconnect flow.
 4. Add rotation/resolution renegotiation.
 5. Harden text input with an IME service instead of accessibility `ACTION_SET_TEXT`.
 6. Add desktop frame-rate and byte-rate counters.

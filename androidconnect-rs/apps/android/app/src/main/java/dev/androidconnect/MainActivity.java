@@ -33,6 +33,13 @@ public final class MainActivity extends Activity {
     private EditText portField;
     private EditText pairingField;
     private final Handler statusHandler = new Handler(Looper.getMainLooper());
+    private final NativeBridge.StatusListener nativeStatusListener =
+            new NativeBridge.StatusListener() {
+                @Override
+                public void onNativeStatusChanged() {
+                    updateStatus();
+                }
+            };
     private final Runnable statusRefresh = new Runnable() {
         @Override
         public void run() {
@@ -52,6 +59,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        NativeBridge.addStatusListener(nativeStatusListener);
         updateStatus();
         statusHandler.removeCallbacks(statusRefresh);
         statusHandler.postDelayed(statusRefresh, STATUS_REFRESH_MS);
@@ -59,6 +67,7 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onPause() {
+        NativeBridge.removeStatusListener(nativeStatusListener);
         statusHandler.removeCallbacks(statusRefresh);
         super.onPause();
     }
