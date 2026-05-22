@@ -321,7 +321,7 @@ fn drain_writer_commands(
     loop {
         match writer_command_rx.try_recv() {
             Ok(WriterCommand::SendPayload(payload)) => {
-                write_payload(stream, sequence, payload)?;
+                write_payload(stream, sequence, *payload)?;
             }
             Ok(WriterCommand::SetInputAuthenticated(accepted)) => {
                 *input_authenticated = accepted;
@@ -489,8 +489,9 @@ fn read_client_loop(
                     challenge: auth_challenge,
                     paired_secret,
                 });
-                let _ = writer_command_tx
-                    .send(WriterCommand::SendPayload(Payload::AuthResponse(response)));
+                let _ = writer_command_tx.send(WriterCommand::SendPayload(Box::new(
+                    Payload::AuthResponse(response),
+                )));
             }
             Payload::AuthResult(result) => {
                 if result.accepted {
@@ -694,7 +695,7 @@ struct DesktopIncomingTransfer {
 }
 
 enum WriterCommand {
-    SendPayload(Payload),
+    SendPayload(Box<Payload>),
     SetInputAuthenticated(bool),
 }
 
