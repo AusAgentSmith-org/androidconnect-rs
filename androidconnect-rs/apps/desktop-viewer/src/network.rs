@@ -54,10 +54,16 @@ pub enum NetworkStatus {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DesktopCommand {
+    Input(InputEvent),
+    Utility(Payload),
+}
+
 pub fn run(
     bind: &str,
     frame_sender: Sender<RgbaFrame>,
-    input_rx: Receiver<InputEvent>,
+    command_rx: Receiver<DesktopCommand>,
     pairing_code: String,
     trust_store_path: PathBuf,
     status_tx: Sender<NetworkStatus>,
@@ -84,11 +90,11 @@ pub fn run(
                     NetworkStatus::ClientConnected { peer: peer.clone() },
                 );
                 let trust_store = TrustStore::load_or_create_at(&trust_store_path)?;
-                drain_stale_input(&input_rx);
+                drain_stale_commands(&command_rx);
                 if let Err(e) = handle_client(
                     stream,
                     frame_sender.clone(),
-                    &input_rx,
+                    &command_rx,
                     &pairing_code,
                     trust_store,
                     status_tx.clone(),
@@ -105,7 +111,7 @@ pub fn run(
                             },
                         );
                     }
-                    drain_stale_input(&input_rx);
+                    drain_stale_commands(&command_rx);
                 }
             }
             Err(e) => {
@@ -126,7 +132,7 @@ pub fn run(
 fn handle_client(
     stream: TcpStream,
     frame_sender: Sender<RgbaFrame>,
-    input_rx: &Receiver<InputEvent>,
+    command_rx: &Receiver<DesktopCommand>,
     pairing_code: &str,
     trust_store: TrustStore,
     status_tx: Sender<NetworkStatus>,
@@ -149,27 +155,27 @@ fn handle_client(
         let _ = reader_done_tx.send(result);
     });
 
-    write_input_loop(writer, input_rx, reader_done_rx, writer_command_rx)
+    write_command_loop(writer, command_rx, reader_done_rx, writer_command_rx)
 }
 
-fn write_input_loop(
+fn write_command_loop(
     mut stream: TcpStream,
-    input_rx: &Receiver<InputEvent>,
+    command_rx: &Receiver<DesktopCommand>,
     reader_done_rx: Receiver<Result<()>>,
     writer_command_rx: Receiver<WriterCommand>,
 ) -> Result<()> {
-    write_input_loop_with_heartbeat(
+    write_command_loop_with_heartbeat(
         &mut stream,
-        input_rx,
+        command_rx,
         reader_done_rx,
         writer_command_rx,
         HEARTBEAT_INTERVAL,
     )
 }
 
-fn write_input_loop_with_heartbeat(
+fn write_command_loop_with_heartbeat(
     stream: &mut TcpStream,
-    input_rx: &Receiver<InputEvent>,
+    command_rx: &Receiver<DesktopCommand>,
     reader_done_rx: Receiver<Result<()>>,
     writer_command_rx: Receiver<WriterCommand>,
     heartbeat_interval: Duration,
@@ -195,8 +201,8 @@ fn write_input_loop_with_heartbeat(
             last_heartbeat = Instant::now();
         }
 
-        match input_rx.recv_timeout(INPUT_POLL_INTERVAL) {
-            Ok(event) => {
+        match command_rx.recv_timeout(INPUT_POLL_INTERVAL) {
+            Ok(command) => {
                 drain_writer_commands(
                     stream,
                     &mut sequence,
@@ -204,14 +210,14 @@ fn write_input_loop_with_heartbeat(
                     &mut input_authenticated,
                 )?;
                 if input_authenticated {
-                    write_input(stream, &mut sequence, event)?;
+                    write_desktop_command(stream, &mut sequence, command)?;
                 } else if !logged_unauthenticated_input {
-                    warn!("dropping desktop input until pairing succeeds");
+                    warn!("dropping desktop commands until pairing succeeds");
                     logged_unauthenticated_input = true;
                 }
-                while let Ok(event) = input_rx.try_recv() {
+                while let Ok(command) = command_rx.try_recv() {
                     if input_authenticated {
-                        write_input(stream, &mut sequence, event)?;
+                        write_desktop_command(stream, &mut sequence, command)?;
                     }
                 }
             }
@@ -221,8 +227,20 @@ fn write_input_loop_with_heartbeat(
     }
 }
 
-fn write_input(stream: &mut TcpStream, sequence: &mut u64, event: InputEvent) -> Result<()> {
-    write_payload(stream, sequence, Payload::Input(event))
+fn write_desktop_command(
+    stream: &mut TcpStream,
+    sequence: &mut u64,
+    command: DesktopCommand,
+) -> Result<()> {
+    match command {
+        DesktopCommand::Input(event) => write_payload(stream, sequence, Payload::Input(event)),
+        DesktopCommand::Utility(payload) => {
+            if !is_desktop_utility_payload(&payload) {
+                bail!("payload is not a desktop utility command");
+            }
+            write_payload(stream, sequence, payload)
+        }
+    }
 }
 
 fn write_ping(stream: &mut TcpStream, sequence: &mut u64) -> Result<()> {
@@ -257,8 +275,32 @@ fn drain_writer_commands(
     }
 }
 
-fn drain_stale_input(input_rx: &Receiver<InputEvent>) {
-    while input_rx.try_recv().is_ok() {}
+fn drain_stale_commands(command_rx: &Receiver<DesktopCommand>) {
+    while command_rx.try_recv().is_ok() {}
+}
+
+fn is_desktop_utility_payload(payload: &Payload) -> bool {
+    matches!(
+        payload,
+        Payload::MediaControl(_)
+            | Payload::ClipboardText(_)
+            | Payload::ClipboardImage(_)
+            | Payload::FileTransferStart(_)
+            | Payload::FileTransferChunk(_)
+            | Payload::FileTransferComplete(_)
+            | Payload::FileBrowseRequest(_)
+            | Payload::FileMutation(_)
+            | Payload::NotificationAction(_)
+            | Payload::AudioControl(_)
+            | Payload::AppWindowOpen(_)
+            | Payload::AppWindowClose(_)
+            | Payload::AppWindowInput(_)
+            | Payload::MessageSendRequest(_)
+            | Payload::CallAction(_)
+            | Payload::PhotoAssetTransfer(_)
+            | Payload::RelayOffer(_)
+            | Payload::ClientRoleUpdate(_)
+    )
 }
 
 fn read_client_loop(
@@ -454,6 +496,37 @@ fn read_client_loop(
             }
             Payload::AuthResponse(_) => {}
             Payload::Input(_) => {}
+            Payload::DeviceStatus(_)
+            | Payload::MediaStatus(_)
+            | Payload::MediaControl(_)
+            | Payload::ClipboardText(_)
+            | Payload::ClipboardImage(_)
+            | Payload::FileTransferStart(_)
+            | Payload::FileTransferChunk(_)
+            | Payload::FileTransferComplete(_)
+            | Payload::FileBrowseRequest(_)
+            | Payload::FileBrowseResponse(_)
+            | Payload::FileMutation(_)
+            | Payload::NotificationPosted(_)
+            | Payload::NotificationRemoved(_)
+            | Payload::NotificationAction(_)
+            | Payload::AudioFormat(_)
+            | Payload::AudioFrame(_)
+            | Payload::AudioControl(_)
+            | Payload::AppWindowOpen(_)
+            | Payload::AppWindowClose(_)
+            | Payload::AppWindowInput(_)
+            | Payload::MessageThreadList(_)
+            | Payload::MessageEvent(_)
+            | Payload::MessageSendRequest(_)
+            | Payload::CallState(_)
+            | Payload::CallAction(_)
+            | Payload::PhotoAssetList(_)
+            | Payload::PhotoAssetTransfer(_)
+            | Payload::RelayOffer(_)
+            | Payload::RelayStatus(_)
+            | Payload::ClientList(_)
+            | Payload::ClientRoleUpdate(_) => {}
         }
     }
 }
@@ -504,26 +577,27 @@ mod tests {
     use std::net::Shutdown;
 
     use androidconnect_protocol::{
-        MAX_CONTROL_FRAME_BYTES, PointerButton, PointerEvent, PointerPhase,
+        MAX_CONTROL_FRAME_BYTES, MediaControl, MediaControlAction, PointerButton, PointerEvent,
+        PointerPhase,
     };
 
     #[test]
-    fn writer_drops_input_until_pairing_is_authenticated() -> Result<()> {
+    fn writer_drops_commands_until_pairing_is_authenticated() -> Result<()> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;
         let client = TcpStream::connect(address)?;
         let (mut server, _) = listener.accept()?;
         server.set_read_timeout(Some(Duration::from_millis(100)))?;
 
-        let (input_tx, input_rx) = mpsc::sync_channel(4);
+        let (command_tx, command_rx) = mpsc::sync_channel(4);
         let (reader_done_tx, reader_done_rx) = mpsc::sync_channel(1);
         let (writer_command_tx, writer_command_rx) = mpsc::channel();
 
         let writer = std::thread::spawn(move || {
-            write_input_loop(client, &input_rx, reader_done_rx, writer_command_rx)
+            write_command_loop(client, &command_rx, reader_done_rx, writer_command_rx)
         });
 
-        input_tx.send(InputEvent::Pointer(test_tap(10, 20)))?;
+        command_tx.send(DesktopCommand::Input(InputEvent::Pointer(test_tap(10, 20))))?;
         let error = read_length_prefixed(&mut server, MAX_CONTROL_FRAME_BYTES)
             .expect_err("unauthenticated input must not be written");
         assert!(
@@ -532,7 +606,7 @@ mod tests {
         );
 
         writer_command_tx.send(WriterCommand::SetInputAuthenticated(true))?;
-        input_tx.send(InputEvent::Pointer(test_tap(30, 40)))?;
+        command_tx.send(DesktopCommand::Input(InputEvent::Pointer(test_tap(30, 40))))?;
         server.set_read_timeout(Some(Duration::from_secs(1)))?;
 
         let envelope = read_length_prefixed(&mut server, MAX_CONTROL_FRAME_BYTES)?;
@@ -555,24 +629,61 @@ mod tests {
         let (mut server, _) = listener.accept()?;
         server.set_read_timeout(Some(Duration::from_secs(1)))?;
 
-        let (input_tx, input_rx) = mpsc::sync_channel(4);
+        let (command_tx, command_rx) = mpsc::sync_channel(4);
         let (reader_done_tx, reader_done_rx) = mpsc::sync_channel(1);
         let (_writer_command_tx, writer_command_rx) = mpsc::channel();
 
         let writer = std::thread::spawn(move || {
             let mut client = client;
-            write_input_loop_with_heartbeat(
+            write_command_loop_with_heartbeat(
                 &mut client,
-                &input_rx,
+                &command_rx,
                 reader_done_rx,
                 writer_command_rx,
                 Duration::from_millis(25),
             )
         });
 
-        let _keep_input_channel_open = input_tx;
+        let _keep_input_channel_open = command_tx;
         let envelope = read_length_prefixed(&mut server, MAX_CONTROL_FRAME_BYTES)?;
         assert!(matches!(envelope.payload, Payload::Ping { nonce: 1 }));
+
+        reader_done_tx.send(Ok(()))?;
+        let _ = server.shutdown(Shutdown::Both);
+        writer.join().expect("writer thread join")?;
+        Ok(())
+    }
+
+    #[test]
+    fn writer_sends_authenticated_utility_commands() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let client = TcpStream::connect(address)?;
+        let (mut server, _) = listener.accept()?;
+        server.set_read_timeout(Some(Duration::from_secs(1)))?;
+
+        let (command_tx, command_rx) = mpsc::sync_channel(4);
+        let (reader_done_tx, reader_done_rx) = mpsc::sync_channel(1);
+        let (writer_command_tx, writer_command_rx) = mpsc::channel();
+
+        let writer = std::thread::spawn(move || {
+            write_command_loop(client, &command_rx, reader_done_rx, writer_command_rx)
+        });
+
+        writer_command_tx.send(WriterCommand::SetInputAuthenticated(true))?;
+        command_tx.send(DesktopCommand::Utility(Payload::MediaControl(
+            MediaControl {
+                action: MediaControlAction::PlayPause,
+            },
+        )))?;
+
+        let envelope = read_length_prefixed(&mut server, MAX_CONTROL_FRAME_BYTES)?;
+        assert!(matches!(
+            envelope.payload,
+            Payload::MediaControl(MediaControl {
+                action: MediaControlAction::PlayPause
+            })
+        ));
 
         reader_done_tx.send(Ok(()))?;
         let _ = server.shutdown(Shutdown::Both);

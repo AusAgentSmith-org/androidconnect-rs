@@ -17,8 +17,8 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
 use androidconnect_protocol::{
-    DEFAULT_CONTROL_PORT, InputEvent, Modifiers, PointerButton, PointerEvent, PointerPhase,
-    SystemAction, TextInput, normalize_pairing_code,
+    DEFAULT_CONTROL_PORT, InputEvent, MediaControl, MediaControlAction, Modifiers, Payload,
+    PointerButton, PointerEvent, PointerPhase, SystemAction, TextInput, normalize_pairing_code,
 };
 
 pub struct RgbaFrame {
@@ -31,7 +31,7 @@ struct App {
     window: Option<Arc<Window>>,
     pixels: Option<Pixels<'static>>,
     frame_rx: mpsc::Receiver<RgbaFrame>,
-    input_tx: mpsc::SyncSender<InputEvent>,
+    command_tx: mpsc::SyncSender<network::DesktopCommand>,
     status_rx: mpsc::Receiver<network::NetworkStatus>,
     buf_w: u32,
     buf_h: u32,
@@ -47,7 +47,7 @@ struct App {
 impl App {
     fn new(
         frame_rx: mpsc::Receiver<RgbaFrame>,
-        input_tx: mpsc::SyncSender<InputEvent>,
+        command_tx: mpsc::SyncSender<network::DesktopCommand>,
         status_rx: mpsc::Receiver<network::NetworkStatus>,
         bind: String,
         pairing_code: String,
@@ -58,7 +58,7 @@ impl App {
             window: None,
             pixels: None,
             frame_rx,
-            input_tx,
+            command_tx,
             status_rx,
             buf_w: 540,
             buf_h: 960,
@@ -73,7 +73,15 @@ impl App {
     }
 
     fn send_input(&self, event: InputEvent) {
-        let _ = self.input_tx.try_send(event);
+        let _ = self
+            .command_tx
+            .try_send(network::DesktopCommand::Input(event));
+    }
+
+    fn send_utility(&self, payload: Payload) {
+        let _ = self
+            .command_tx
+            .try_send(network::DesktopCommand::Utility(payload));
     }
 
     fn current_modifiers(&self) -> Modifiers {
@@ -167,6 +175,11 @@ impl App {
         }
 
         let modifiers = self.current_modifiers();
+        if let Some(action) = media_control_for_key(&event.logical_key) {
+            self.send_utility(Payload::MediaControl(MediaControl { action }));
+            return;
+        }
+
         if let Some(action) = system_action_for_key(&event.logical_key, modifiers) {
             self.send_input(InputEvent::System(action));
             return;
@@ -596,6 +609,18 @@ fn system_action_for_key(key: &Key, modifiers: Modifiers) -> Option<SystemAction
     }
 }
 
+fn media_control_for_key(key: &Key) -> Option<MediaControlAction> {
+    match key {
+        Key::Named(NamedKey::MediaPlay) => Some(MediaControlAction::Play),
+        Key::Named(NamedKey::MediaPause) => Some(MediaControlAction::Pause),
+        Key::Named(NamedKey::MediaPlayPause) => Some(MediaControlAction::PlayPause),
+        Key::Named(NamedKey::MediaStop) => Some(MediaControlAction::Stop),
+        Key::Named(NamedKey::MediaTrackNext) => Some(MediaControlAction::Next),
+        Key::Named(NamedKey::MediaTrackPrevious) => Some(MediaControlAction::Previous),
+        _ => None,
+    }
+}
+
 fn text_from_key(event: &winit::event::KeyEvent) -> Option<String> {
     if let Some(text) = &event.text
         && !text.is_empty()
@@ -622,7 +647,7 @@ fn main() -> Result<()> {
     let desktop_identity = trust_store.identity();
 
     let (frame_tx, frame_rx) = mpsc::channel::<RgbaFrame>();
-    let (input_tx, input_rx) = mpsc::sync_channel::<InputEvent>(1024);
+    let (command_tx, command_rx) = mpsc::sync_channel::<network::DesktopCommand>(1024);
     let (status_tx, status_rx) = mpsc::channel::<network::NetworkStatus>();
 
     let bind_for_thread = config.bind.clone();
@@ -633,7 +658,7 @@ fn main() -> Result<()> {
         if let Err(e) = network::run(
             &bind_for_thread,
             frame_tx,
-            input_rx,
+            command_rx,
             pairing_code_for_thread,
             trust_store_path_for_thread,
             status_tx,
@@ -657,7 +682,7 @@ fn main() -> Result<()> {
     let event_loop = EventLoop::new()?;
     event_loop.run_app(&mut App::new(
         frame_rx,
-        input_tx,
+        command_tx,
         status_rx,
         config.bind,
         config.pairing_code,

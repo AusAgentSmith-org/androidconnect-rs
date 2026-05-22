@@ -695,9 +695,44 @@ fn input_reader_loop(
             | Payload::Hello(_)
             | Payload::VideoFormat(_)
             | Payload::VideoFrame(_) => {}
+            payload => {
+                if is_desktop_utility_payload(&payload) {
+                    if desktop_authenticated {
+                        handle_desktop_utility_payload(&mut env, payload);
+                    } else {
+                        set_last_error("utility command ignored before pairing authentication");
+                    }
+                }
+            }
         }
     }
 }
+
+fn is_desktop_utility_payload(payload: &Payload) -> bool {
+    matches!(
+        payload,
+        Payload::MediaControl(_)
+            | Payload::ClipboardText(_)
+            | Payload::ClipboardImage(_)
+            | Payload::FileTransferStart(_)
+            | Payload::FileTransferChunk(_)
+            | Payload::FileTransferComplete(_)
+            | Payload::FileBrowseRequest(_)
+            | Payload::FileMutation(_)
+            | Payload::NotificationAction(_)
+            | Payload::AudioControl(_)
+            | Payload::AppWindowOpen(_)
+            | Payload::AppWindowClose(_)
+            | Payload::AppWindowInput(_)
+            | Payload::MessageSendRequest(_)
+            | Payload::CallAction(_)
+            | Payload::PhotoAssetTransfer(_)
+            | Payload::RelayOffer(_)
+            | Payload::ClientRoleUpdate(_)
+    )
+}
+
+fn handle_desktop_utility_payload(_env: &mut JNIEnv<'_>, _payload: Payload) {}
 
 fn cancel_active_reconnect_and_connection() {
     if let Ok(mut guard) = state().lock() {

@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const DEFAULT_CONTROL_PORT: u16 = 48172;
 pub const DEFAULT_VIDEO_PORT: u16 = 48173;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 256 * 1024;
@@ -45,6 +45,37 @@ pub enum Payload {
     VideoFormat(VideoFormat),
     VideoFrame(VideoFrame),
     Input(InputEvent),
+    DeviceStatus(DeviceStatus),
+    MediaStatus(MediaStatus),
+    MediaControl(MediaControl),
+    ClipboardText(ClipboardText),
+    ClipboardImage(ClipboardImage),
+    FileTransferStart(FileTransferStart),
+    FileTransferChunk(FileTransferChunk),
+    FileTransferComplete(FileTransferComplete),
+    FileBrowseRequest(FileBrowseRequest),
+    FileBrowseResponse(FileBrowseResponse),
+    FileMutation(FileMutation),
+    NotificationPosted(NotificationPosted),
+    NotificationRemoved(NotificationRemoved),
+    NotificationAction(NotificationAction),
+    AudioFormat(AudioFormat),
+    AudioFrame(AudioFrame),
+    AudioControl(AudioControl),
+    AppWindowOpen(AppWindowOpen),
+    AppWindowClose(AppWindowClose),
+    AppWindowInput(AppWindowInput),
+    MessageThreadList(MessageThreadList),
+    MessageEvent(MessageEvent),
+    MessageSendRequest(MessageSendRequest),
+    CallState(CallState),
+    CallAction(CallAction),
+    PhotoAssetList(PhotoAssetList),
+    PhotoAssetTransfer(PhotoAssetTransfer),
+    RelayOffer(RelayOffer),
+    RelayStatus(RelayStatus),
+    ClientList(ClientList),
+    ClientRoleUpdate(ClientRoleUpdate),
     Ping { nonce: u64 },
     Pong { nonce: u64 },
     Error { message: String },
@@ -79,6 +110,7 @@ pub struct Capabilities {
     pub keyboard_input: bool,
     pub system_actions: bool,
     pub audio_capture: bool,
+    pub utility_features: Vec<UtilityFeature>,
 }
 
 impl Capabilities {
@@ -89,6 +121,7 @@ impl Capabilities {
             keyboard_input: true,
             system_actions: true,
             audio_capture: false,
+            utility_features: UtilityFeature::mvp2_all(),
         }
     }
 }
@@ -189,6 +222,491 @@ pub enum SystemAction {
     Home,
     Recents,
     LockScreen,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UtilityFeature {
+    DeviceStatus,
+    MediaControls,
+    ClipboardText,
+    ClipboardImage,
+    FileTransfer,
+    FileBrowser,
+    Notifications,
+    AudioForwarding,
+    AppWindows,
+    Messages,
+    Calls,
+    Photos,
+    Relay,
+    MultiClient,
+}
+
+impl UtilityFeature {
+    pub fn mvp2_all() -> Vec<Self> {
+        vec![
+            Self::DeviceStatus,
+            Self::MediaControls,
+            Self::ClipboardText,
+            Self::ClipboardImage,
+            Self::FileTransfer,
+            Self::FileBrowser,
+            Self::Notifications,
+            Self::AudioForwarding,
+            Self::AppWindows,
+            Self::Messages,
+            Self::Calls,
+            Self::Photos,
+            Self::Relay,
+            Self::MultiClient,
+        ]
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FeatureState {
+    Available,
+    Disabled,
+    PermissionRequired,
+    Unsupported,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeatureStatus {
+    pub feature: UtilityFeature,
+    pub state: FeatureState,
+    pub message: String,
+}
+
+impl FeatureStatus {
+    pub fn available(feature: UtilityFeature) -> Self {
+        Self {
+            feature,
+            state: FeatureState::Available,
+            message: String::new(),
+        }
+    }
+
+    pub fn disabled(feature: UtilityFeature, message: impl Into<String>) -> Self {
+        Self {
+            feature,
+            state: FeatureState::Disabled,
+            message: message.into(),
+        }
+    }
+
+    pub fn permission_required(feature: UtilityFeature, message: impl Into<String>) -> Self {
+        Self {
+            feature,
+            state: FeatureState::PermissionRequired,
+            message: message.into(),
+        }
+    }
+
+    pub fn unsupported(feature: UtilityFeature, message: impl Into<String>) -> Self {
+        Self {
+            feature,
+            state: FeatureState::Unsupported,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceStatus {
+    pub device_id: String,
+    pub device_name: String,
+    pub manufacturer: String,
+    pub model: String,
+    pub android_sdk: u32,
+    pub battery_percent: Option<u8>,
+    pub charging: Option<bool>,
+    pub interactive: Option<bool>,
+    pub features: Vec<FeatureStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaStatus {
+    pub active: bool,
+    pub app_package: Option<String>,
+    pub app_name: Option<String>,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub playback_state: MediaPlaybackState,
+    pub position_ms: Option<u64>,
+    pub duration_ms: Option<u64>,
+    pub supported_actions: Vec<MediaControlAction>,
+    pub status: FeatureStatus,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MediaPlaybackState {
+    Unknown,
+    None,
+    Stopped,
+    Paused,
+    Playing,
+    Buffering,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaControl {
+    pub action: MediaControlAction,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MediaControlAction {
+    Play,
+    Pause,
+    PlayPause,
+    Previous,
+    Next,
+    Stop,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardText {
+    pub sequence: u64,
+    pub text: String,
+    pub source: ClipboardSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardImage {
+    pub sequence: u64,
+    pub mime_type: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub data: Vec<u8>,
+    pub source: ClipboardSource,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClipboardSource {
+    Android,
+    Desktop,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileTransferStart {
+    pub transfer_id: String,
+    pub direction: TransferDirection,
+    pub file_name: String,
+    pub mime_type: Option<String>,
+    pub size_bytes: Option<u64>,
+    pub target_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileTransferChunk {
+    pub transfer_id: String,
+    pub offset: u64,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileTransferComplete {
+    pub transfer_id: String,
+    pub status: TransferStatus,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransferDirection {
+    AndroidToDesktop,
+    DesktopToAndroid,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransferStatus {
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileBrowseRequest {
+    pub request_id: String,
+    pub path: String,
+    pub include_thumbnails: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileBrowseResponse {
+    pub request_id: String,
+    pub path: String,
+    pub entries: Vec<FileEntry>,
+    pub status: FeatureStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileEntry {
+    pub name: String,
+    pub path: String,
+    pub entry_type: FileEntryType,
+    pub size_bytes: Option<u64>,
+    pub modified_unix_ms: Option<u64>,
+    pub mime_type: Option<String>,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileEntryType {
+    File,
+    Directory,
+    Media,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileMutation {
+    pub request_id: String,
+    pub mutation: FileMutationKind,
+    pub path: String,
+    pub new_path: Option<String>,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileMutationKind {
+    CreateFolder,
+    Delete,
+    Rename,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationPosted {
+    pub notification_id: String,
+    pub app_package: String,
+    pub app_name: String,
+    pub title: Option<String>,
+    pub text: Option<String>,
+    pub timestamp_unix_ms: u64,
+    pub sensitive: bool,
+    pub actions: Vec<NotificationActionDescriptor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationActionDescriptor {
+    pub action_id: String,
+    pub title: String,
+    pub allows_reply: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationRemoved {
+    pub notification_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationAction {
+    pub notification_id: String,
+    pub action_id: String,
+    pub reply_text: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioFormat {
+    pub stream_id: u32,
+    pub codec: AudioCodec,
+    pub sample_rate_hz: u32,
+    pub channels: u16,
+    pub status: FeatureStatus,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AudioCodec {
+    PcmS16Le,
+    Opus,
+    Aac,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioFrame {
+    pub stream_id: u32,
+    pub presentation_time_us: i64,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioControl {
+    pub command: AudioControlCommand,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AudioControlCommand {
+    Start,
+    Stop,
+    Mute,
+    Unmute,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppWindowOpen {
+    pub request_id: String,
+    pub package_name: String,
+    pub activity_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppWindowClose {
+    pub window_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppWindowInput {
+    pub window_id: String,
+    pub event: InputEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageThreadList {
+    pub threads: Vec<MessageThreadSummary>,
+    pub status: FeatureStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageThreadSummary {
+    pub thread_id: String,
+    pub display_name: String,
+    pub last_message: Option<String>,
+    pub timestamp_unix_ms: Option<u64>,
+    pub unread_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageEvent {
+    pub thread_id: String,
+    pub sender: String,
+    pub body: String,
+    pub timestamp_unix_ms: u64,
+    pub attachments: Vec<SharedContent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageSendRequest {
+    pub request_id: String,
+    pub thread_id: Option<String>,
+    pub recipients: Vec<String>,
+    pub body: String,
+    pub attachments: Vec<SharedContent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedContent {
+    pub uri: Option<String>,
+    pub file_name: Option<String>,
+    pub mime_type: Option<String>,
+    pub size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallState {
+    pub call_id: Option<String>,
+    pub state: PhoneCallState,
+    pub display_name: Option<String>,
+    pub phone_number: Option<String>,
+    pub supported_actions: Vec<CallActionKind>,
+    pub status: FeatureStatus,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PhoneCallState {
+    Idle,
+    Ringing,
+    Dialing,
+    Active,
+    Held,
+    Disconnected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallAction {
+    pub call_id: Option<String>,
+    pub action: CallActionKind,
+    pub phone_number: Option<String>,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CallActionKind {
+    Answer,
+    Decline,
+    HangUp,
+    Mute,
+    Unmute,
+    Dial,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhotoAssetList {
+    pub request_id: String,
+    pub assets: Vec<PhotoAsset>,
+    pub status: FeatureStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhotoAsset {
+    pub asset_id: String,
+    pub display_name: String,
+    pub mime_type: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub size_bytes: Option<u64>,
+    pub created_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhotoAssetTransfer {
+    pub asset_id: String,
+    pub transfer_id: String,
+    pub direction: TransferDirection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayOffer {
+    pub relay_id: String,
+    pub endpoint: String,
+    pub expires_unix_ms: u64,
+    pub public_key_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayStatus {
+    pub enabled: bool,
+    pub connected: bool,
+    pub remote: bool,
+    pub status: FeatureStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientList {
+    pub clients: Vec<ClientInfo>,
+    pub input_owner_desktop_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientInfo {
+    pub desktop_id: String,
+    pub desktop_name: String,
+    pub connected: bool,
+    pub roles: Vec<ClientRole>,
+    pub last_seen_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientRoleUpdate {
+    pub desktop_id: String,
+    pub roles: Vec<ClientRole>,
+    pub owns_input: bool,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClientRole {
+    Viewer,
+    Controller,
+    FileTransfer,
+    Notifications,
+    Media,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -557,6 +1075,37 @@ mod tests {
 
         assert_eq!(decoded.version, PROTOCOL_VERSION);
         assert_eq!(decoded.sequence, 7);
+        assert_eq!(decoded.payload, envelope.payload);
+    }
+
+    #[test]
+    fn mvp2_utility_payload_round_trips() {
+        let envelope = Envelope::new(
+            8,
+            Payload::DeviceStatus(DeviceStatus {
+                device_id: "phone-1".to_owned(),
+                device_name: "Pixel test device".to_owned(),
+                manufacturer: "Google".to_owned(),
+                model: "Pixel".to_owned(),
+                android_sdk: 35,
+                battery_percent: Some(86),
+                charging: Some(true),
+                interactive: Some(true),
+                features: vec![
+                    FeatureStatus::available(UtilityFeature::DeviceStatus),
+                    FeatureStatus::permission_required(
+                        UtilityFeature::Notifications,
+                        "notification listener access is not enabled",
+                    ),
+                ],
+            }),
+        );
+
+        let bytes = encode_envelope(&envelope).expect("encode");
+        let decoded = decode_envelope(&bytes).expect("decode");
+
+        assert_eq!(decoded.version, PROTOCOL_VERSION);
+        assert_eq!(decoded.sequence, 8);
         assert_eq!(decoded.payload, envelope.payload);
     }
 
