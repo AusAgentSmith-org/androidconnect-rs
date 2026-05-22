@@ -2,9 +2,9 @@ use std::fs;
 use std::io::{self, Read};
 use std::net::{Shutdown, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use androidconnect_protocol::{
     AUTH_CHALLENGE_BYTES, AuthChallenge, AuthMethod, AuthResult, DeviceHello, Envelope, InputEvent,
@@ -22,6 +22,9 @@ use serde::{Deserialize, Serialize};
 
 static STATE: OnceLock<Mutex<AppState>> = OnceLock::new();
 
+const RECONNECT_INITIAL_DELAY: Duration = Duration::from_millis(500);
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(5);
+
 #[derive(Debug)]
 struct AppState {
     sequence: u64,
@@ -37,6 +40,12 @@ struct AppState {
     paired_desktop_name: Option<String>,
     session_key_fingerprint: Option<[u8; SESSION_KEY_FINGERPRINT_BYTES]>,
     trusted_desktop_count: usize,
+    reconnect_config: Option<SessionConnectConfig>,
+    reconnect_callbacks: Option<SessionCallbacks>,
+    reconnect_generation: u64,
+    reconnecting: bool,
+    reconnect_attempts: u64,
+    last_reconnect_error: Option<String>,
     sent_envelopes: u64,
     sent_bytes: u64,
     received_pings: u64,
@@ -60,6 +69,12 @@ impl Default for AppState {
             paired_desktop_name: None,
             session_key_fingerprint: None,
             trusted_desktop_count: 0,
+            reconnect_config: None,
+            reconnect_callbacks: None,
+            reconnect_generation: 0,
+            reconnecting: false,
+            reconnect_attempts: 0,
+            last_reconnect_error: None,
             sent_envelopes: 0,
             sent_bytes: 0,
             received_pings: 0,
@@ -101,6 +116,16 @@ impl AppState {
         self.mark_status_changed();
     }
 
+    fn reset_active_connection(&mut self) {
+        self.connection_generation += 1;
+        close_stream(self.stream.take());
+        self.connected_to = None;
+        self.input_authenticated = false;
+        self.paired_desktop_id = None;
+        self.paired_desktop_name = None;
+        self.session_key_fingerprint = None;
+    }
+
     fn is_connected(&self) -> bool {
         self.stream.is_some()
     }
@@ -108,6 +133,28 @@ impl AppState {
     fn mark_status_changed(&mut self) {
         self.status_revision = self.status_revision.wrapping_add(1);
     }
+}
+
+#[derive(Debug, Clone)]
+struct SessionConnectConfig {
+    address: String,
+    device_name: String,
+    storage_dir: PathBuf,
+    pairing_code: String,
+}
+
+#[derive(Debug, Clone)]
+struct SessionCallbacks {
+    java_vm: Arc<JavaVM>,
+    input_class: GlobalRef,
+    status_class: GlobalRef,
+}
+
+#[derive(Debug, Clone)]
+struct ReconnectRequest {
+    config: SessionConnectConfig,
+    callbacks: SessionCallbacks,
+    reconnect_generation: u64,
 }
 
 #[derive(Debug)]
@@ -213,44 +260,7 @@ pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativeConnect(
         notify_native_status_changed(&mut env);
         return JNI_FALSE;
     }
-    let trust_store = match AndroidTrustStore::load_or_create(&storage_dir) {
-        Ok(store) => store,
-        Err(error) => {
-            set_last_error(format!("trust store unavailable: {error}"));
-            notify_native_status_changed(&mut env);
-            return JNI_FALSE;
-        }
-    };
-    let android_device_id = trust_store.device_id().to_owned();
-    let trusted_desktop_count = trust_store.trusted_desktop_count();
-    if pairing_code.is_empty() && trusted_desktop_count == 0 {
-        set_last_error("pairing code required for first desktop");
-        notify_native_status_changed(&mut env);
-        return JNI_FALSE;
-    }
-
     let address = format!("{}:{}", host.trim(), port);
-    let stream = match TcpStream::connect(&address) {
-        Ok(stream) => stream,
-        Err(error) => {
-            set_last_error(format!("connect to {address} failed: {error}"));
-            notify_native_status_changed(&mut env);
-            return JNI_FALSE;
-        }
-    };
-    if let Err(error) = configure_stream(&stream) {
-        set_last_error(format!("configure {address} failed: {error}"));
-        notify_native_status_changed(&mut env);
-        return JNI_FALSE;
-    }
-    let input_stream = match stream.try_clone() {
-        Ok(stream) => stream,
-        Err(error) => {
-            set_last_error(format!("clone {address} stream failed: {error}"));
-            notify_native_status_changed(&mut env);
-            return JNI_FALSE;
-        }
-    };
     let java_vm = match env.get_java_vm() {
         Ok(vm) => vm,
         Err(error) => {
@@ -275,63 +285,27 @@ pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativeConnect(
             return JNI_FALSE;
         }
     };
-
-    let mut guard = match state().lock() {
-        Ok(guard) => guard,
-        Err(_) => return JNI_FALSE,
+    let callbacks = SessionCallbacks {
+        java_vm: Arc::new(java_vm),
+        input_class,
+        status_class,
     };
-    guard.connection_generation += 1;
-    guard.stream = Some(stream);
-    guard.connected_to = Some(address.clone());
-    guard.pairing_code_set = !pairing_code.is_empty();
-    guard.input_authenticated = false;
-    guard.paired_desktop_id = None;
-    guard.paired_desktop_name = None;
-    guard.session_key_fingerprint = None;
-    guard.trusted_desktop_count = trusted_desktop_count;
-    guard.received_pings = 0;
-    guard.sent_pongs = 0;
-    guard.last_error = None;
-    guard.mark_status_changed();
-    let generation = guard.connection_generation;
-    let auth_challenge = make_auth_challenge();
+    let config = SessionConnectConfig {
+        address: address.clone(),
+        device_name,
+        storage_dir,
+        pairing_code,
+    };
 
-    let hello = Payload::Hello(DeviceHello::android(android_device_id.clone(), device_name));
-    let send_result = guard
-        .send_payload(hello)
-        .and_then(|()| guard.send_payload(Payload::AuthChallenge(auth_challenge.clone())));
-    match send_result {
+    cancel_active_reconnect_and_connection();
+    match connect_session(&config, &callbacks, None) {
         Ok(()) => {
-            if let Some(format) = guard.last_video_format.clone()
-                && let Err(error) = guard.send_payload(Payload::VideoFormat(format))
-            {
-                guard.clear_connection(format!("format send to {address} failed: {error}"));
-                drop(guard);
-                notify_native_status_changed_with_class(&mut env, &status_class);
-                return JNI_FALSE;
-            }
-            drop(guard);
-            notify_native_status_changed_with_class(&mut env, &status_class);
-            spawn_input_reader(
-                java_vm,
-                input_class,
-                status_class,
-                input_stream,
-                generation,
-                address,
-                AuthContext {
-                    trust_store,
-                    android_device_id,
-                    pairing_code,
-                    challenge: auth_challenge.challenge,
-                },
-            );
+            notify_native_status_changed_with_class(&mut env, &callbacks.status_class);
             JNI_TRUE
         }
         Err(error) => {
-            guard.clear_connection(format!("hello send to {address} failed: {error}"));
-            drop(guard);
-            notify_native_status_changed_with_class(&mut env, &status_class);
+            set_last_error(error);
+            notify_native_status_changed_with_class(&mut env, &callbacks.status_class);
             JNI_FALSE
         }
     }
@@ -343,14 +317,14 @@ pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativeDisconnect(
     _class: JClass<'_>,
 ) {
     let changed = if let Ok(mut guard) = state().lock() {
-        guard.connection_generation += 1;
-        close_stream(guard.stream.take());
-        guard.connected_to = None;
+        guard.reset_active_connection();
         guard.pairing_code_set = false;
-        guard.input_authenticated = false;
-        guard.paired_desktop_id = None;
-        guard.paired_desktop_name = None;
-        guard.session_key_fingerprint = None;
+        guard.reconnect_generation += 1;
+        guard.reconnect_config = None;
+        guard.reconnect_callbacks = None;
+        guard.reconnecting = false;
+        guard.reconnect_attempts = 0;
+        guard.last_reconnect_error = None;
         guard.last_error = None;
         guard.mark_status_changed();
         true
@@ -398,8 +372,10 @@ pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativePushVideoForma
     match guard.send_payload(Payload::VideoFormat(format)) {
         Ok(()) => JNI_TRUE,
         Err(error) => {
-            guard.clear_connection(error);
+            let error = format!("video format send failed: {error}");
+            guard.clear_connection(error.clone());
             drop(guard);
+            start_reconnect_worker_if_needed(error);
             notify_native_status_changed(&mut env);
             JNI_FALSE
         }
@@ -444,8 +420,10 @@ pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativePushVideoFrame
     match guard.send_payload(payload) {
         Ok(()) => JNI_TRUE,
         Err(error) => {
-            guard.clear_connection(error);
+            let error = format!("video frame send failed: {error}");
+            guard.clear_connection(error.clone());
             drop(guard);
+            start_reconnect_worker_if_needed(error);
             notify_native_status_changed(&mut env);
             JNI_FALSE
         }
@@ -486,6 +464,9 @@ pub fn current_stats_json() -> String {
         "paired_desktop_name": guard.paired_desktop_name.clone(),
         "session_key_fingerprint": guard.session_key_fingerprint.map(|fingerprint| bytes_to_hex(&fingerprint)),
         "trusted_desktop_count": guard.trusted_desktop_count,
+        "reconnecting": guard.reconnecting,
+        "reconnect_attempts": guard.reconnect_attempts,
+        "last_reconnect_error": guard.last_reconnect_error.clone(),
         "status_revision": guard.status_revision,
         "uptime_ms": capture.map(|capture| capture.started_at.elapsed().as_millis()).unwrap_or_default(),
         "last_error": guard.last_error,
@@ -493,58 +474,163 @@ pub fn current_stats_json() -> String {
     .to_string()
 }
 
+fn connect_session(
+    config: &SessionConnectConfig,
+    callbacks: &SessionCallbacks,
+    reconnect_generation: Option<u64>,
+) -> Result<(), String> {
+    if let Some(token) = reconnect_generation
+        && !is_reconnect_generation_active(token)
+    {
+        return Err("stale reconnect generation".to_owned());
+    }
+
+    let trust_store = AndroidTrustStore::load_or_create(&config.storage_dir)
+        .map_err(|error| format!("trust store unavailable: {error}"))?;
+    let android_device_id = trust_store.device_id().to_owned();
+    let trusted_desktop_count = trust_store.trusted_desktop_count();
+    if config.pairing_code.is_empty() && trusted_desktop_count == 0 {
+        return Err("pairing code required for first desktop".to_owned());
+    }
+
+    let stream = TcpStream::connect(&config.address)
+        .map_err(|error| format!("connect to {} failed: {error}", config.address))?;
+    configure_stream(&stream)
+        .map_err(|error| format!("configure {} failed: {error}", config.address))?;
+    let input_stream = stream
+        .try_clone()
+        .map_err(|error| format!("clone {} stream failed: {error}", config.address))?;
+    let auth_challenge = make_auth_challenge();
+
+    let mut guard = state()
+        .lock()
+        .map_err(|_| "state lock poisoned while connecting".to_owned())?;
+    if let Some(token) = reconnect_generation
+        && guard.reconnect_generation != token
+    {
+        close_stream(Some(stream));
+        return Err("stale reconnect generation".to_owned());
+    }
+
+    guard.connection_generation += 1;
+    guard.stream = Some(stream);
+    guard.connected_to = Some(config.address.clone());
+    guard.pairing_code_set = !config.pairing_code.is_empty();
+    guard.input_authenticated = false;
+    guard.paired_desktop_id = None;
+    guard.paired_desktop_name = None;
+    guard.session_key_fingerprint = None;
+    guard.trusted_desktop_count = trusted_desktop_count;
+    guard.reconnect_config = Some(config.clone());
+    guard.reconnect_callbacks = Some(callbacks.clone());
+    guard.received_pings = 0;
+    guard.sent_pongs = 0;
+    guard.last_error = None;
+    guard.mark_status_changed();
+    let generation = guard.connection_generation;
+
+    let hello = Payload::Hello(DeviceHello::android(
+        android_device_id.clone(),
+        config.device_name.clone(),
+    ));
+    let send_result = guard
+        .send_payload(hello)
+        .and_then(|()| guard.send_payload(Payload::AuthChallenge(auth_challenge.clone())));
+    match send_result {
+        Ok(()) => {
+            if let Some(format) = guard.last_video_format.clone()
+                && let Err(error) = guard.send_payload(Payload::VideoFormat(format))
+            {
+                guard
+                    .clear_connection(format!("format send to {} failed: {error}", config.address));
+                return Err(error);
+            }
+        }
+        Err(error) => {
+            guard.clear_connection(format!("hello send to {} failed: {error}", config.address));
+            return Err(error);
+        }
+    }
+    guard.reconnecting = false;
+    guard.reconnect_attempts = 0;
+    guard.last_reconnect_error = None;
+    guard.mark_status_changed();
+    drop(guard);
+
+    spawn_input_reader(
+        callbacks.clone(),
+        input_stream,
+        generation,
+        config.address.clone(),
+        AuthContext {
+            trust_store,
+            android_device_id,
+            pairing_code: config.pairing_code.clone(),
+            challenge: auth_challenge.challenge,
+        },
+    );
+    Ok(())
+}
+
 fn spawn_input_reader(
-    java_vm: JavaVM,
-    input_class: GlobalRef,
-    status_class: GlobalRef,
+    callbacks: SessionCallbacks,
     stream: TcpStream,
     generation: u64,
     address: String,
     auth_context: AuthContext,
 ) {
     let thread_address = address.clone();
+    let callbacks_for_error = callbacks.clone();
     let spawn_result = thread::Builder::new()
         .name("AndroidConnectInputReader".to_owned())
         .spawn(move || {
-            let result = input_reader_loop(
-                &java_vm,
-                input_class,
-                &status_class,
-                stream,
-                generation,
-                auth_context,
-            );
+            let result = input_reader_loop(&callbacks, stream, generation, auth_context);
             if let Err(error) = result {
-                let changed = clear_connection_if_generation(
-                    generation,
-                    format!("input reader from {thread_address} stopped: {error}"),
-                );
+                let error = format!("input reader from {thread_address} stopped: {error}");
+                let changed = clear_connection_if_generation(generation, error.clone());
+                let reconnect_started = if changed && should_reconnect_after_error(&error) {
+                    start_reconnect_worker_if_needed(error)
+                } else {
+                    false
+                };
                 if changed {
-                    notify_native_status_changed_from_vm(&java_vm, &status_class);
+                    notify_native_status_changed_from_vm(
+                        &callbacks.java_vm,
+                        &callbacks.status_class,
+                    );
+                }
+                if reconnect_started {
+                    notify_native_status_changed_from_vm(
+                        &callbacks.java_vm,
+                        &callbacks.status_class,
+                    );
                 }
             }
         });
 
     if let Err(error) = spawn_result {
-        clear_connection_if_generation(
-            generation,
-            format!("input reader for {address} failed to start: {error}"),
-        );
+        let error = format!("input reader for {address} failed to start: {error}");
+        if clear_connection_if_generation(generation, error.clone()) {
+            start_reconnect_worker_if_needed(error);
+            notify_native_status_changed_from_vm(
+                &callbacks_for_error.java_vm,
+                &callbacks_for_error.status_class,
+            );
+        }
     }
 }
 
 fn input_reader_loop(
-    java_vm: &JavaVM,
-    input_class: GlobalRef,
-    status_class: &GlobalRef,
+    callbacks: &SessionCallbacks,
     mut stream: TcpStream,
     generation: u64,
     mut auth_context: AuthContext,
 ) -> Result<(), String> {
-    let mut env = java_vm
+    let mut env = callbacks
+        .java_vm
         .attach_current_thread()
         .map_err(|error| format!("attach JNI input thread failed: {error}"))?;
-    let mut dispatcher = InputDispatcher::new(input_class);
+    let mut dispatcher = InputDispatcher::new(callbacks.input_class.clone());
     let mut desktop_authenticated = false;
 
     loop {
@@ -589,7 +675,7 @@ fn input_reader_loop(
                     }),
                 )?;
                 if status_changed {
-                    notify_native_status_changed_with_class(&mut env, status_class);
+                    notify_native_status_changed_with_class(&mut env, &callbacks.status_class);
                 }
                 if !auth_result.accepted {
                     return Err(auth_result.message);
@@ -611,6 +697,157 @@ fn input_reader_loop(
             | Payload::VideoFrame(_) => {}
         }
     }
+}
+
+fn cancel_active_reconnect_and_connection() {
+    if let Ok(mut guard) = state().lock() {
+        guard.reconnect_generation += 1;
+        guard.reconnect_config = None;
+        guard.reconnect_callbacks = None;
+        guard.reconnecting = false;
+        guard.reconnect_attempts = 0;
+        guard.last_reconnect_error = None;
+        guard.reset_active_connection();
+        guard.last_error = None;
+        guard.mark_status_changed();
+    }
+}
+
+fn is_reconnect_generation_active(reconnect_generation: u64) -> bool {
+    state()
+        .lock()
+        .map(|guard| {
+            guard.reconnect_generation == reconnect_generation
+                && guard.reconnecting
+                && guard.reconnect_config.is_some()
+        })
+        .unwrap_or(false)
+}
+
+fn start_reconnect_worker_if_needed(reason: String) -> bool {
+    let request = {
+        let Ok(mut guard) = state().lock() else {
+            return false;
+        };
+        if guard.stream.is_some() || guard.reconnecting {
+            return false;
+        }
+        let Some(config) = guard.reconnect_config.clone() else {
+            return false;
+        };
+        let Some(callbacks) = guard.reconnect_callbacks.clone() else {
+            return false;
+        };
+        guard.reconnecting = true;
+        guard.reconnect_attempts = 0;
+        guard.last_reconnect_error = Some(reason);
+        guard.mark_status_changed();
+        ReconnectRequest {
+            config,
+            callbacks,
+            reconnect_generation: guard.reconnect_generation,
+        }
+    };
+
+    let callbacks_for_error = request.callbacks.clone();
+    let spawn_result = thread::Builder::new()
+        .name("AndroidConnectReconnect".to_owned())
+        .spawn(move || reconnect_worker_loop(request));
+    if let Err(error) = spawn_result {
+        mark_reconnect_worker_stopped(format!("reconnect worker failed to start: {error}"));
+        notify_native_status_changed_from_vm(
+            &callbacks_for_error.java_vm,
+            &callbacks_for_error.status_class,
+        );
+        false
+    } else {
+        true
+    }
+}
+
+fn reconnect_worker_loop(request: ReconnectRequest) {
+    let mut delay = RECONNECT_INITIAL_DELAY;
+    loop {
+        thread::sleep(delay);
+        if !mark_reconnect_attempt(request.reconnect_generation) {
+            return;
+        }
+        notify_native_status_changed_from_vm(
+            &request.callbacks.java_vm,
+            &request.callbacks.status_class,
+        );
+
+        match connect_session(
+            &request.config,
+            &request.callbacks,
+            Some(request.reconnect_generation),
+        ) {
+            Ok(()) => {
+                notify_native_status_changed_from_vm(
+                    &request.callbacks.java_vm,
+                    &request.callbacks.status_class,
+                );
+                return;
+            }
+            Err(error) => {
+                if !mark_reconnect_failure(request.reconnect_generation, error) {
+                    return;
+                }
+                notify_native_status_changed_from_vm(
+                    &request.callbacks.java_vm,
+                    &request.callbacks.status_class,
+                );
+                delay = next_reconnect_delay(delay);
+            }
+        }
+    }
+}
+
+fn mark_reconnect_attempt(reconnect_generation: u64) -> bool {
+    if let Ok(mut guard) = state().lock()
+        && guard.reconnect_generation == reconnect_generation
+        && guard.reconnecting
+    {
+        guard.reconnect_attempts += 1;
+        guard.mark_status_changed();
+        true
+    } else {
+        false
+    }
+}
+
+fn mark_reconnect_failure(reconnect_generation: u64, error: String) -> bool {
+    if let Ok(mut guard) = state().lock()
+        && guard.reconnect_generation == reconnect_generation
+        && guard.reconnecting
+    {
+        guard.last_reconnect_error = Some(error);
+        guard.mark_status_changed();
+        true
+    } else {
+        false
+    }
+}
+
+fn mark_reconnect_worker_stopped(error: String) {
+    if let Ok(mut guard) = state().lock() {
+        guard.reconnecting = false;
+        guard.last_reconnect_error = Some(error);
+        guard.mark_status_changed();
+    }
+}
+
+fn next_reconnect_delay(current: Duration) -> Duration {
+    current.saturating_mul(2).min(RECONNECT_MAX_DELAY)
+}
+
+fn should_reconnect_after_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    !lower.contains("pairing")
+        && !lower.contains("authentication")
+        && !lower.contains("rejected")
+        && !lower.contains("unsupported protocol")
+        && !lower.contains("stale connection generation")
 }
 
 struct AuthContext {
@@ -1254,6 +1491,22 @@ mod tests {
     }
 
     #[test]
+    fn stats_json_exposes_reconnect_state() {
+        let _guard = test_lock().lock().expect("test lock");
+        let mut guard = state().lock().expect("state lock");
+        *guard = AppState::default();
+        guard.reconnecting = true;
+        guard.reconnect_attempts = 3;
+        guard.last_reconnect_error = Some("connect failed".to_owned());
+        drop(guard);
+
+        let stats = stats_value();
+        assert_eq!(stats["reconnecting"], true);
+        assert_eq!(stats["reconnect_attempts"], 3);
+        assert_eq!(stats["last_reconnect_error"], "connect failed");
+    }
+
+    #[test]
     fn status_revision_changes_with_native_status() {
         let _guard = test_lock().lock().expect("test lock");
         let mut guard = state().lock().expect("state lock");
@@ -1347,6 +1600,31 @@ mod tests {
         assert!(decision.trusted);
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reconnect_backoff_caps_at_max_delay() {
+        assert_eq!(
+            next_reconnect_delay(Duration::from_millis(500)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            next_reconnect_delay(RECONNECT_MAX_DELAY),
+            RECONNECT_MAX_DELAY
+        );
+    }
+
+    #[test]
+    fn reconnect_skips_authentication_failures() {
+        assert!(should_reconnect_after_error(
+            "io error: failed to fill whole buffer"
+        ));
+        assert!(!should_reconnect_after_error(
+            "pairing authentication failed"
+        ));
+        assert!(!should_reconnect_after_error(
+            "unsupported protocol version 2"
+        ));
     }
 
     fn stats_value() -> serde_json::Value {

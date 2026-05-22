@@ -25,6 +25,8 @@ The detailed desktop input-control reference lives in `docs/INPUT_CONTROL.md`.
   last error, and refreshes while the activity is visible. ✓
 - Desktop sends periodic TCP heartbeat pings, Android replies with pongs, and both surfaces report
   heartbeat health. ✓
+- Android automatically retries the last desktop endpoint with backoff after unexpected TCP drops,
+  and explicit disconnect cancels recovery. ✓
 - Android native connection/session status changes notify the visible activity immediately, with
   polling kept as a fallback. ✓
 
@@ -44,8 +46,8 @@ Capture desktop pointer and keyboard events and deliver them to the Android acce
 
 TCP is acceptable for local validation. The current trusted-session input gate stops accidental
 unauthenticated input, but the stream is still not encrypted or hardened against active
-man-in-the-middle attacks. QUIC should replace TCP after reconnect/session recovery to give separate
-reliable/unreliable streams for control, input, and video.
+man-in-the-middle attacks. QUIC should replace TCP to give separate reliable/unreliable streams for
+control, input, and video.
 
 The current trust model: the desktop has a persistent local identity, Android has a persistent
 app-install device id, first pairing derives and stores a shared secret on both sides, and later
@@ -83,12 +85,11 @@ Known shortcuts:
 
 ## Immediate Backlog
 
-1. Add reconnect/session recovery beyond the current manual connect/disconnect flow.
-2. Add rotation/resolution renegotiation.
-3. Harden text input with an IME service instead of accessibility `ACTION_SET_TEXT`.
-4. Add desktop frame-rate and byte-rate counters.
-5. Replace single TCP stream with encrypted/authenticated QUIC/control streams.
-6. Run the deferred physical-device input QA pass.
+1. Add rotation/resolution renegotiation.
+2. Harden text input with an IME service instead of accessibility `ACTION_SET_TEXT`.
+3. Add desktop frame-rate and byte-rate counters.
+4. Replace single TCP stream with encrypted/authenticated QUIC/control streams.
+5. Run the deferred physical-device input QA pass.
 
 ## Current Manual Run Flow
 
@@ -103,3 +104,5 @@ Known shortcuts:
 7. Confirm the desktop logs `hello`, `video`, and `frame` messages.
 8. Enable the Android accessibility service.
 9. Validate left-click tap, left-button drag, wheel scroll, text input, Back, Home, Recents, and Lock.
+10. Stop and restart the desktop viewer, then confirm Android reports reconnect attempts and
+    reconnects without tapping `Connect desktop` again.

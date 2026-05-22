@@ -65,7 +65,6 @@ Not implemented yet:
 - End-to-end input validation on a physical Android device (emulator pass does not substitute).
 - Encrypted/authenticated session transport. The current trusted-session input gate is not the final
   security model because the TCP stream is still unencrypted.
-- Reconnect/session recovery beyond the current manual connect/disconnect flow.
 - Rotation/resolution renegotiation beyond initial format metadata.
 
 ## Architecture
@@ -206,7 +205,8 @@ Tasks:
 - Feed H.264 frames from transport into decoder. Done.
 - Preserve aspect ratio — letterbox scaling to window size. Done.
 - Add frame timing and dropped-frame counters. Deferred to M5 polish.
-- Add manual reconnect and clear error states. Deferred to M4.
+- Add manual reconnect and clear error states. Automatic Android-side reconnect moved to M4; desktop
+  error-state polish remains deferred.
 
 Exit criteria:
 
@@ -245,8 +245,9 @@ Exit criteria:
 
 Goal: make the MVP safe enough for repeated local use.
 
-Status: **partial**. Persistent desktop trust and per-session key derivation are implemented for the
-input gate. Encrypted transport and reconnect recovery are not implemented yet.
+Status: **partial**. Persistent desktop trust, per-session key derivation, heartbeat, and automatic
+TCP reconnect recovery are implemented for the input gate. Encrypted transport is not implemented
+yet.
 
 Tasks:
 
@@ -254,8 +255,8 @@ Tasks:
 - Store paired desktop identity on Android. Done.
 - Authenticate each session before accepting video or input traffic. Partial — input is gated;
   video remains available during pairing.
-- Add heartbeat and reconnect behavior. Partial — heartbeat is implemented and visible; reconnect is
-  pending.
+- Add heartbeat and reconnect behavior. Done — heartbeat is visible and Android retries the last
+  desktop endpoint after unexpected TCP drops until explicit disconnect.
 - Stop input processing immediately when a session is unauthenticated or disconnected. Done for the
   current connection.
 - Add visible Android status for connected desktop identity. Done.
@@ -267,8 +268,8 @@ Exit criteria:
 
 - Unknown clients cannot send input. Partial — true for pairing/trusted-session auth; encrypted
   transport is pending.
-- Previously paired desktop can reconnect without repeating full setup. Partial — authentication can
-  reuse stored trust, but connection recovery is still manual.
+- Previously paired desktop can reconnect without repeating full setup. Done for the current
+  Android-initiated TCP flow.
 - Revoking permissions or dropping the network produces clear user-visible state.
 
 ### M5: MVP Polish And Test Pass
@@ -345,7 +346,7 @@ Android device variance:
 6. Add identity-bound pairing-code input authentication. ✓
 7. Validate input end-to-end on a physical Android device. Deferred for current development order.
 8. Persist paired desktop identity and derive per-session keys. ✓
-9. Add reconnect/session recovery.
+9. Add reconnect/session recovery. ✓
 10. Add rotation/resolution renegotiation.
 11. Replace accessibility text with IME-backed input path.
 12. Replace or extend TCP transport with QUIC.

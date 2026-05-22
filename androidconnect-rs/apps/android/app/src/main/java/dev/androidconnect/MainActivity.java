@@ -249,15 +249,18 @@ public final class MainActivity extends Activity {
             JSONObject json = new JSONObject(stats);
             boolean running = json.optBoolean("running", false);
             boolean connected = json.optBoolean("connected", false);
+            boolean reconnecting = json.optBoolean("reconnecting", false);
             boolean inputAuthenticated = json.optBoolean("input_authenticated", false);
             long encodedFrames = json.optLong("encoded_frames", 0);
             long sentBytes = json.optLong("sent_bytes", 0);
             long receivedPings = json.optLong("received_pings", 0);
             long sentPongs = json.optLong("sent_pongs", 0);
+            long reconnectAttempts = json.optLong("reconnect_attempts", 0);
             String connectedTo = json.optString("connected_to", "");
             String pairedDesktopName = json.optString("paired_desktop_name", "");
             String pairedDesktopId = json.optString("paired_desktop_id", "");
             long trustedDesktopCount = json.optLong("trusted_desktop_count", 0);
+            String lastReconnectError = json.optString("last_reconnect_error", "");
             String lastError = json.optString("last_error", "");
 
             StringBuilder status = new StringBuilder();
@@ -274,6 +277,13 @@ public final class MainActivity extends Activity {
                     status.append(" to ");
                     status.append(connectedTo);
                 }
+            } else if (reconnecting) {
+                status.append("reconnecting");
+                if (reconnectAttempts > 0) {
+                    status.append(" (attempt ");
+                    status.append(reconnectAttempts);
+                    status.append(")");
+                }
             } else {
                 status.append("disconnected");
             }
@@ -288,7 +298,7 @@ public final class MainActivity extends Activity {
                     status.append(" with ");
                     status.append(pairedDesktopId);
                 }
-            } else if (connected) {
+            } else if (connected || reconnecting) {
                 status.append("pending");
             } else {
                 status.append("not connected");
@@ -310,6 +320,10 @@ public final class MainActivity extends Activity {
             if (!lastError.isEmpty()) {
                 status.append("\nLast error: ");
                 status.append(lastError);
+            }
+            if (!lastReconnectError.isEmpty()) {
+                status.append("\nReconnect: ");
+                status.append(lastReconnectError);
             }
 
             return status.toString();

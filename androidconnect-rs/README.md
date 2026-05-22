@@ -16,6 +16,7 @@ Open, local-first, Rust-based Android screen mirroring and desktop control for n
 - `docs/FEATURE_POSITIONING.md`: product thesis, feature matrix vs Phone Link/KDE Connect, scope decisions, and licence targets.
 - `docs/PROJECT_PLAN.md`: structured scope, milestones, architecture, risks, and definition of done.
 - `docs/MVP1.md`: short tactical backlog for the current MVP slice.
+- `docs/MVP2.md`: expanded post-MVP1 utility, advanced integration, relay, and multi-client scope.
 - `docs/INPUT_CONTROL.md`: current desktop input controls, architecture, limitations, and validation checklist.
 
 ## Build Rust
@@ -74,6 +75,8 @@ The app can launch without the native library, but encoded frames are dropped un
 7. Tap `Start mirroring` and approve screen capture.
 8. The desktop window shows the live Android screen letterboxed to fit.
 9. Enable the Android accessibility service before testing remote input.
+10. If the TCP session drops unexpectedly, Android retries the last desktop endpoint with backoff
+    until `Disconnect desktop` is tapped.
 
 ## Desktop Input Controls
 
@@ -95,8 +98,7 @@ See `docs/INPUT_CONTROL.md` for the full control reference, limitations, and val
 
 ## MVP 1 Remaining Work
 
-1. Add reconnect/session recovery beyond the current manual connect/disconnect flow.
-2. Add rotation/resolution renegotiation.
-3. Replace accessibility `ACTION_SET_TEXT` with an IME-backed text input path.
-4. Replace TCP with encrypted/authenticated QUIC streams.
-5. Add a deferred physical-device QA pass for desktop input control.
+1. Add rotation/resolution renegotiation.
+2. Replace accessibility `ACTION_SET_TEXT` with an IME-backed text input path.
+3. Replace TCP with encrypted/authenticated QUIC streams.
+4. Add a deferred physical-device QA pass for desktop input control.

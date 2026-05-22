@@ -101,13 +101,17 @@ Key files:
 10. Focus an editable text field and type letters, Backspace, Delete, Enter, and Tab.
 11. Trigger Back, Home, Recents, and Lock with hardware keys or `Ctrl+Alt+B/H/R/L`.
 12. Disconnect Android and confirm input stops.
-13. Reconnect and repeat at least click and text checks.
+13. Stop and restart the desktop viewer without tapping `Disconnect desktop`; confirm Android
+    reports reconnect attempts and pairs again automatically.
+14. Reconnect manually and repeat at least click and text checks if automatic recovery fails.
 
 ## Troubleshooting
 
 - If video works but input does not, confirm Android accessibility service status in the app and
   Android Settings, then confirm the desktop logged pairing success and the window title shows
   `input paired`.
+- If reconnect does not happen after a dropped desktop session, confirm AndroidConnect was not
+  explicitly disconnected and check the Android status panel's reconnect error line.
 - If clicks land in the wrong place, verify the desktop window is showing the current frame size and
   test without rotating the device during the session.
 - If text does not enter, confirm the focused Android node is editable. Some fields block
