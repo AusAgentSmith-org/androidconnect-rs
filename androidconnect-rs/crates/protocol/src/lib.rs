@@ -4,7 +4,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 4;
+pub mod qr;
+
+pub const PROTOCOL_VERSION: u16 = 5;
 pub const DEFAULT_CONTROL_PORT: u16 = 48172;
 pub const DEFAULT_VIDEO_PORT: u16 = 48173;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 256 * 1024;
@@ -59,6 +61,7 @@ pub enum Payload {
     NotificationPosted(NotificationPosted),
     NotificationRemoved(NotificationRemoved),
     NotificationAction(NotificationAction),
+    NotificationFilterUpdate(NotificationFilterUpdate),
     AudioFormat(AudioFormat),
     AudioFrame(AudioFrame),
     AudioControl(AudioControl),
@@ -324,6 +327,48 @@ pub struct DeviceStatus {
     pub charging: Option<bool>,
     pub interactive: Option<bool>,
     pub features: Vec<FeatureStatus>,
+    #[serde(default)]
+    pub wifi_state: Option<WifiState>,
+    #[serde(default)]
+    pub bluetooth_state: Option<BluetoothState>,
+    #[serde(default)]
+    pub dnd_state: Option<DndState>,
+    #[serde(default)]
+    pub volume: Option<VolumeState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WifiState {
+    pub connected: bool,
+    pub ssid: Option<String>,
+    pub signal_strength: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BluetoothState {
+    pub enabled: bool,
+    pub connected_devices: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DndState {
+    pub enabled: bool,
+    pub mode: DndMode,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DndMode {
+    Off,
+    Priority,
+    Alarms,
+    TotalSilence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeState {
+    pub media_percent: u8,
+    pub ring_percent: Option<u8>,
+    pub max_percent: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -506,6 +551,12 @@ pub struct NotificationAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationFilterUpdate {
+    pub package_name: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AudioFormat {
     pub stream_id: u32,
     pub codec: AudioCodec,
@@ -539,6 +590,9 @@ pub enum AudioControlCommand {
     Stop,
     Mute,
     Unmute,
+    SetVolume { percent: u8 },
+    SetDnd { mode: DndMode },
+    SetBluetooth { enabled: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1098,6 +1152,10 @@ mod tests {
                         "notification listener access is not enabled",
                     ),
                 ],
+                wifi_state: None,
+                bluetooth_state: None,
+                dnd_state: None,
+                volume: None,
             }),
         );
 

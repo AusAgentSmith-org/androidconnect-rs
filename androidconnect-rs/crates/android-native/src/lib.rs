@@ -720,6 +720,14 @@ struct DeviceStatusUpdate {
     charging: Option<bool>,
     interactive: Option<bool>,
     features: Vec<FeatureStatus>,
+    #[serde(default)]
+    wifi_state: Option<androidconnect_protocol::WifiState>,
+    #[serde(default)]
+    bluetooth_state: Option<androidconnect_protocol::BluetoothState>,
+    #[serde(default)]
+    dnd_state: Option<androidconnect_protocol::DndState>,
+    #[serde(default)]
+    volume: Option<androidconnect_protocol::VolumeState>,
 }
 
 fn push_json_payload<T>(
@@ -777,6 +785,10 @@ fn push_device_status_json(json: &str) -> Result<(), String> {
         charging: update.charging,
         interactive: update.interactive,
         features: update.features,
+        wifi_state: update.wifi_state,
+        bluetooth_state: update.bluetooth_state,
+        dnd_state: update.dnd_state,
+        volume: update.volume,
     }))
 }
 
@@ -1109,6 +1121,7 @@ fn is_desktop_utility_payload(payload: &Payload) -> bool {
             | Payload::FileBrowseRequest(_)
             | Payload::FileMutation(_)
             | Payload::NotificationAction(_)
+            | Payload::NotificationFilterUpdate(_)
             | Payload::AudioControl(_)
             | Payload::AppWindowOpen(_)
             | Payload::AppWindowClose(_)
