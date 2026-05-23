@@ -7,12 +7,13 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryR
 use std::time::{Duration, Instant};
 
 use androidconnect_protocol::{
-    AUTH_CHALLENGE_BYTES, AuthMethod, AuthResponse, ClipboardSource, Envelope, FeatureStatus,
-    FileTransferChunk, FileTransferComplete, FileTransferStart, InputEvent, MAX_VIDEO_FRAME_BYTES,
-    MediaStatus, PAIRED_SECRET_BYTES, PROTOCOL_VERSION, Payload, TransferDirection, TransferStatus,
-    WireError, bytes_to_hex, derive_session_key, paired_secret_from_pairing_code,
-    pairing_auth_response, read_length_prefixed, session_key_fingerprint,
-    trusted_session_auth_response, write_length_prefixed,
+    AUTH_CHALLENGE_BYTES, AuthMethod, AuthResponse, ClipboardSource, DndMode, Envelope,
+    FeatureStatus, FileBrowseResponse, FileTransferChunk, FileTransferComplete, FileTransferStart,
+    InputEvent, MAX_VIDEO_FRAME_BYTES, MediaStatus, NotificationPosted, NotificationRemoved,
+    PAIRED_SECRET_BYTES, PROTOCOL_VERSION, Payload, TransferDirection, TransferStatus, WireError,
+    bytes_to_hex, derive_session_key, paired_secret_from_pairing_code, pairing_auth_response,
+    read_length_prefixed, session_key_fingerprint, trusted_session_auth_response,
+    write_length_prefixed,
 };
 use anyhow::{Result, bail};
 use log::{error, info, warn};
@@ -60,6 +61,10 @@ pub enum NetworkStatus {
         battery_percent: Option<u8>,
         charging: Option<bool>,
         feature_summary: String,
+        wifi_summary: Option<String>,
+        bluetooth_enabled: Option<bool>,
+        dnd_mode: Option<DndMode>,
+        volume_percent: Option<u8>,
     },
     MediaStatus {
         active: bool,
@@ -117,6 +122,18 @@ pub enum DesktopCommand {
     Utility(Payload),
 }
 
+/// Structured copies of inbound protocol payloads that the UI panels consume.
+/// `NetworkStatus` carries summary strings for the status bar; this enum carries the
+/// data the panels actually render.
+#[derive(Debug, Clone)]
+pub enum DesktopEvent {
+    NotificationPosted(NotificationPosted),
+    NotificationRemoved(NotificationRemoved),
+    FileBrowseResponse(FileBrowseResponse),
+    SessionLost,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     bind: &str,
     frame_sender: SyncSender<RgbaFrame>,
@@ -125,6 +142,7 @@ pub fn run(
     trust_store_path: PathBuf,
     status_tx: Sender<NetworkStatus>,
     clipboard_apply_tx: Sender<String>,
+    event_tx: Sender<DesktopEvent>,
 ) -> Result<()> {
     let listener = TcpListener::bind(bind)?;
     info!("listening on {bind}");
@@ -149,7 +167,7 @@ pub fn run(
                 );
                 let trust_store = TrustStore::load_or_create_at(&trust_store_path)?;
                 drain_stale_commands(&command_rx);
-                if let Err(e) = handle_client(
+                let result = handle_client(
                     stream,
                     frame_sender.clone(),
                     &command_rx,
@@ -157,7 +175,10 @@ pub fn run(
                     trust_store,
                     status_tx.clone(),
                     clipboard_apply_tx.clone(),
-                ) {
+                    event_tx.clone(),
+                );
+                let _ = event_tx.send(DesktopEvent::SessionLost);
+                if let Err(e) = result {
                     if is_clean_disconnect(&e) {
                         info!("client disconnected");
                         send_status(&status_tx, NetworkStatus::ClientDisconnected);
@@ -188,6 +209,7 @@ pub fn run(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_client(
     stream: TcpStream,
     frame_sender: SyncSender<RgbaFrame>,
@@ -196,6 +218,7 @@ fn handle_client(
     trust_store: TrustStore,
     status_tx: Sender<NetworkStatus>,
     clipboard_apply_tx: Sender<String>,
+    event_tx: Sender<DesktopEvent>,
 ) -> Result<()> {
     stream.set_nodelay(true)?;
     let writer = stream.try_clone()?;
@@ -212,6 +235,7 @@ fn handle_client(
             writer_command_tx,
             status_tx,
             clipboard_apply_tx,
+            event_tx,
         );
         let _ = reader_done_tx.send(result);
     });
@@ -365,6 +389,7 @@ fn is_desktop_utility_payload(payload: &Payload) -> bool {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_client_loop(
     mut stream: TcpStream,
     sender: SyncSender<RgbaFrame>,
@@ -373,6 +398,7 @@ fn read_client_loop(
     writer_command_tx: Sender<WriterCommand>,
     status_tx: Sender<NetworkStatus>,
     clipboard_apply_tx: Sender<String>,
+    event_tx: Sender<DesktopEvent>,
 ) -> Result<()> {
     let mut decoder = Decoder::new().map_err(|e| anyhow::anyhow!("decoder init failed: {e:?}"))?;
     let desktop_identity = trust_store.identity();
@@ -565,18 +591,40 @@ fn read_client_loop(
             Payload::Input(_) => {}
             Payload::DeviceStatus(status) => {
                 info!(
-                    "device_status: battery={:?}% charging={:?} interactive={:?} features={}",
+                    "device_status: battery={:?}% charging={:?} interactive={:?} wifi={:?} bt={:?} dnd={:?} vol={:?} features={}",
                     status.battery_percent,
                     status.charging,
                     status.interactive,
+                    status.wifi_state,
+                    status.bluetooth_state,
+                    status.dnd_state,
+                    status.volume,
                     feature_summary(&status.features)
                 );
+                let wifi_summary = status.wifi_state.as_ref().map(|w| {
+                    if w.connected {
+                        match (&w.ssid, w.signal_strength) {
+                            (Some(ssid), Some(rssi)) => format!("{ssid} ({rssi} dBm)"),
+                            (Some(ssid), None) => ssid.clone(),
+                            (None, _) => "connected".to_owned(),
+                        }
+                    } else {
+                        "off".to_owned()
+                    }
+                });
+                let bt_enabled = status.bluetooth_state.as_ref().map(|b| b.enabled);
+                let dnd_mode = status.dnd_state.as_ref().map(|d| d.mode);
+                let volume_percent = status.volume.as_ref().map(|v| v.media_percent);
                 send_status(
                     &status_tx,
                     NetworkStatus::DeviceStatus {
                         battery_percent: status.battery_percent,
                         charging: status.charging,
                         feature_summary: feature_summary(&status.features),
+                        wifi_summary,
+                        bluetooth_enabled: bt_enabled,
+                        dnd_mode,
+                        volume_percent,
                     },
                 );
             }
@@ -639,11 +687,12 @@ fn read_client_loop(
                 send_status(
                     &status_tx,
                     NetworkStatus::FileBrowse {
-                        path: response.path,
+                        path: response.path.clone(),
                         entries: response.entries.len(),
                         state: format!("{:?}", response.status.state),
                     },
                 );
+                let _ = event_tx.send(DesktopEvent::FileBrowseResponse(response));
             }
             Payload::NotificationPosted(notification) => {
                 info!(
@@ -657,20 +706,22 @@ fn read_client_loop(
                 send_status(
                     &status_tx,
                     NetworkStatus::NotificationPosted {
-                        app_name: notification.app_name,
-                        title: notification.title,
+                        app_name: notification.app_name.clone(),
+                        title: notification.title.clone(),
                         sensitive: notification.sensitive,
                     },
                 );
+                let _ = event_tx.send(DesktopEvent::NotificationPosted(notification));
             }
             Payload::NotificationRemoved(removed) => {
                 info!("notification_removed: id={:?}", removed.notification_id);
                 send_status(
                     &status_tx,
                     NetworkStatus::NotificationRemoved {
-                        notification_id: removed.notification_id,
+                        notification_id: removed.notification_id.clone(),
                     },
                 );
+                let _ = event_tx.send(DesktopEvent::NotificationRemoved(removed));
             }
             Payload::MessageThreadList(list) => {
                 send_status(
@@ -1067,6 +1118,7 @@ mod tests {
         let (writer_command_tx, _writer_command_rx) = mpsc::channel();
         let (status_tx, status_rx) = mpsc::channel();
         let (clipboard_apply_tx, _clipboard_apply_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::channel();
 
         let reader = std::thread::spawn(move || {
             read_client_loop(
@@ -1077,6 +1129,7 @@ mod tests {
                 writer_command_tx,
                 status_tx,
                 clipboard_apply_tx,
+                event_tx,
             )
         });
 

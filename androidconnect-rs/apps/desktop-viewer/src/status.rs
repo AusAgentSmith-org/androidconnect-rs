@@ -1,4 +1,4 @@
-use androidconnect_protocol::normalize_pairing_code;
+use androidconnect_protocol::{DndMode, normalize_pairing_code};
 
 use crate::network;
 
@@ -32,6 +32,10 @@ pub struct DesktopStatus {
     pub relay_summary: Option<String>,
     pub client_summary: Option<String>,
     pub clipboard_summary: Option<String>,
+    pub wifi_summary: Option<String>,
+    pub bluetooth_enabled: Option<bool>,
+    pub dnd_mode: Option<DndMode>,
+    pub volume_percent: Option<u8>,
 }
 
 impl DesktopStatus {
@@ -58,6 +62,10 @@ impl DesktopStatus {
             relay_summary: None,
             client_summary: None,
             clipboard_summary: None,
+            wifi_summary: None,
+            bluetooth_enabled: None,
+            dnd_mode: None,
+            volume_percent: None,
         }
     }
 
@@ -135,6 +143,10 @@ impl DesktopStatus {
                 battery_percent,
                 charging,
                 feature_summary,
+                wifi_summary,
+                bluetooth_enabled,
+                dnd_mode,
+                volume_percent,
             } => {
                 self.battery_status = battery_percent.map(|percent| {
                     if charging.unwrap_or(false) {
@@ -144,6 +156,10 @@ impl DesktopStatus {
                     }
                 });
                 self.feature_summary = Some(feature_summary);
+                self.wifi_summary = wifi_summary;
+                self.bluetooth_enabled = bluetooth_enabled;
+                self.dnd_mode = dnd_mode;
+                self.volume_percent = volume_percent;
                 self.connection = ConnectionState::Connected;
             }
             network::NetworkStatus::MediaStatus { active, summary } => {
@@ -287,6 +303,10 @@ impl DesktopStatus {
         self.relay_summary = None;
         self.client_summary = None;
         self.clipboard_summary = None;
+        self.wifi_summary = None;
+        self.bluetooth_enabled = None;
+        self.dnd_mode = None;
+        self.volume_percent = None;
     }
 
     fn utility_summary(&self) -> Option<String> {

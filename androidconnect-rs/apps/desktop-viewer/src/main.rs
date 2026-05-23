@@ -2,6 +2,7 @@ mod app;
 mod clipboard;
 mod config;
 mod network;
+mod panels;
 mod status;
 mod streaming;
 mod trust;
@@ -28,6 +29,7 @@ fn main() -> Result<()> {
     let (frame_tx, frame_rx) = mpsc::sync_channel::<RgbaFrame>(2);
     let (command_tx, command_rx) = mpsc::sync_channel::<network::DesktopCommand>(1024);
     let (status_tx, status_rx) = mpsc::channel::<network::NetworkStatus>();
+    let (event_tx, event_rx) = mpsc::channel::<network::DesktopEvent>();
 
     let clipboard_apply_tx = clipboard::spawn(command_tx.clone());
 
@@ -44,6 +46,7 @@ fn main() -> Result<()> {
             trust_store_path_for_thread,
             status_tx,
             clipboard_apply_tx,
+            event_tx,
         ) {
             error!("network thread: {e:#}");
             let _ = status_tx_for_error.send(network::NetworkStatus::ClientError {
@@ -82,6 +85,7 @@ fn main() -> Result<()> {
                 frame_rx,
                 command_tx,
                 status_rx,
+                event_rx,
                 bind,
                 pairing_code,
                 desktop_id,

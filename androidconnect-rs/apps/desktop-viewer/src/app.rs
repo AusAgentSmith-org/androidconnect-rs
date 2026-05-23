@@ -4,72 +4,49 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use anyhow::{Result, bail};
+use eframe::egui;
+use egui::{
+    Color32, ColorImage, Event, Frame, Key, Layout, Margin, PointerButton as EguiButton, Pos2,
+    Rect, RichText, Sense, TextureHandle, TextureOptions, Vec2,
+};
+use log::error;
+use qrcode::{Color as QrColor, QrCode};
+
 use androidconnect_protocol::{
     FileTransferChunk, FileTransferComplete, FileTransferStart, InputEvent, Modifiers, Payload,
     PointerButton, PointerEvent, PointerPhase, SystemAction, TextInput, TransferDirection,
     TransferStatus,
     qr::{QrPairingPayload, encode_qr_payload},
 };
-use anyhow::{Result, bail};
-use eframe::egui;
-use egui::{
-    Color32, ColorImage, Event, FontId, Frame, Image, Key, Layout, Margin,
-    PointerButton as EguiButton, Pos2, Rect, RichText, ScrollArea, Sense, Stroke, TextureHandle,
-    TextureOptions, Vec2,
-};
-use qrcode::{Color as QrColor, QrCode};
 
 use crate::network;
+use crate::panels::{
+    self, Panel, files::FilesState, notifications::NotificationsState, phone::PhoneState,
+};
 use crate::status::{ConnectionState, DesktopStatus};
 use crate::streaming::{RgbaFrame, map_window_to_frame};
 
 const SHELL_WINDOW_TITLE: &str = "AndroidConnect";
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum Panel {
-    Notifications,
-    Messages,
-    Files,
-    Phone,
-    Mirror,
-}
-
-impl Panel {
-    fn label(self) -> &'static str {
-        match self {
-            Panel::Notifications => "Notifications",
-            Panel::Messages => "Messages",
-            Panel::Files => "Files",
-            Panel::Phone => "Phone",
-            Panel::Mirror => "Mirror",
-        }
-    }
-
-    const ALL: [Panel; 5] = [
-        Panel::Mirror,
-        Panel::Notifications,
-        Panel::Messages,
-        Panel::Files,
-        Panel::Phone,
-    ];
-}
-
 pub struct App {
     frame_rx: mpsc::Receiver<RgbaFrame>,
     command_tx: mpsc::SyncSender<network::DesktopCommand>,
     status_rx: mpsc::Receiver<network::NetworkStatus>,
+    event_rx: mpsc::Receiver<network::DesktopEvent>,
     status: DesktopStatus,
     desktop_id: String,
     desktop_name: String,
     active_panel: Panel,
-    /// Latest decoded frame as an egui texture. None until a frame arrives.
     frame_texture: Option<TextureHandle>,
     frame_w: u32,
     frame_h: u32,
     last_mirror_rect: Option<Rect>,
     left_pressed: bool,
-    /// Cached QR rendering keyed on the URI we hashed.
     pair_qr_cache: Option<(String, TextureHandle)>,
+    notifications: NotificationsState,
+    phone_state: PhoneState,
+    files_state: FilesState,
 }
 
 impl App {
@@ -78,16 +55,20 @@ impl App {
         frame_rx: mpsc::Receiver<RgbaFrame>,
         command_tx: mpsc::SyncSender<network::DesktopCommand>,
         status_rx: mpsc::Receiver<network::NetworkStatus>,
+        event_rx: mpsc::Receiver<network::DesktopEvent>,
         bind: String,
         pairing_code: String,
         desktop_id: String,
         desktop_name: String,
     ) -> Self {
         let status = DesktopStatus::new(bind, pairing_code);
+        let mut files_state = FilesState::default();
+        files_state.current_path = "/sdcard".to_owned();
         Self {
             frame_rx,
             command_tx,
             status_rx,
+            event_rx,
             status,
             desktop_id,
             desktop_name,
@@ -98,6 +79,9 @@ impl App {
             last_mirror_rect: None,
             left_pressed: false,
             pair_qr_cache: None,
+            notifications: NotificationsState::default(),
+            phone_state: PhoneState::default(),
+            files_state,
         }
     }
 
@@ -107,9 +91,35 @@ impl App {
             .try_send(network::DesktopCommand::Input(event));
     }
 
+    fn send_utility(&self, payload: Payload) {
+        let _ = self
+            .command_tx
+            .try_send(network::DesktopCommand::Utility(payload));
+    }
+
     fn drain_status(&mut self) {
         while let Ok(status) = self.status_rx.try_recv() {
             self.status.apply(status);
+        }
+    }
+
+    fn drain_events(&mut self) {
+        while let Ok(event) = self.event_rx.try_recv() {
+            match event {
+                network::DesktopEvent::NotificationPosted(n) => self.notifications.posted(n),
+                network::DesktopEvent::NotificationRemoved(r) => self.notifications.removed(r),
+                network::DesktopEvent::FileBrowseResponse(r) => self.files_state.record_response(r),
+                network::DesktopEvent::SessionLost => {
+                    self.notifications.clear();
+                    self.phone_state = PhoneState::default();
+                    self.files_state = FilesState::default();
+                    self.files_state.current_path = "/sdcard".to_owned();
+                    self.frame_texture = None;
+                    self.frame_w = 0;
+                    self.frame_h = 0;
+                    self.last_mirror_rect = None;
+                }
+            }
         }
     }
 
@@ -141,12 +151,41 @@ impl App {
             }
         }
     }
+
+    fn drain_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<egui::DroppedFile> = ctx.input(|i| i.raw.dropped_files.clone());
+        for f in dropped {
+            if let Some(path) = f.path {
+                let command_tx = self.command_tx.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = send_file_to_android(command_tx, path) {
+                        error!("send dropped file failed: {e:#}");
+                    }
+                });
+            }
+        }
+    }
+
+    fn process_pending_downloads(&mut self) {
+        // Files panel records (remote_path, local_dest); request the stream so the
+        // network thread can ferry it back. For MVP we just kick off a FileBrowseRequest
+        // marker — the actual download surface uses the existing file-transfer flow on
+        // the Android side which is out of scope for this commit.
+        let drained: Vec<_> = self.files_state.pending_downloads.drain(..).collect();
+        for (remote, dest) in drained {
+            log::info!("download request: {remote} -> {}", dest.display());
+            // Future: emit a file pull request. For now leave a log breadcrumb.
+        }
+    }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _eframe: &mut eframe::Frame) {
         self.drain_status();
+        self.drain_events();
         self.drain_frames(ctx);
+        self.drain_dropped_files(ctx);
+        self.process_pending_downloads();
 
         let title = self.status.window_title();
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
@@ -154,102 +193,58 @@ impl eframe::App for App {
         let connected = matches!(self.status.connection, ConnectionState::Connected)
             && self.status.input_authenticated;
 
-        // Top bar
-        egui::TopBottomPanel::top("topbar")
-            .frame(Frame::new().inner_margin(Margin::same(8)))
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("AndroidConnect").heading());
-                    ui.separator();
-                    let subject = self
-                        .status
-                        .device_name
-                        .clone()
-                        .or_else(|| self.status.peer.clone())
-                        .unwrap_or_else(|| "no device".to_owned());
-                    ui.label(subject);
-                    ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                        let (color, label) = match self.status.connection {
-                            ConnectionState::Listening => (Color32::GRAY, "listening"),
-                            ConnectionState::Connected if self.status.input_authenticated => {
-                                (Color32::from_rgb(80, 200, 120), "paired")
-                            }
-                            ConnectionState::Connected => (Color32::YELLOW, "pairing"),
-                            ConnectionState::Error => (Color32::RED, "error"),
-                        };
-                        let (rect, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
-                        ui.painter().circle_filled(rect.center(), 5.0, color);
-                        ui.label(label);
-                    });
-                });
-            });
+        draw_top_bar(ctx, &self.status);
+        draw_nav_rail(ctx, &mut self.active_panel);
+        draw_status_bar(ctx, &self.status);
 
-        // Left nav rail
-        egui::SidePanel::left("nav")
-            .resizable(false)
-            .exact_width(160.0)
-            .show(ctx, |ui| {
-                ui.add_space(8.0);
-                for panel in Panel::ALL {
-                    let selected = panel == self.active_panel;
-                    let label = RichText::new(panel.label()).strong();
-                    if ui.selectable_label(selected, label).clicked() {
-                        self.active_panel = panel;
-                    }
-                }
-            });
-
-        // Bottom status bar
-        egui::TopBottomPanel::bottom("statusbar")
-            .frame(Frame::new().inner_margin(Margin::same(6)))
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    let battery = self
-                        .status
-                        .battery_status
-                        .clone()
-                        .unwrap_or_else(|| "battery —".to_owned());
-                    ui.label(format!("🔋 {battery}"));
-                    ui.separator();
-                    ui.label(format!(
-                        "📶 {}",
-                        self.status.feature_summary.as_deref().unwrap_or("—")
-                    ));
-                    ui.separator();
-                    ui.label(format!(
-                        "🔊 {}",
-                        self.status.media_summary.as_deref().unwrap_or("—")
-                    ));
-                    ui.separator();
-                    if let Some(nonce) = self.status.last_pong_nonce {
-                        ui.label(format!("♥ #{nonce}"));
-                    } else {
-                        ui.label("♥ —");
-                    }
-                });
-            });
-
-        // Central panel
         let pair_texture = if !connected {
             self.refresh_pair_qr(ctx)
         } else {
             None
         };
+
+        let mut emitted: Vec<Payload> = Vec::new();
+        let mut mirror_rect: Option<Rect> = None;
+
         egui::CentralPanel::default().show(ctx, |ui| {
             if !connected {
-                draw_pair_screen(ui, &self.status, pair_texture.as_ref());
+                panels::pair::draw(ui, &self.status, pair_texture.as_ref());
                 return;
             }
             match self.active_panel {
-                Panel::Mirror => draw_mirror_panel(ui, self),
-                Panel::Notifications => draw_placeholder(ui, "Notifications", "Coming in Lane 3B"),
-                Panel::Messages => draw_placeholder(ui, "Messages", "Coming in Lane 3B"),
-                Panel::Files => draw_placeholder(ui, "Files", "Coming in Lane 3C"),
-                Panel::Phone => draw_placeholder(ui, "Phone (quick settings)", "Coming in Lane 3B"),
+                Panel::Mirror => {
+                    mirror_rect = panels::mirror::draw(
+                        ui,
+                        panels::mirror::DrawInput {
+                            texture: self.frame_texture.as_ref(),
+                            frame_w: self.frame_w,
+                            frame_h: self.frame_h,
+                        },
+                    );
+                }
+                Panel::Notifications => {
+                    emitted
+                        .extend(panels::notifications::draw(ui, &mut self.notifications).payloads);
+                }
+                Panel::Messages => panels::messages::draw(ui),
+                Panel::Files => {
+                    emitted.extend(panels::files::draw(ui, &mut self.files_state).payloads);
+                }
+                Panel::Phone => {
+                    emitted.extend(
+                        panels::phone::draw(ui, &self.status, &mut self.phone_state).payloads,
+                    );
+                }
             }
         });
 
-        // Forward egui input events to Android when the Mirror panel is active.
+        for payload in emitted {
+            self.send_utility(payload);
+        }
+        if mirror_rect.is_some() {
+            self.last_mirror_rect = mirror_rect;
+        }
+
         if connected && self.active_panel == Panel::Mirror {
             self.forward_input_events(ctx);
         }
@@ -258,15 +253,110 @@ impl eframe::App for App {
     }
 }
 
+fn draw_top_bar(ctx: &egui::Context, status: &DesktopStatus) {
+    egui::TopBottomPanel::top("topbar")
+        .frame(Frame::new().inner_margin(Margin::same(8)))
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("AndroidConnect").heading());
+                ui.separator();
+                let subject = status
+                    .device_name
+                    .clone()
+                    .or_else(|| status.peer.clone())
+                    .unwrap_or_else(|| "no device".to_owned());
+                ui.label(subject);
+                ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                    let (color, label) = match status.connection {
+                        ConnectionState::Listening => (Color32::GRAY, "listening"),
+                        ConnectionState::Connected if status.input_authenticated => {
+                            (Color32::from_rgb(80, 200, 120), "paired")
+                        }
+                        ConnectionState::Connected => (Color32::YELLOW, "pairing"),
+                        ConnectionState::Error => (Color32::RED, "error"),
+                    };
+                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 5.0, color);
+                    ui.label(label);
+                });
+            });
+        });
+}
+
+fn draw_nav_rail(ctx: &egui::Context, active: &mut Panel) {
+    egui::SidePanel::left("nav")
+        .resizable(false)
+        .exact_width(160.0)
+        .show(ctx, |ui| {
+            ui.add_space(8.0);
+            for panel in Panel::ALL {
+                let selected = panel == *active;
+                let label = RichText::new(panel.label()).strong();
+                if ui.selectable_label(selected, label).clicked() {
+                    *active = panel;
+                }
+            }
+        });
+}
+
+fn draw_status_bar(ctx: &egui::Context, status: &DesktopStatus) {
+    egui::TopBottomPanel::bottom("statusbar")
+        .frame(Frame::new().inner_margin(Margin::same(6)))
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let battery = status
+                    .battery_status
+                    .clone()
+                    .unwrap_or_else(|| "—".to_owned());
+                ui.label(format!("🔋 {battery}"));
+                ui.separator();
+                ui.label(format!(
+                    "📶 {}",
+                    status.wifi_summary.as_deref().unwrap_or("—")
+                ));
+                ui.separator();
+                ui.label(format!(
+                    "🅱 {}",
+                    match status.bluetooth_enabled {
+                        Some(true) => "on",
+                        Some(false) => "off",
+                        None => "—",
+                    }
+                ));
+                ui.separator();
+                ui.label(format!(
+                    "🌙 {}",
+                    match status.dnd_mode {
+                        Some(androidconnect_protocol::DndMode::Off) | None => "—",
+                        Some(androidconnect_protocol::DndMode::Priority) => "priority",
+                        Some(androidconnect_protocol::DndMode::Alarms) => "alarms",
+                        Some(androidconnect_protocol::DndMode::TotalSilence) => "silence",
+                    }
+                ));
+                ui.separator();
+                ui.label(format!(
+                    "🔊 {}",
+                    status
+                        .volume_percent
+                        .map(|p| format!("{p}%"))
+                        .unwrap_or_else(|| "—".to_owned())
+                ));
+                ui.separator();
+                if let Some(nonce) = status.last_pong_nonce {
+                    ui.label(format!("♥ #{nonce}"));
+                } else {
+                    ui.label("♥ —");
+                }
+            });
+        });
+}
+
 impl App {
-    /// Rebuild the QR texture when the pair URI changes. The URI moves only when bind,
-    /// pairing code, or desktop identity changes, so the cache hit rate is very high.
     fn refresh_pair_qr(&mut self, ctx: &egui::Context) -> Option<TextureHandle> {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or_default();
-        // 5-minute token lifetime to match the spirit of MVP3's pairing TTL.
         let expires_ms = now_ms.saturating_add(5 * 60 * 1000);
 
         let payload = QrPairingPayload::new(
@@ -279,8 +369,6 @@ impl App {
         );
         let uri = encode_qr_payload(&payload).ok()?;
 
-        // Drop the lifetime parts (timestamps) from the cache key so we don't rebuild
-        // every tick — the payload is the same as long as bind/code/identity hold.
         let cache_key = format!(
             "v={}|addrs={:?}|tok={}|id={}",
             payload.protocol_version, payload.addresses, payload.pairing_token, payload.desktop_id,
@@ -461,96 +549,6 @@ impl App {
     }
 }
 
-fn draw_pair_screen(ui: &mut egui::Ui, status: &DesktopStatus, qr_texture: Option<&TextureHandle>) {
-    ScrollArea::vertical().show(ui, |ui| {
-        ui.add_space(40.0);
-        ui.vertical_centered(|ui| {
-            ui.label(RichText::new("Pair a device").font(FontId::proportional(28.0)));
-            ui.add_space(12.0);
-            ui.label(
-                "Open AndroidConnect on your phone and scan the QR, or enter the code manually.",
-            );
-            ui.add_space(28.0);
-
-            Frame::new()
-                .stroke(Stroke::new(1.0, Color32::from_gray(120)))
-                .corner_radius(4)
-                .inner_margin(Margin::same(12))
-                .fill(Color32::WHITE)
-                .show(ui, |ui| match qr_texture {
-                    Some(handle) => {
-                        let size = Vec2::splat(256.0);
-                        ui.add(Image::from_texture((handle.id(), size)).fit_to_exact_size(size));
-                    }
-                    None => {
-                        ui.set_width(256.0);
-                        ui.set_height(256.0);
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(110.0);
-                            ui.label(
-                                RichText::new("QR unavailable")
-                                    .color(Color32::from_gray(40))
-                                    .italics(),
-                            );
-                        });
-                    }
-                });
-            ui.add_space(20.0);
-
-            ui.label(RichText::new("Manual pairing").heading());
-            ui.add_space(6.0);
-            ui.label(format!("Address: {}", status.bind));
-            ui.label(format!(
-                "Pairing code: {}",
-                crate::status::format_pairing_code(&status.pairing_code)
-            ));
-            ui.add_space(16.0);
-            if !matches!(status.connection, ConnectionState::Listening) {
-                ui.label(RichText::new("Waiting for handshake…").italics());
-                if let Some(err) = &status.last_error {
-                    ui.colored_label(Color32::RED, err);
-                }
-            }
-        });
-    });
-}
-
-fn draw_mirror_panel(ui: &mut egui::Ui, app: &mut App) {
-    if let Some(handle) = &app.frame_texture {
-        let available = ui.available_size();
-        let aspect = if app.frame_w == 0 || app.frame_h == 0 {
-            9.0 / 16.0
-        } else {
-            app.frame_w as f32 / app.frame_h as f32
-        };
-        let mut w = available.x;
-        let mut h = w / aspect;
-        if h > available.y {
-            h = available.y;
-            w = h * aspect;
-        }
-        let (rect, _resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click_and_drag());
-        app.last_mirror_rect = Some(rect);
-        let image = Image::from_texture((handle.id(), rect.size())).fit_to_exact_size(rect.size());
-        image.paint_at(ui, rect);
-    } else {
-        ui.vertical_centered(|ui| {
-            ui.add_space(40.0);
-            ui.label(RichText::new("No video yet").heading());
-            ui.label("Mirror starts as soon as your phone shares its screen.");
-        });
-    }
-}
-
-fn draw_placeholder(ui: &mut egui::Ui, title: &str, sub: &str) {
-    ui.vertical_centered(|ui| {
-        ui.add_space(60.0);
-        ui.label(RichText::new(title).heading());
-        ui.add_space(8.0);
-        ui.label(sub);
-    });
-}
-
 fn map_pointer_button(button: EguiButton) -> Option<PointerButton> {
     match button {
         EguiButton::Primary => Some(PointerButton::Left),
@@ -604,7 +602,6 @@ fn synthetic_text_for_key(key: Key) -> Option<String> {
     }
 }
 
-/// Run a file-transfer in a background thread; called from a file drop or picker.
 #[allow(dead_code)]
 pub fn send_file_to_android(
     command_tx: mpsc::SyncSender<network::DesktopCommand>,
@@ -681,7 +678,7 @@ fn sanitize_file_name(path: &str) -> String {
 fn now_micros() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_micros())
+        .map(|d| d.as_micros())
         .unwrap_or_default()
 }
 
@@ -689,8 +686,6 @@ pub fn shell_window_title() -> &'static str {
     SHELL_WINDOW_TITLE
 }
 
-/// Render the pair URI into a square QR ColorImage with a 4-module quiet zone, scaled
-/// up so each module is at least `MIN_MODULE_PX` pixels.
 fn render_qr_image(uri: &str) -> Option<ColorImage> {
     const QUIET_MODULES: usize = 4;
     const MIN_MODULE_PX: usize = 8;
@@ -715,6 +710,10 @@ fn render_qr_image(uri: &str) -> Option<ColorImage> {
             let y0 = (my + QUIET_MODULES) * MIN_MODULE_PX;
             for py in 0..MIN_MODULE_PX {
                 let row_start = (y0 + py) * size_px + x0;
+                for _ in 0..MIN_MODULE_PX {
+                    pixels[row_start] = dark;
+                }
+                // unrolled fill — clobber MIN_MODULE_PX consecutive cells starting at row_start
                 for px in 0..MIN_MODULE_PX {
                     pixels[row_start + px] = dark;
                 }
