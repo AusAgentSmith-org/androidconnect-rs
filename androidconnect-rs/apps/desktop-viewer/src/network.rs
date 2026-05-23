@@ -3,7 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use androidconnect_protocol::{
@@ -119,7 +119,7 @@ pub enum DesktopCommand {
 
 pub fn run(
     bind: &str,
-    frame_sender: Sender<RgbaFrame>,
+    frame_sender: SyncSender<RgbaFrame>,
     command_rx: Receiver<DesktopCommand>,
     pairing_code: String,
     trust_store_path: PathBuf,
@@ -188,7 +188,7 @@ pub fn run(
 
 fn handle_client(
     stream: TcpStream,
-    frame_sender: Sender<RgbaFrame>,
+    frame_sender: SyncSender<RgbaFrame>,
     command_rx: &Receiver<DesktopCommand>,
     pairing_code: &str,
     trust_store: TrustStore,
@@ -363,7 +363,7 @@ fn is_desktop_utility_payload(payload: &Payload) -> bool {
 
 fn read_client_loop(
     mut stream: TcpStream,
-    sender: Sender<RgbaFrame>,
+    sender: SyncSender<RgbaFrame>,
     pairing_code: String,
     mut trust_store: TrustStore,
     writer_command_tx: Sender<WriterCommand>,
@@ -423,7 +423,9 @@ fn read_client_loop(
                         let (w, h) = yuv.dimensions();
                         let mut rgba = vec![0u8; w * h * 4];
                         yuv.write_rgba8(&mut rgba);
-                        let _ = sender.send(RgbaFrame {
+                        // try_send: drop the frame if the render loop can't keep up,
+                        // rather than queuing unboundedly and building lag.
+                        let _ = sender.try_send(RgbaFrame {
                             width: w as u32,
                             height: h as u32,
                             data: rgba,
@@ -1029,7 +1031,7 @@ mod tests {
         let mut client = TcpStream::connect(address)?;
         let (server, _) = listener.accept()?;
 
-        let (frame_tx, _frame_rx) = mpsc::channel();
+        let (frame_tx, _frame_rx) = mpsc::sync_channel(2);
         let (writer_command_tx, _writer_command_rx) = mpsc::channel();
         let (status_tx, status_rx) = mpsc::channel();
 

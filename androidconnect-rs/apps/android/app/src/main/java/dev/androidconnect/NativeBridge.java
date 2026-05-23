@@ -17,6 +17,10 @@ public final class NativeBridge {
     private static final Set<StatusListener> STATUS_LISTENERS = new CopyOnWriteArraySet<>();
     private static volatile Context appContext;
 
+    // Scale factors from video space → physical display space, used by input dispatch.
+    static volatile float inputScaleX = 1.0f;
+    static volatile float inputScaleY = 1.0f;
+
     static {
         boolean loaded = false;
         try {

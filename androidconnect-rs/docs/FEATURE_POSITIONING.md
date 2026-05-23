@@ -53,8 +53,8 @@ AndroidConnect should be:
 | --- | --- | --- | --- |
 | MVP 1 | Prove local mirroring and input | LAN connection, screen capture, H.264 stream, desktop render, click/drag/scroll/text/navigation input, pairing/auth, reconnect | A non-rooted Android device can be mirrored and controlled safely on a trusted LAN |
 | MVP 1 polish | Make the core usable repeatedly | IME text input, rotation handling, connection settings UI, metrics, logs, QA scripts | Real-device QA pass; clear failures; no unauthenticated input |
-| Utility pack | Add KDE Connect-style basics | Clipboard, file send/share, notification mirror, battery, media controls, find phone | Each feature has explicit Android permission UX and can be disabled independently |
-| Advanced integration | Compete with deeper Phone Link surfaces | Audio forwarding, file browser, photos view, SMS, calls, app-specific windows, camera/webcam, hotspot | Only after core mirroring is solid; each item requires separate privacy/security review |
+| MVP 2 utility lane | Add KDE Connect-style basics | Clipboard, file send/share, notification mirror, battery, media controls, find phone | Each feature has explicit Android permission UX and can be disabled independently; see `docs/MVP2.md` |
+| MVP 2 advanced lane | Compete with deeper Phone Link surfaces | Audio forwarding, file browser, photos view, SMS/MMS/RCS, calls, app-specific windows, relay/NAT traversal, multi-client | Only after core mirroring is solid; each item requires separate privacy/security review |
 
 ## Feature Matrix
 
@@ -66,23 +66,23 @@ AndroidConnect should be:
 | Desktop mouse/touch control of Android | Core differentiator | Implemented, pending validation | Supported for phone screen/apps with mouse, trackpad, keyboard, pen, touch | Android mouse receiver exists, but no Android virtual display pairing | P0; accessibility first, optional advanced backends later |
 | Desktop keyboard text into Android | Required | Basic accessibility text replacement | Supported in phone screen/apps | Limited/feature-specific | P0/P1; move to IME path |
 | Rotation/resolution changes | Required | Partial format tolerance | Supported in Phone Link flows | Not a screen-mirroring target | P1 |
-| Audio forwarding | Later | Not implemented | Supported for some app/phone-screen scenarios on supported devices | Media control exists; audio forwarding is not the core model | P2/P3 after video/input latency work |
-| App-specific Android windows | Later/optional | Not implemented | Supported, with multiple-app support on selected devices | Not a core feature | P3, not MVP |
-| Notifications | Later utility | Not implemented | Supported with actions/dismiss sync | Supported, including replies where notifications allow | Utility pack |
-| SMS/MMS/RCS | Later optional | Not implemented | SMS/MMS supported; RCS limited to select devices | SMS supported through phone bridge | Advanced integration; permission-heavy |
-| Calls | Later optional | Not implemented | Supported via Bluetooth | Incoming-call notifications and media pause; not full dialer parity | Advanced integration |
-| Photos/gallery | Later optional | Not implemented | Recent photo view/manage supported | File/share plugins can move files | Utility or advanced, not core |
-| File transfer/share | Later utility | Not implemented | Supported through share sheet, drag/drop, and File Explorer surfaces | Supported through Share and Receive and remote file browser | Utility pack |
-| Remote file browser | Later utility | Not implemented | Supported in Windows File Explorer on Windows 11 | Supported via SFTP/Dolphin integration | Utility pack after simple file transfer |
-| Clipboard sync | Later utility | Not implemented | Supported on selected OEM devices for text/images | Supported for text, with Android 10+ limitations | Utility pack; document Android clipboard limits |
-| Media controls | Later utility | Not implemented | Supported for now-playing controls | Supported | Utility pack |
-| Battery/device status | Later utility | Not implemented | Supported in Phone Link status | Supported | Utility pack |
-| Find/ring phone | Later utility | Not implemented | Not a headline feature | Supported | Utility pack |
+| Audio forwarding | MVP 2 advanced lane | Not implemented | Supported for some app/phone-screen scenarios on supported devices | Media control exists; audio forwarding is not the core model | MVP 2 with latency, codec, routing, and protected-content limits documented |
+| App-specific Android windows | MVP 2 advanced lane | Not implemented | Supported, with multiple-app support on selected devices | Not a core feature | MVP 2 with public-API or documented supported-device limits |
+| Notifications | MVP 2 utility lane | Not implemented | Supported with actions/dismiss sync | Supported, including replies where notifications allow | MVP 2 |
+| SMS/MMS/RCS | MVP 2 advanced lane | Not implemented | SMS/MMS supported; RCS limited to select devices | SMS supported through phone bridge | MVP 2; permission-heavy and provider-limited |
+| Calls | MVP 2 advanced lane | Not implemented | Supported via Bluetooth | Incoming-call notifications and media pause; not full dialer parity | MVP 2; permission and transport limits documented |
+| Photos/gallery | MVP 2 advanced lane | Not implemented | Recent photo view/manage supported | File/share plugins can move files | MVP 2 |
+| File transfer/share | MVP 2 utility lane | Not implemented | Supported through share sheet, drag/drop, and File Explorer surfaces | Supported through Share and Receive and remote file browser | MVP 2 |
+| Remote file browser | MVP 2 advanced lane | Not implemented | Supported in Windows File Explorer on Windows 11 | Supported via SFTP/Dolphin integration | MVP 2 after one-shot file transfer |
+| Clipboard sync | MVP 2 utility lane | Not implemented | Supported on selected OEM devices for text/images | Supported for text, with Android 10+ limitations | MVP 2 for text and image, with Android clipboard limits documented |
+| Media controls | MVP 2 utility lane | Not implemented | Supported for now-playing controls | Supported | MVP 2 |
+| Battery/device status | MVP 2 utility lane | Not implemented | Supported in Phone Link status | Supported | MVP 2 |
+| Find/ring phone | MVP 2 optional stretch | Not implemented | Not a headline feature | Supported | MVP 2 if core utility UX is stable |
 | Remote commands/presentation/phone-as-PC-input | Not this stack's core | Not implemented | Not Phone Link's main posture | Supported | Defer unless users ask; avoid scope creep |
 | Phone camera as webcam | Optional | Not implemented | Supported on Windows 11 with linked Android camera | Not a core KDE Connect feature | P3 only |
 | Instant hotspot | Out of scope for now | Not implemented | Supported on selected OEM/device versions | Not a core KDE Connect feature | Do not target until the app has OS integration hooks |
-| Internet relay/NAT traversal | Out of scope for MVP | Not implemented | Phone Link can use Microsoft account/cloud/mobile-data flows | VPN/manual network setups are documented | Local-first; consider relay only after LAN product is solid |
-| Multi-client/device accounts | Out of scope for MVP | Not implemented | Microsoft account/device graph | Multi-device pairing | Defer |
+| Internet relay/NAT traversal | MVP 2 advanced lane | Not implemented | Phone Link can use Microsoft account/cloud/mobile-data flows | VPN/manual network setups are documented | MVP 2 opt-in remote connectivity; LAN remains default |
+| Multi-client/device accounts | MVP 2 advanced lane | Not implemented | Microsoft account/device graph | Multi-device pairing | MVP 2 with explicit roles, revocation, and input ownership |
 
 ## Scope Decisions
 
@@ -95,9 +95,11 @@ The first public value proposition should be:
 > Android screen mirroring and desktop control for non-rooted Android devices, built as an open,
 > local-first Rust stack.
 
-After MVP 1, the next best expansion is the utility pack. These features are easier to explain,
-mostly local-first, and align with KDE Connect user expectations without undermining the core
-mirroring roadmap.
+After MVP 1, MVP 2 expands into both utility features and deeper Phone Link-style integration
+surfaces. The safer utility items should land first, but audio forwarding, app-specific windows,
+SMS/MMS/RCS, calls, photos/gallery, remote file browsing, image clipboard, Internet relay/NAT
+traversal, and multiple simultaneous desktop clients are all MVP 2 scope. They need explicit
+permission UX, support boundaries, and security review rather than silent deferral.
 
 Avoid trying to clone Phone Link wholesale. Phone Link is deeply tied to Windows UX, Microsoft
 accounts, selected OEM packages, device-specific permissions, and proprietary integration surfaces.

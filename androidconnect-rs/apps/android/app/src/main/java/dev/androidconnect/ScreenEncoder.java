@@ -14,14 +14,23 @@ import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.Surface;
 
+import android.os.Build;
+
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class ScreenEncoder {
     private static final String TAG = "AndroidConnectEncoder";
-    private static final int FRAME_RATE = 30;
     private static final int I_FRAME_INTERVAL_SECONDS = 1;
+
+    // Emulators have no hardware H264 encoder; reduce load so the desktop decoder can keep up.
+    private static final boolean IS_EMULATOR =
+            Build.HARDWARE.equals("goldfish") || Build.HARDWARE.equals("ranchu")
+            || Build.FINGERPRINT.startsWith("generic") || Build.FINGERPRINT.startsWith("unknown")
+            || Build.MODEL.contains("Emulator") || Build.MODEL.contains("Android SDK built for x86");
+    private static final int FRAME_RATE = IS_EMULATOR ? 15 : 30;
+    private static final int MAX_SHORT_EDGE = IS_EMULATOR ? 720 : 1080;
 
     private final Context context;
     private final MediaProjection projection;
@@ -46,12 +55,17 @@ public final class ScreenEncoder {
         }
 
         DisplayMetrics metrics = displayMetrics();
-        int[] scaled = scaleToMax(metrics.widthPixels, metrics.heightPixels, 1080);
+        int[] scaled = scaleToMax(metrics.widthPixels, metrics.heightPixels, MAX_SHORT_EDGE);
         int width = scaled[0];
         int height = scaled[1];
         int dpi = metrics.densityDpi;
 
-        Log.i(TAG, "display metrics: " + width + "x" + height + " dpi=" + dpi);
+        NativeBridge.inputScaleX = (float) metrics.widthPixels / width;
+        NativeBridge.inputScaleY = (float) metrics.heightPixels / height;
+
+        Log.i(TAG, (IS_EMULATOR ? "[emulator] " : "") + "display: "
+                + width + "x" + height + " dpi=" + dpi + " fps=" + FRAME_RATE
+                + " inputScale=" + NativeBridge.inputScaleX + "x" + NativeBridge.inputScaleY);
         if (width <= 0 || height <= 0) {
             throw new IllegalStateException("invalid display dimensions: " + width + "x" + height);
         }

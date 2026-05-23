@@ -41,6 +41,8 @@ struct App {
     buf_h: u32,
     frame_w: u32,
     frame_h: u32,
+    format_w: u32,
+    format_h: u32,
     cursor_pos: Option<PhysicalPosition<f64>>,
     left_pressed: bool,
     modifiers: ModifiersState,
@@ -68,6 +70,8 @@ impl App {
             buf_h: 960,
             frame_w: 0,
             frame_h: 0,
+            format_w: 0,
+            format_h: 0,
             cursor_pos: None,
             left_pressed: false,
             modifiers: ModifiersState::default(),
@@ -209,9 +213,23 @@ impl App {
 
     fn drain_status_events(&mut self) {
         let mut changed = false;
+        let mut resize_to: Option<(u32, u32)> = None;
+
         while let Ok(status) = self.status_rx.try_recv() {
+            if let network::NetworkStatus::VideoFormat { width, height, .. } = &status {
+                let (w, h) = (*width, *height);
+                if w != self.format_w || h != self.format_h {
+                    self.format_w = w;
+                    self.format_h = h;
+                    resize_to = Some(fit_window_to_video(w, h, 540));
+                }
+            }
             self.status.apply(status);
             changed = true;
+        }
+
+        if let (Some((tw, th)), Some(window)) = (resize_to, &self.window) {
+            let _ = window.request_inner_size(PhysicalSize::new(tw, th));
         }
 
         if !changed {
@@ -726,6 +744,19 @@ fn letterbox_layout(sw: u32, sh: u32, dw: u32, dh: u32) -> LetterboxLayout {
     }
 }
 
+/// Scale video dimensions down so the short edge fits within `max_short_edge`, preserving ratio.
+fn fit_window_to_video(vw: u32, vh: u32, max_short_edge: u32) -> (u32, u32) {
+    let short = vw.min(vh);
+    if short == 0 || short <= max_short_edge {
+        return (vw.max(1), vh.max(1));
+    }
+    let scale = max_short_edge as f32 / short as f32;
+    (
+        ((vw as f32 * scale).round() as u32).max(1),
+        ((vh as f32 * scale).round() as u32).max(1),
+    )
+}
+
 fn map_window_to_frame(
     x: f64,
     y: f64,
@@ -919,7 +950,7 @@ fn main() -> Result<()> {
     let trust_store_path = trust_store.path().to_path_buf();
     let desktop_identity = trust_store.identity();
 
-    let (frame_tx, frame_rx) = mpsc::channel::<RgbaFrame>();
+    let (frame_tx, frame_rx) = mpsc::sync_channel::<RgbaFrame>(2);
     let (command_tx, command_rx) = mpsc::sync_channel::<network::DesktopCommand>(1024);
     let (status_tx, status_rx) = mpsc::channel::<network::NetworkStatus>();
 
