@@ -1,4 +1,6 @@
 /target/
+/apps/desktop-viewer/target/
+/apps/gpui-spike/target/
 /apps/android/.gradle/
 /apps/android/build/
 /apps/android/app/build/

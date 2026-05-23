@@ -1,5 +1,6 @@
 use androidconnect_protocol::{
-    DndMode, MediaControlAction, MediaPlaybackState, normalize_pairing_code,
+    DndMode, FeatureStatus, MediaControlAction, MediaPlaybackState, UtilityFeature,
+    normalize_pairing_code,
 };
 
 use crate::network;
@@ -33,6 +34,7 @@ pub struct DesktopStatus {
     pub last_error: Option<String>,
     pub battery_status: Option<String>,
     pub feature_summary: Option<String>,
+    pub features: Vec<FeatureStatus>,
     pub media_summary: Option<String>,
     pub media_info: Option<MediaInfo>,
     pub notification_summary: Option<String>,
@@ -64,6 +66,7 @@ impl DesktopStatus {
             last_error: None,
             battery_status: None,
             feature_summary: None,
+            features: Vec::new(),
             media_summary: None,
             media_info: None,
             notification_summary: None,
@@ -156,6 +159,7 @@ impl DesktopStatus {
                 battery_percent,
                 charging,
                 feature_summary,
+                features,
                 wifi_summary,
                 bluetooth_enabled,
                 dnd_mode,
@@ -169,6 +173,7 @@ impl DesktopStatus {
                     }
                 });
                 self.feature_summary = Some(feature_summary);
+                self.features = features;
                 self.wifi_summary = wifi_summary;
                 self.bluetooth_enabled = bluetooth_enabled;
                 self.dnd_mode = dnd_mode;
@@ -281,9 +286,14 @@ impl DesktopStatus {
         }
     }
 
+    pub fn feature(&self, kind: UtilityFeature) -> Option<&FeatureStatus> {
+        self.features.iter().find(|f| f.feature == kind)
+    }
+
     fn clear_utility_status(&mut self) {
         self.battery_status = None;
         self.feature_summary = None;
+        self.features.clear();
         self.media_summary = None;
         self.media_info = None;
         self.notification_summary = None;

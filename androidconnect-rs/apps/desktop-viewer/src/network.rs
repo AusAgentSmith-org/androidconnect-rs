@@ -4,16 +4,18 @@ use std::io::{self, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use androidconnect_protocol::{
     AUTH_CHALLENGE_BYTES, AuthMethod, AuthResponse, ClipboardSource, DndMode, Envelope,
     FeatureStatus, FileBrowseResponse, FileTransferChunk, FileTransferComplete, FileTransferStart,
     InputEvent, MAX_VIDEO_FRAME_BYTES, MediaControlAction, MediaPlaybackState, MediaStatus,
-    NotificationPosted, NotificationRemoved, PAIRED_SECRET_BYTES, PROTOCOL_VERSION, Payload,
-    TransferDirection, TransferStatus, WireError, bytes_to_hex, derive_session_key,
-    paired_secret_from_pairing_code, pairing_auth_response, read_length_prefixed,
-    session_key_fingerprint, trusted_session_auth_response, write_length_prefixed,
+    MessageEvent, MessageSendResponse, MessageThreadDetail, MessageThreadList, NotificationPosted,
+    NotificationRemoved, PAIRED_SECRET_BYTES, PROTOCOL_VERSION, Payload, TransferDirection,
+    TransferStatus, WireError, bytes_to_hex, derive_session_key, paired_secret_from_pairing_code,
+    pairing_auth_response, read_length_prefixed, session_key_fingerprint,
+    trusted_session_auth_response, write_length_prefixed,
 };
 use anyhow::{Result, bail};
 use log::{error, info, warn};
@@ -61,6 +63,7 @@ pub enum NetworkStatus {
         battery_percent: Option<u8>,
         charging: Option<bool>,
         feature_summary: String,
+        features: Vec<FeatureStatus>,
         wifi_summary: Option<String>,
         bluetooth_enabled: Option<bool>,
         dnd_mode: Option<DndMode>,
@@ -135,6 +138,10 @@ pub enum DesktopEvent {
     NotificationPosted(NotificationPosted),
     NotificationRemoved(NotificationRemoved),
     FileBrowseResponse(FileBrowseResponse),
+    MessageThreadList(MessageThreadList),
+    MessageEvent(MessageEvent),
+    MessageThreadDetail(MessageThreadDetail),
+    MessageSendResponse(MessageSendResponse),
     SessionLost,
 }
 
@@ -148,6 +155,7 @@ pub fn run(
     status_tx: Sender<NetworkStatus>,
     clipboard_apply_tx: Sender<String>,
     event_tx: Sender<DesktopEvent>,
+    download_destinations: Arc<Mutex<HashMap<String, PathBuf>>>,
 ) -> Result<()> {
     let listener = TcpListener::bind(bind)?;
     info!("listening on {bind}");
@@ -181,6 +189,7 @@ pub fn run(
                     status_tx.clone(),
                     clipboard_apply_tx.clone(),
                     event_tx.clone(),
+                    download_destinations.clone(),
                 );
                 let _ = event_tx.send(DesktopEvent::SessionLost);
                 if let Err(e) = result {
@@ -224,6 +233,7 @@ fn handle_client(
     status_tx: Sender<NetworkStatus>,
     clipboard_apply_tx: Sender<String>,
     event_tx: Sender<DesktopEvent>,
+    download_destinations: Arc<Mutex<HashMap<String, PathBuf>>>,
 ) -> Result<()> {
     stream.set_nodelay(true)?;
     let writer = stream.try_clone()?;
@@ -241,6 +251,7 @@ fn handle_client(
             status_tx,
             clipboard_apply_tx,
             event_tx,
+            download_destinations,
         );
         let _ = reader_done_tx.send(result);
     });
@@ -380,6 +391,7 @@ fn is_desktop_utility_payload(payload: &Payload) -> bool {
             | Payload::FileTransferComplete(_)
             | Payload::FileBrowseRequest(_)
             | Payload::FileMutation(_)
+            | Payload::FileTransferRequest(_)
             | Payload::NotificationAction(_)
             | Payload::NotificationFilterUpdate(_)
             | Payload::AudioControl(_)
@@ -387,6 +399,7 @@ fn is_desktop_utility_payload(payload: &Payload) -> bool {
             | Payload::AppWindowClose(_)
             | Payload::AppWindowInput(_)
             | Payload::MessageSendRequest(_)
+            | Payload::MessageThreadOpen(_)
             | Payload::CallAction(_)
             | Payload::PhotoAssetTransfer(_)
             | Payload::RelayOffer(_)
@@ -404,6 +417,7 @@ fn read_client_loop(
     status_tx: Sender<NetworkStatus>,
     clipboard_apply_tx: Sender<String>,
     event_tx: Sender<DesktopEvent>,
+    download_destinations: Arc<Mutex<HashMap<String, PathBuf>>>,
 ) -> Result<()> {
     let mut decoder = Decoder::new().map_err(|e| anyhow::anyhow!("decoder init failed: {e:?}"))?;
     let desktop_identity = trust_store.identity();
@@ -620,12 +634,14 @@ fn read_client_loop(
                 let bt_enabled = status.bluetooth_state.as_ref().map(|b| b.enabled);
                 let dnd_mode = status.dnd_state.as_ref().map(|d| d.mode);
                 let volume_percent = status.volume.as_ref().map(|v| v.media_percent);
+                let features = status.features.clone();
                 send_status(
                     &status_tx,
                     NetworkStatus::DeviceStatus {
                         battery_percent: status.battery_percent,
                         charging: status.charging,
                         feature_summary: feature_summary(&status.features),
+                        features,
                         wifi_summary,
                         bluetooth_enabled: bt_enabled,
                         dnd_mode,
@@ -669,7 +685,12 @@ fn read_client_loop(
                 }
             }
             Payload::FileTransferStart(start) => {
-                handle_incoming_file_start(&mut incoming_transfers, &status_tx, start)?;
+                handle_incoming_file_start(
+                    &mut incoming_transfers,
+                    &status_tx,
+                    start,
+                    &download_destinations,
+                )?;
             }
             Payload::FileTransferChunk(chunk) => {
                 handle_incoming_file_chunk(&mut incoming_transfers, &status_tx, chunk)?;
@@ -679,6 +700,7 @@ fn read_client_loop(
             }
             Payload::FileBrowseRequest(_)
             | Payload::FileMutation(_)
+            | Payload::FileTransferRequest(_)
             | Payload::NotificationAction(_)
             | Payload::NotificationFilterUpdate(_)
             | Payload::AudioFormat(_)
@@ -687,12 +709,31 @@ fn read_client_loop(
             | Payload::AppWindowOpen(_)
             | Payload::AppWindowClose(_)
             | Payload::AppWindowInput(_)
-            | Payload::MessageEvent(_)
             | Payload::MessageSendRequest(_)
+            | Payload::MessageThreadOpen(_)
             | Payload::CallAction(_)
             | Payload::PhotoAssetTransfer(_)
             | Payload::RelayOffer(_)
             | Payload::ClientRoleUpdate(_) => {}
+            Payload::MessageEvent(message) => {
+                info!(
+                    "message_event: thread={} sender={} chars={}",
+                    message.thread_id,
+                    message.sender,
+                    message.body.chars().count()
+                );
+                let _ = event_tx.send(DesktopEvent::MessageEvent(message));
+            }
+            Payload::MessageThreadDetail(detail) => {
+                let _ = event_tx.send(DesktopEvent::MessageThreadDetail(detail));
+            }
+            Payload::MessageSendResponse(resp) => {
+                info!(
+                    "message_send_response: thread={:?} result={:?}",
+                    resp.thread_id, resp.result
+                );
+                let _ = event_tx.send(DesktopEvent::MessageSendResponse(resp));
+            }
             Payload::FileBrowseResponse(response) => {
                 send_status(
                     &status_tx,
@@ -741,6 +782,7 @@ fn read_client_loop(
                         state: format!("{:?}", list.status.state),
                     },
                 );
+                let _ = event_tx.send(DesktopEvent::MessageThreadList(list));
             }
             Payload::CallState(call) => {
                 send_status(
@@ -787,6 +829,8 @@ struct DesktopIncomingTransfer {
     file_name: String,
     path: PathBuf,
     bytes: u64,
+    /// If set, move the file to this path once the transfer completes.
+    redirect_to: Option<PathBuf>,
 }
 
 enum WriterCommand {
@@ -842,6 +886,7 @@ fn handle_incoming_file_start(
     transfers: &mut HashMap<String, DesktopIncomingTransfer>,
     status_tx: &Sender<NetworkStatus>,
     start: FileTransferStart,
+    download_destinations: &Arc<Mutex<HashMap<String, PathBuf>>>,
 ) -> Result<()> {
     if start.direction != TransferDirection::AndroidToDesktop {
         return Ok(());
@@ -850,12 +895,22 @@ fn handle_incoming_file_start(
     fs::create_dir_all(&dir)?;
     let path = unique_child_path(&dir, &sanitize_file_name(&start.file_name));
     File::create(&path)?;
+    // If the user requested this download via `request_download`, the Android side stamps the
+    // source path into `target_path`. Look up and pop the chosen destination.
+    let redirect_to = start.target_path.as_ref().and_then(|src| {
+        if let Ok(mut map) = download_destinations.lock() {
+            map.remove(src)
+        } else {
+            None
+        }
+    });
     transfers.insert(
         start.transfer_id.clone(),
         DesktopIncomingTransfer {
             file_name: start.file_name.clone(),
             path,
             bytes: 0,
+            redirect_to,
         },
     );
     send_status(
@@ -912,6 +967,19 @@ fn handle_incoming_file_complete(
     };
     if complete.status != TransferStatus::Completed {
         let _ = fs::remove_file(&transfer.path);
+    } else if let Some(dest) = transfer.redirect_to.as_ref() {
+        // Move the staged file to the user's chosen destination. Fall back to copy+remove on
+        // cross-filesystem rename failures.
+        if let Err(e) = fs::rename(&transfer.path, dest)
+            && let Err(e2) =
+                fs::copy(&transfer.path, dest).and_then(|_| fs::remove_file(&transfer.path))
+        {
+            warn!(
+                "could not move {} to {}: rename={e:?} copy={e2:?}",
+                transfer.path.display(),
+                dest.display()
+            );
+        }
     }
     send_status(
         status_tx,
@@ -1130,6 +1198,7 @@ mod tests {
         let (clipboard_apply_tx, _clipboard_apply_rx) = mpsc::channel();
         let (event_tx, _event_rx) = mpsc::channel();
 
+        let downloads = Arc::new(Mutex::new(HashMap::new()));
         let reader = std::thread::spawn(move || {
             read_client_loop(
                 server,
@@ -1140,6 +1209,7 @@ mod tests {
                 status_tx,
                 clipboard_apply_tx,
                 event_tx,
+                downloads,
             )
         });
 

@@ -25,6 +25,8 @@ import android.net.wifi.WifiManager;
 import android.os.BatteryManager;
 import android.os.Build;
 import android.os.PowerManager;
+
+import androidx.core.content.ContextCompat;
 import android.provider.MediaStore;
 import android.provider.OpenableColumns;
 import android.provider.Settings;
@@ -516,16 +518,32 @@ public final class AndroidUtilityBridge {
     }
 
     public static void pushMessagesPermissionStatus() {
+        Context context = context();
+        if (context != null) {
+            SmsBridge.pushThreadList(context);
+            return;
+        }
+        // No context yet — surface a permission-required placeholder.
         JSONObject json = new JSONObject();
         try {
             json.put("threads", new JSONArray());
             json.put("status", featureStatus(
                     "Messages",
-                    "Unsupported",
-                    "SMS/MMS sending requires Android role and policy review; RCS is provider limited"));
+                    "PermissionRequired",
+                    "SMS access required to mirror conversations."));
             NativeBridge.pushMessageThreadListJson(json.toString());
         } catch (JSONException ignored) {
         }
+    }
+
+    /**
+     * Handle a desktop-initiated `FileTransferRequest`. For MVP this is unimplemented on the
+     * Android side; we just log and skip. The desktop's `download_destinations` map will silently
+     * expire when no transfer arrives.
+     */
+    public static void handleFileTransferRequest(Context context, String requestJson) {
+        Log.w(TAG, "FileTransferRequest received but Android does not yet initiate"
+                + " AndroidToDesktop transfers from arbitrary paths: " + requestJson);
     }
 
     public static void pushCallState(Context context) {
@@ -591,8 +609,19 @@ public final class AndroidUtilityBridge {
                 RemoteControlAccessibilityService.isRunning()
                         ? "Launch-app requests are supported; independent app windows remain device/API limited"
                         : "Accessibility control must be enabled for app-focused input"));
-        features.put(featureStatus("Messages", "Unsupported",
-                "SMS/MMS/RCS require Android role/provider support and are not enabled by default"));
+        boolean smsRead = ContextCompat.checkSelfPermission(context,
+                android.Manifest.permission.READ_SMS) == PackageManager.PERMISSION_GRANTED;
+        boolean smsSend = ContextCompat.checkSelfPermission(context,
+                android.Manifest.permission.SEND_SMS) == PackageManager.PERMISSION_GRANTED;
+        if (smsRead && smsSend) {
+            features.put(featureStatus("Messages", "Available", ""));
+        } else if (smsRead) {
+            features.put(featureStatus("Messages", "PermissionRequired",
+                    "SEND_SMS permission required to send replies."));
+        } else {
+            features.put(featureStatus("Messages", "PermissionRequired",
+                    "Grant SMS access to mirror conversations and send replies."));
+        }
         features.put(featureStatus("Calls", canUseCallSurfaces(context) ? "Available" : "PermissionRequired",
                 canUseCallSurfaces(context) ? "" : "Phone permissions and roles are required"));
         features.put(featureStatus("Photos",

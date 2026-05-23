@@ -7,7 +7,9 @@ mod status;
 mod streaming;
 mod trust;
 
-use std::sync::mpsc;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use anyhow::Result;
@@ -34,10 +36,14 @@ fn main() -> Result<()> {
 
     let clipboard_apply_tx = clipboard::spawn(command_tx.clone());
 
+    let download_destinations: Arc<Mutex<HashMap<String, PathBuf>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
     let bind_for_thread = config.bind.clone();
     let pairing_code_for_thread = config.pairing_code.clone();
     let trust_store_path_for_thread = trust_store_path.clone();
     let status_tx_for_error = status_tx.clone();
+    let downloads_for_thread = download_destinations.clone();
     thread::spawn(move || {
         if let Err(e) = network::run(
             &bind_for_thread,
@@ -48,6 +54,7 @@ fn main() -> Result<()> {
             status_tx,
             clipboard_apply_tx,
             event_tx,
+            downloads_for_thread,
         ) {
             error!("network thread: {e:#}");
             let _ = status_tx_for_error.send(network::NetworkStatus::ClientError {
@@ -72,9 +79,11 @@ fn main() -> Result<()> {
     FluentApp::new("AndroidConnect")
         .window_size(960.0, 720.0)
         .run(move |cx| {
-            let model = cx.new(|_| {
+            let model = cx.new(|cx| {
                 AppModel::new(
+                    cx,
                     command_tx.clone(),
+                    download_destinations.clone(),
                     bind,
                     pairing_code,
                     desktop_id,

@@ -157,6 +157,18 @@ public final class NativeBridge {
         return AVAILABLE && nativePushMessageThreadList(json);
     }
 
+    public static boolean pushMessageThreadDetailJson(String json) {
+        return AVAILABLE && nativePushMessageThreadDetail(json);
+    }
+
+    public static boolean pushMessageEventJson(String json) {
+        return AVAILABLE && nativePushMessageEvent(json);
+    }
+
+    public static boolean pushMessageSendResponseJson(String json) {
+        return AVAILABLE && nativePushMessageSendResponse(json);
+    }
+
     public static boolean pushCallStateJson(String json) {
         return AVAILABLE && nativePushCallState(json);
     }
@@ -247,7 +259,24 @@ public final class NativeBridge {
     }
 
     static void onMessageSendRequest(String requestJson) {
-        AndroidUtilityBridge.pushMessagesPermissionStatus();
+        Context context = appContext;
+        if (context != null) {
+            SmsBridge.sendMessage(context, requestJson);
+        }
+    }
+
+    static void onMessageThreadOpen(String openJson) {
+        Context context = appContext;
+        if (context != null) {
+            SmsBridge.handleThreadOpen(context, openJson);
+        }
+    }
+
+    static void onFileTransferRequest(String requestJson) {
+        Context context = appContext;
+        if (context != null) {
+            AndroidUtilityBridge.handleFileTransferRequest(context, requestJson);
+        }
     }
 
     static void onNotificationAction(String actionJson) {
@@ -328,6 +357,9 @@ public final class NativeBridge {
     );
     private static native boolean nativePushPhotoAssetList(String listJson);
     private static native boolean nativePushMessageThreadList(String listJson);
+    private static native boolean nativePushMessageThreadDetail(String detailJson);
+    private static native boolean nativePushMessageEvent(String eventJson);
+    private static native boolean nativePushMessageSendResponse(String responseJson);
     private static native boolean nativePushCallState(String stateJson);
     private static native boolean nativePushRelayStatus(String statusJson);
     private static native String nativeStatsJson();

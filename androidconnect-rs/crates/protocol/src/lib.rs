@@ -71,6 +71,10 @@ pub enum Payload {
     MessageThreadList(MessageThreadList),
     MessageEvent(MessageEvent),
     MessageSendRequest(MessageSendRequest),
+    MessageThreadOpen(MessageThreadOpen),
+    MessageThreadDetail(MessageThreadDetail),
+    MessageSendResponse(MessageSendResponse),
+    FileTransferRequest(FileTransferRequest),
     CallState(CallState),
     CallAction(CallAction),
     PhotoAssetList(PhotoAssetList),
@@ -644,6 +648,65 @@ pub struct MessageSendRequest {
     pub recipients: Vec<String>,
     pub body: String,
     pub attachments: Vec<SharedContent>,
+}
+
+/// Sent desktop → Android to request the full message history of a thread.
+/// Android responds with `MessageThreadDetail`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageThreadOpen {
+    pub request_id: String,
+    pub thread_id: String,
+    /// Maximum number of messages to return, newest-first. 0 = server default.
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageThreadDetail {
+    pub request_id: String,
+    pub thread_id: String,
+    pub messages: Vec<MessageEntry>,
+    pub status: FeatureStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageEntry {
+    pub message_id: String,
+    pub thread_id: String,
+    pub sender: String,
+    pub body: String,
+    pub timestamp_unix_ms: u64,
+    pub direction: MessageDirection,
+    pub attachments: Vec<SharedContent>,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MessageDirection {
+    Inbound,
+    Outbound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageSendResponse {
+    pub request_id: String,
+    pub thread_id: Option<String>,
+    pub result: MessageSendResult,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MessageSendResult {
+    Queued,
+    Sent,
+    Failed,
+    PermissionDenied,
+}
+
+/// Sent desktop → Android to request download of a single file/path.
+/// Android replies by starting a `FileTransferStart` (AndroidToDesktop) for that file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileTransferRequest {
+    pub request_id: String,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

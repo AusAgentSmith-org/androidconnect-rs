@@ -1,19 +1,28 @@
 # MVP 3 Implementation Plan
 
 Last updated: 2026-05-23.
-Status: **planning** — no code work has begun. Implementation is blocked on MVP 2 entry criteria
-(physical-device validation of utility messages, input path, and reconnect/session recovery).
+Status: **in flight** — Lanes 3A + 3B mostly landed against FluentGUI; SMS panel, quick-reply,
+file mutations, and feature-gating placeholders are the remaining MVP 3 work.
 
 This document is the concrete implementation plan for [MVP3.md](MVP3.md). It pins the open
 architectural decisions, lists protocol gaps that must close before UI work, and breaks the three
 delivery lanes into ordered tasks against the current code surface.
 
+> **UI framework pivot (commit `2aa638f`, 2026-05-22):** the desktop-viewer was migrated from
+> `egui`/`eframe` to **FluentGUI** (GPUI-based, local path deps on
+> `~/Working/Active/apps/FluentGUI`). References below to `egui`/`eframe`/`egui_extras` should be
+> read as "the FluentGUI equivalent" — e.g. `eframe::App` → `gpui::Render`, `egui::ScrollArea`
+> → FluentGUI scroll containers, `ctx.input(|i| i.raw.dropped_files)` → GPUI window
+> drag-and-drop events. The companion-shell-vs-streaming separation still holds; the streaming
+> canvas now lives inside FluentGUI as a `VideoFrame` primitive (see
+> `memory/project_videoframe_primitive.md`) rather than a separate `winit`/`pixels` window.
+
 ## Decisions (locked)
 
 | Decision | Choice | Rationale |
 | --- | --- | --- |
-| Desktop UI framework | **`egui`** via `eframe` (`egui-wgpu` backend) | Pure Rust, no new runtime dep, embeds in the existing `winit`/`pixels` stack. Streaming canvas stays `pixels`-backed inside an `egui` paint callback. Doc-recommended option. Re-evaluate at the end of lane 3B if notification/file panels feel constrained. |
-| Companion shell vs streaming canvas | Single `eframe` window hosts the companion shell. Streaming opens in a separate `winit` window owned by the same process. | Avoids forcing the streaming hot path through `egui` repaint cadence. The companion shell can stay open without a stream. |
+| Desktop UI framework | **FluentGUI** (GPUI-based) — superseded the original egui pick | Pivoted after egui's text-input / nested-scroll ergonomics started biting in the notification panel. FluentGUI gives us a native-feeling shell, a real `VideoFrame` primitive for the streaming canvas, and shared theming with other in-house apps. |
+| Companion shell vs streaming canvas | Single FluentGUI window hosts the shell. The streaming canvas is a `VideoFrame` element inside the Mirror panel — no separate `winit` window. | Simpler lifecycle, one input focus tree, and the `VideoFrame` primitive lets us keep the decoded H.264 frame on the GPU as an Rgba8Unorm texture. |
 | QR payload encoding | JSON inside a `androidconnect://pair?...` URI, base64url'd into the QR. | URI scheme works for deep-links from camera apps; JSON keeps the payload extensible without bumping protocol version. |
 | Pairing token lifetime | Match MVP 2 pairing-code TTL (no change). | QR rotation key is the same token, so the lifetimes are tied. |
 

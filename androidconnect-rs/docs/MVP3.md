@@ -144,10 +144,11 @@ Scope:
 - The companion shell and the streaming window can be open simultaneously; streaming is an optional
   overlay/sub-window, not the app's root view.
 
-Desktop UI framework note: the current `winit` + `pixels` setup is adequate for the streaming
-canvas but is not a UI framework. MVP 3 requires choosing a desktop UI library (e.g. `egui`,
-`iced`, Tauri webview, or native platform APIs) for the companion shell panels. The streaming
-canvas can remain `pixels`-backed inside a UI framework embedding point.
+Desktop UI framework: **resolved — FluentGUI** (commit `2aa638f`, 2026-05-22). The companion
+shell, panels, and streaming canvas all live inside a single FluentGUI window. The streaming
+canvas is a `VideoFrame` GPU primitive that the decoded H.264 frames render into directly, so
+`winit` + `pixels` are no longer in the picture. The framework comparison table further below
+is kept for historical context but the decision is closed.
 
 Out of scope:
 

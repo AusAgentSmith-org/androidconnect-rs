@@ -648,6 +648,48 @@ pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativePushMessageThr
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativePushMessageThreadDetail(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    detail_json: JString<'_>,
+) -> jboolean {
+    push_json_payload::<androidconnect_protocol::MessageThreadDetail>(
+        &mut env,
+        detail_json,
+        "message thread detail",
+        Payload::MessageThreadDetail,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativePushMessageEvent(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    event_json: JString<'_>,
+) -> jboolean {
+    push_json_payload::<androidconnect_protocol::MessageEvent>(
+        &mut env,
+        event_json,
+        "message event",
+        Payload::MessageEvent,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativePushMessageSendResponse(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    response_json: JString<'_>,
+) -> jboolean {
+    push_json_payload::<androidconnect_protocol::MessageSendResponse>(
+        &mut env,
+        response_json,
+        "message send response",
+        Payload::MessageSendResponse,
+    )
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativePushCallState(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
@@ -1127,6 +1169,8 @@ fn is_desktop_utility_payload(payload: &Payload) -> bool {
             | Payload::AppWindowClose(_)
             | Payload::AppWindowInput(_)
             | Payload::MessageSendRequest(_)
+            | Payload::MessageThreadOpen(_)
+            | Payload::FileTransferRequest(_)
             | Payload::CallAction(_)
             | Payload::PhotoAssetTransfer(_)
             | Payload::RelayOffer(_)
@@ -1182,6 +1226,18 @@ fn handle_desktop_utility_payload(
             env,
             bridge_class,
             "onMessageSendRequest",
+            serde_json::to_string(&request).unwrap_or_default(),
+        ),
+        Payload::MessageThreadOpen(open) => call_static_void_string(
+            env,
+            bridge_class,
+            "onMessageThreadOpen",
+            serde_json::to_string(&open).unwrap_or_default(),
+        ),
+        Payload::FileTransferRequest(request) => call_static_void_string(
+            env,
+            bridge_class,
+            "onFileTransferRequest",
             serde_json::to_string(&request).unwrap_or_default(),
         ),
         Payload::NotificationAction(action) => call_static_void_string(

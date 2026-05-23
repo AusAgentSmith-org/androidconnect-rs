@@ -5,6 +5,8 @@ pub mod notifications;
 pub mod pair;
 pub mod phone;
 
+pub use messages::MessagesState;
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Panel {
     Mirror,
