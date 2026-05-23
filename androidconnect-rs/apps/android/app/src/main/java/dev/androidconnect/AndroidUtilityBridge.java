@@ -2,7 +2,11 @@ package dev.androidconnect;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.NotificationManager;
 import android.app.role.RoleManager;
+import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothManager;
+import android.bluetooth.BluetoothProfile;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.ContentResolver;
@@ -12,7 +16,12 @@ import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.media.AudioManager;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.net.Uri;
+import android.net.wifi.WifiInfo;
+import android.net.wifi.WifiManager;
 import android.os.BatteryManager;
 import android.os.Build;
 import android.os.PowerManager;
@@ -64,6 +73,22 @@ public final class AndroidUtilityBridge {
             putNullable(json, "charging", battery.charging);
             putNullable(json, "interactive", isInteractive(context));
             json.put("features", buildFeatureStatuses(context));
+            JSONObject wifi = readWifiState(context);
+            if (wifi != null) {
+                json.put("wifi_state", wifi);
+            }
+            JSONObject bluetooth = readBluetoothState(context);
+            if (bluetooth != null) {
+                json.put("bluetooth_state", bluetooth);
+            }
+            JSONObject dnd = readDndState(context);
+            if (dnd != null) {
+                json.put("dnd_state", dnd);
+            }
+            JSONObject volume = readVolumeState(context);
+            if (volume != null) {
+                json.put("volume", volume);
+            }
             NativeBridge.pushDeviceStatusJson(json.toString());
         } catch (JSONException ignored) {
         }
@@ -339,6 +364,183 @@ public final class AndroidUtilityBridge {
     private static Boolean isInteractive(Context context) {
         PowerManager power = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
         return power == null ? null : power.isInteractive();
+    }
+
+    private static JSONObject readWifiState(Context context) {
+        try {
+            ConnectivityManager cm =
+                    (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
+            boolean connected = false;
+            if (cm != null) {
+                Network active = cm.getActiveNetwork();
+                if (active != null) {
+                    NetworkCapabilities caps = cm.getNetworkCapabilities(active);
+                    connected = caps != null
+                            && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI);
+                }
+            }
+
+            JSONObject json = new JSONObject();
+            json.put("connected", connected);
+
+            String ssid = null;
+            Integer signal = null;
+            WifiManager wifi = (WifiManager)
+                    context.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+            if (wifi != null && connected) {
+                WifiInfo info = wifi.getConnectionInfo();
+                if (info != null) {
+                    String rawSsid = info.getSSID();
+                    if (rawSsid != null
+                            && !rawSsid.isEmpty()
+                            && !"<unknown ssid>".equalsIgnoreCase(rawSsid)) {
+                        // Strip the surrounding quotes Android adds.
+                        if (rawSsid.startsWith("\"") && rawSsid.endsWith("\"")
+                                && rawSsid.length() >= 2) {
+                            ssid = rawSsid.substring(1, rawSsid.length() - 1);
+                        } else {
+                            ssid = rawSsid;
+                        }
+                    }
+                    int rssi = info.getRssi();
+                    if (rssi != Integer.MIN_VALUE) {
+                        signal = rssi;
+                    }
+                }
+            }
+            putNullable(json, "ssid", ssid);
+            putNullable(json, "signal_strength", signal);
+            return json;
+        } catch (JSONException error) {
+            return null;
+        } catch (SecurityException ignored) {
+            return null;
+        }
+    }
+
+    private static JSONObject readBluetoothState(Context context) {
+        try {
+            BluetoothAdapter adapter;
+            if (Build.VERSION.SDK_INT >= 18) {
+                BluetoothManager manager =
+                        (BluetoothManager) context.getSystemService(Context.BLUETOOTH_SERVICE);
+                adapter = manager == null ? BluetoothAdapter.getDefaultAdapter() : manager.getAdapter();
+            } else {
+                adapter = BluetoothAdapter.getDefaultAdapter();
+            }
+            if (adapter == null) {
+                return null;
+            }
+            boolean enabled;
+            try {
+                enabled = adapter.isEnabled();
+            } catch (SecurityException ignored) {
+                enabled = false;
+            }
+
+            int connected = 0;
+            if (enabled && hasBluetoothConnectPermission(context)) {
+                try {
+                    BluetoothManager manager = (BluetoothManager)
+                            context.getSystemService(Context.BLUETOOTH_SERVICE);
+                    if (manager != null) {
+                        connected = manager.getConnectedDevices(BluetoothProfile.GATT).size();
+                    }
+                } catch (SecurityException ignored) {
+                }
+            }
+
+            JSONObject json = new JSONObject();
+            json.put("enabled", enabled);
+            json.put("connected_devices", Math.max(0, Math.min(connected, 255)));
+            return json;
+        } catch (JSONException error) {
+            return null;
+        }
+    }
+
+    private static JSONObject readDndState(Context context) {
+        try {
+            NotificationManager nm =
+                    (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
+            if (nm == null) {
+                return null;
+            }
+            int filter;
+            try {
+                filter = nm.getCurrentInterruptionFilter();
+            } catch (SecurityException ignored) {
+                return null;
+            }
+            String mode;
+            switch (filter) {
+                case NotificationManager.INTERRUPTION_FILTER_NONE:
+                    mode = "TotalSilence";
+                    break;
+                case NotificationManager.INTERRUPTION_FILTER_ALARMS:
+                    mode = "Alarms";
+                    break;
+                case NotificationManager.INTERRUPTION_FILTER_PRIORITY:
+                    mode = "Priority";
+                    break;
+                case NotificationManager.INTERRUPTION_FILTER_ALL:
+                case NotificationManager.INTERRUPTION_FILTER_UNKNOWN:
+                default:
+                    mode = "Off";
+                    break;
+            }
+            JSONObject json = new JSONObject();
+            json.put("enabled", filter != NotificationManager.INTERRUPTION_FILTER_ALL
+                    && filter != NotificationManager.INTERRUPTION_FILTER_UNKNOWN);
+            json.put("mode", mode);
+            return json;
+        } catch (JSONException error) {
+            return null;
+        }
+    }
+
+    private static JSONObject readVolumeState(Context context) {
+        try {
+            AudioManager audio = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
+            if (audio == null) {
+                return null;
+            }
+            int musicMax = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+            int musicCur = audio.getStreamVolume(AudioManager.STREAM_MUSIC);
+            int mediaPercent = musicMax <= 0 ? 0 : Math.round(musicCur * 100f / musicMax);
+
+            Integer ringPercent = null;
+            try {
+                int ringMax = audio.getStreamMaxVolume(AudioManager.STREAM_RING);
+                int ringCur = audio.getStreamVolume(AudioManager.STREAM_RING);
+                if (ringMax > 0) {
+                    ringPercent = Math.round(ringCur * 100f / ringMax);
+                }
+            } catch (RuntimeException ignored) {
+            }
+
+            JSONObject json = new JSONObject();
+            json.put("media_percent", clampPercent(mediaPercent));
+            putNullable(json, "ring_percent", ringPercent == null ? null : clampPercent(ringPercent));
+            json.put("max_percent", 100);
+            return json;
+        } catch (JSONException error) {
+            return null;
+        }
+    }
+
+    private static int clampPercent(int value) {
+        if (value < 0) return 0;
+        if (value > 255) return 255;
+        return value;
+    }
+
+    private static boolean hasBluetoothConnectPermission(Context context) {
+        if (Build.VERSION.SDK_INT < 31) {
+            return true;
+        }
+        return context.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)
+                == PackageManager.PERMISSION_GRANTED;
     }
 
     private static boolean notificationListenerEnabled(Context context) {

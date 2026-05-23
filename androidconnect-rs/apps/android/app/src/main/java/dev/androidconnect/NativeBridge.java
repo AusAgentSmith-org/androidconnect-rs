@@ -80,6 +80,7 @@ public final class NativeBridge {
             return 0;
         }
         rememberContext(context);
+        DeviceStateMonitor.start(context);
         return nativeStartSession(buildSessionConfig(context));
     }
 
@@ -89,6 +90,7 @@ public final class NativeBridge {
     }
 
     public static void stopSession() {
+        DeviceStateMonitor.stop();
         if (AVAILABLE) {
             nativeStopSession();
         }
