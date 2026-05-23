@@ -77,6 +77,7 @@ public final class NativeBridge {
 
     public static void disconnect() {
         utilitiesPrimedForConnection = false;
+        SmsBridge.stopObserver();
         DeviceStateMonitor.stopForConnection();
         if (AVAILABLE) {
             nativeDisconnect();
@@ -209,6 +210,7 @@ public final class NativeBridge {
         if (!connected || !authenticated) {
             utilitiesPrimedForConnection = false;
             if (!connected) {
+                SmsBridge.stopObserver();
                 DeviceStateMonitor.stopForConnection();
             }
             return;
@@ -220,6 +222,7 @@ public final class NativeBridge {
         MAIN_HANDLER.post(() -> {
             DeviceStateMonitor.startForConnection(context);
             AndroidUtilityBridge.refreshAll(context);
+            SmsBridge.startObserver(context);
         });
     }
 

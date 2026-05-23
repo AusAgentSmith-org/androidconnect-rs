@@ -49,6 +49,8 @@ import java.util.Map;
 public final class AndroidUtilityBridge {
     private static final String TAG = "AndroidUtilityBridge";
     private static final int SHARE_BUFFER_BYTES = 64 * 1024;
+    private static final java.util.concurrent.ExecutorService EXEC =
+            java.util.concurrent.Executors.newSingleThreadExecutor();
 
     private AndroidUtilityBridge() {
     }
@@ -537,13 +539,74 @@ public final class AndroidUtilityBridge {
     }
 
     /**
-     * Handle a desktop-initiated `FileTransferRequest`. For MVP this is unimplemented on the
-     * Android side; we just log and skip. The desktop's `download_destinations` map will silently
-     * expire when no transfer arrives.
+     * Handle a desktop-initiated {@code FileTransferRequest} by opening the requested file
+     * (relative to the app's files dir) and pushing it as an AndroidToDesktop file transfer.
+     * Path traversal outside the app files dir is rejected.
      */
     public static void handleFileTransferRequest(Context context, String requestJson) {
-        Log.w(TAG, "FileTransferRequest received but Android does not yet initiate"
-                + " AndroidToDesktop transfers from arbitrary paths: " + requestJson);
+        if (context == null || requestJson == null) {
+            Log.w(TAG, "handleFileTransferRequest: null context or request");
+            return;
+        }
+        EXEC.execute(() -> {
+            String requestId = "";
+            try {
+                JSONObject json = new JSONObject(requestJson);
+                requestId = json.optString("request_id", "");
+                String relativePath = json.optString("path", "");
+
+                if (relativePath.isEmpty()) {
+                    Log.w(TAG, "FileTransferRequest[" + requestId + "]: empty path");
+                    return;
+                }
+
+                java.io.File filesDir = context.getFilesDir().getCanonicalFile();
+                java.io.File target = new java.io.File(filesDir, relativePath).getCanonicalFile();
+
+                // Prevent path traversal outside the app storage root.
+                String rootPath = filesDir.getAbsolutePath();
+                if (!target.getAbsolutePath().startsWith(rootPath + java.io.File.separator)
+                        && !target.getAbsolutePath().equals(rootPath)) {
+                    Log.w(TAG, "FileTransferRequest[" + requestId + "]: path escapes storage: "
+                            + relativePath);
+                    return;
+                }
+
+                if (!target.exists() || !target.isFile()) {
+                    Log.w(TAG, "FileTransferRequest[" + requestId + "]: file not found: " + target);
+                    return;
+                }
+
+                String fileName = target.getName();
+                String mimeType = guessMimeType(fileName);
+                long size = target.length();
+
+                Log.d(TAG, "FileTransferRequest[" + requestId + "]: pushing " + fileName
+                        + " (" + size + " bytes)");
+                NativeBridge.pushSharedFile(fileName, mimeType, target.getAbsolutePath(), size);
+            } catch (JSONException je) {
+                Log.w(TAG, "FileTransferRequest[" + requestId + "]: malformed JSON", je);
+            } catch (java.io.IOException ie) {
+                Log.w(TAG, "FileTransferRequest[" + requestId + "]: IO error: " + ie.getMessage());
+            } catch (Exception e) {
+                Log.w(TAG, "FileTransferRequest[" + requestId + "]: unexpected error", e);
+            }
+        });
+    }
+
+    private static String guessMimeType(String fileName) {
+        if (fileName == null) {
+            return "application/octet-stream";
+        }
+        int dot = fileName.lastIndexOf('.');
+        if (dot >= 0 && dot < fileName.length() - 1) {
+            String ext = fileName.substring(dot + 1).toLowerCase(java.util.Locale.US);
+            String mime = android.webkit.MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext);
+            if (mime != null && !mime.isEmpty()) {
+                return mime;
+            }
+        }
+        return "application/octet-stream";
     }
 
     public static void pushCallState(Context context) {

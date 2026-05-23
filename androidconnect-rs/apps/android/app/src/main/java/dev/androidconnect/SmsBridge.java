@@ -3,10 +3,12 @@ package dev.androidconnect;
 import android.Manifest;
 import android.content.Context;
 import android.content.pm.PackageManager;
+import android.database.ContentObserver;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.ContactsContract;
 import android.provider.Telephony;
 import android.telephony.SmsManager;
 import android.util.Log;
@@ -44,6 +46,10 @@ final class SmsBridge {
     private static final int DEFAULT_DETAIL_LIMIT = 100;
     private static final ExecutorService EXEC = Executors.newSingleThreadExecutor();
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
+
+    private static volatile ContentObserver smsObserver;
+    private static volatile Context observerContext;
+    private static volatile long lastKnownMaxSmsId = -1L;
 
     private SmsBridge() {}
 
@@ -171,6 +177,143 @@ final class SmsBridge {
         });
     }
 
+    // ───────────────────────── live observer ─────────────────────────
+
+    /**
+     * Register a ContentObserver on the SMS database so new incoming messages are pushed live
+     * without requiring the desktop to re-open the thread. Initialises lastKnownMaxSmsId to
+     * the current maximum so historical messages are not re-sent.
+     */
+    static void startObserver(Context context) {
+        stopObserver();
+        if (context == null || !canReadSms(context)) {
+            return;
+        }
+        long maxId = queryCurrentMaxSmsId(context);
+        lastKnownMaxSmsId = maxId;
+        observerContext = context;
+
+        ContentObserver observer = new ContentObserver(MAIN) {
+            @Override
+            public void onChange(boolean selfChange) {
+                EXEC.execute(() -> pushNewInboundMessages(context));
+            }
+        };
+        try {
+            context.getContentResolver().registerContentObserver(
+                    Telephony.Sms.CONTENT_URI, true, observer);
+            smsObserver = observer;
+            Log.d(TAG, "SMS ContentObserver registered (lastId=" + maxId + ")");
+        } catch (Exception e) {
+            Log.w(TAG, "registerContentObserver failed: " + e.getMessage());
+        }
+    }
+
+    static void stopObserver() {
+        ContentObserver observer = smsObserver;
+        Context ctx = observerContext;
+        smsObserver = null;
+        observerContext = null;
+        lastKnownMaxSmsId = -1L;
+        if (observer != null && ctx != null) {
+            try {
+                ctx.getContentResolver().unregisterContentObserver(observer);
+                Log.d(TAG, "SMS ContentObserver unregistered");
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    private static long queryCurrentMaxSmsId(Context context) {
+        try (Cursor cursor = context.getContentResolver().query(
+                Telephony.Sms.CONTENT_URI,
+                new String[]{Telephony.Sms._ID},
+                null, null,
+                Telephony.Sms._ID + " DESC LIMIT 1")) {
+            if (cursor != null && cursor.moveToFirst()) {
+                int col = cursor.getColumnIndex(Telephony.Sms._ID);
+                if (col >= 0) {
+                    return cursor.getLong(col);
+                }
+            }
+        } catch (SecurityException ignored) {
+        }
+        return 0L;
+    }
+
+    private static void pushNewInboundMessages(Context context) {
+        try {
+            if (!canReadSms(context)) {
+                return;
+            }
+            long maxId = lastKnownMaxSmsId;
+            if (maxId < 0) {
+                return;
+            }
+
+            String[] projection = {
+                    Telephony.Sms._ID,
+                    Telephony.Sms.ADDRESS,
+                    Telephony.Sms.BODY,
+                    Telephony.Sms.DATE,
+                    Telephony.Sms.THREAD_ID,
+            };
+            String selection = Telephony.Sms._ID + " > ? AND "
+                    + Telephony.Sms.TYPE + " = " + Telephony.Sms.MESSAGE_TYPE_INBOX;
+            String[] args = {String.valueOf(maxId)};
+
+            long newMaxId = maxId;
+            boolean hadNew = false;
+            try (Cursor cursor = context.getContentResolver().query(
+                    Telephony.Sms.CONTENT_URI, projection, selection, args,
+                    Telephony.Sms.DATE + " ASC")) {
+                if (cursor == null) {
+                    return;
+                }
+                int idCol = cursor.getColumnIndex(Telephony.Sms._ID);
+                int addrCol = cursor.getColumnIndex(Telephony.Sms.ADDRESS);
+                int bodyCol = cursor.getColumnIndex(Telephony.Sms.BODY);
+                int dateCol = cursor.getColumnIndex(Telephony.Sms.DATE);
+                int threadCol = cursor.getColumnIndex(Telephony.Sms.THREAD_ID);
+
+                while (cursor.moveToNext()) {
+                    long id = idCol >= 0 ? cursor.getLong(idCol) : -1;
+                    String address = addrCol >= 0 ? cursor.getString(addrCol) : null;
+                    String body = bodyCol >= 0 ? cursor.getString(bodyCol) : "";
+                    long date = dateCol >= 0 ? cursor.getLong(dateCol) : 0L;
+                    String threadId = threadCol >= 0 ? cursor.getString(threadCol) : "";
+
+                    try {
+                        JSONObject event = new JSONObject();
+                        event.put("thread_id", threadId == null ? "" : threadId);
+                        event.put("sender", address == null ? "" : address);
+                        event.put("body", body == null ? "" : body);
+                        event.put("timestamp_unix_ms", date);
+                        event.put("attachments", new JSONArray());
+                        NativeBridge.pushMessageEventJson(event.toString());
+                    } catch (JSONException je) {
+                        Log.w(TAG, "pushNewInboundMessages: JSON build failed", je);
+                    }
+
+                    if (id > newMaxId) {
+                        newMaxId = id;
+                    }
+                    hadNew = true;
+                }
+            }
+            lastKnownMaxSmsId = newMaxId;
+
+            // Refresh thread list so snippet/unread badge updates in the sidebar.
+            if (hadNew) {
+                pushThreadList(context);
+            }
+        } catch (SecurityException se) {
+            Log.w(TAG, "pushNewInboundMessages SecurityException: " + se.getMessage());
+        } catch (Exception e) {
+            Log.w(TAG, "pushNewInboundMessages failed", e);
+        }
+    }
+
     // ───────────────────────── helpers ─────────────────────────
 
     private static boolean canReadSms(Context context) {
@@ -181,6 +324,32 @@ final class SmsBridge {
     private static boolean canSendSms(Context context) {
         return ContextCompat.checkSelfPermission(context, Manifest.permission.SEND_SMS)
                 == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private static String lookupContactName(Context context, String phoneNumber) {
+        if (phoneNumber == null || phoneNumber.isEmpty()) {
+            return null;
+        }
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS)
+                != PackageManager.PERMISSION_GRANTED) {
+            return null;
+        }
+        Uri uri = Uri.withAppendedPath(
+                ContactsContract.PhoneLookup.CONTENT_FILTER_URI,
+                Uri.encode(phoneNumber));
+        try (Cursor cursor = context.getContentResolver().query(
+                uri,
+                new String[]{ContactsContract.PhoneLookup.DISPLAY_NAME},
+                null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) {
+                String name = cursor.getString(0);
+                if (name != null && !name.trim().isEmpty()) {
+                    return name;
+                }
+            }
+        } catch (SecurityException | RuntimeException ignored) {
+        }
+        return null;
     }
 
     private static JSONArray readThreadSummaries(Context context) throws JSONException {
@@ -208,9 +377,16 @@ final class SmsBridge {
                         threadId, id -> lookupRecipientFromThread(context, String.valueOf(id)));
                 int unread = readUnreadCount(context, threadId);
                 Long timestamp = readLatestTimestamp(context, threadId);
+                String displayName;
+                if (address == null || address.isEmpty()) {
+                    displayName = "(unknown)";
+                } else {
+                    String contact = lookupContactName(context, address);
+                    displayName = contact != null ? contact : address;
+                }
                 JSONObject t = new JSONObject();
                 t.put("thread_id", String.valueOf(threadId));
-                t.put("display_name", address == null ? "(unknown)" : address);
+                t.put("display_name", displayName);
                 if (snippet != null) {
                     t.put("last_message", snippet);
                 } else {
