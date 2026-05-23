@@ -29,6 +29,7 @@ import android.provider.MediaStore;
 import android.provider.OpenableColumns;
 import android.provider.Settings;
 import android.telecom.TelecomManager;
+import android.util.Log;
 import android.view.KeyEvent;
 import android.widget.Toast;
 
@@ -40,8 +41,11 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 public final class AndroidUtilityBridge {
+    private static final String TAG = "AndroidUtilityBridge";
     private static final int SHARE_BUFFER_BYTES = 64 * 1024;
 
     private AndroidUtilityBridge() {
@@ -146,11 +150,288 @@ public final class AndroidUtilityBridge {
     }
 
     public static void applyAudioControl(Context context, String command) {
-        Toast.makeText(
-                context,
-                "Audio forwarding requires a supported capture path and is not active",
-                Toast.LENGTH_SHORT).show();
+        if (context == null || command == null) {
+            return;
+        }
+        ParsedCommand parsed = parseDebugCommand(command);
+        if (parsed == null) {
+            Log.w(TAG, "applyAudioControl: unparseable command: " + command);
+            return;
+        }
+        switch (parsed.name) {
+            case "Start":
+            case "Stop":
+            case "Mute":
+            case "Unmute":
+                // Audio forwarding capture is not active; surface the existing toast for parity.
+                Toast.makeText(
+                        context,
+                        "Audio forwarding requires a supported capture path and is not active",
+                        Toast.LENGTH_SHORT).show();
+                break;
+            case "SetVolume":
+                applySetVolume(context, parsed);
+                break;
+            case "SetDnd":
+                applySetDnd(context, parsed);
+                break;
+            case "SetBluetooth":
+                applySetBluetooth(context, parsed);
+                break;
+            default:
+                Log.w(TAG, "applyAudioControl: unknown command: " + parsed.name);
+                break;
+        }
         pushDeviceStatus(context);
+    }
+
+    private static void applySetVolume(Context context, ParsedCommand parsed) {
+        Integer percent = parsed.intField("percent");
+        if (percent == null) {
+            Log.w(TAG, "SetVolume missing percent field");
+            return;
+        }
+        int clamped = Math.max(0, Math.min(100, percent));
+        AudioManager audio = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
+        if (audio == null) {
+            Log.w(TAG, "SetVolume: AudioManager unavailable");
+            return;
+        }
+        try {
+            int max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+            if (max <= 0) {
+                Log.w(TAG, "SetVolume: STREAM_MUSIC max volume is " + max);
+                return;
+            }
+            int index = Math.round(clamped * max / 100f);
+            if (index < 0) index = 0;
+            if (index > max) index = max;
+            audio.setStreamVolume(AudioManager.STREAM_MUSIC, index, 0);
+        } catch (SecurityException error) {
+            Log.w(TAG, "SetVolume blocked: " + error.getMessage());
+        } catch (RuntimeException error) {
+            Log.w(TAG, "SetVolume failed: " + error.getMessage());
+        }
+    }
+
+    private static void applySetDnd(Context context, ParsedCommand parsed) {
+        String mode = parsed.field("mode");
+        if (mode == null) {
+            Log.w(TAG, "SetDnd missing mode field");
+            return;
+        }
+        int filter;
+        switch (mode) {
+            case "Off":
+                filter = NotificationManager.INTERRUPTION_FILTER_ALL;
+                break;
+            case "Priority":
+                filter = NotificationManager.INTERRUPTION_FILTER_PRIORITY;
+                break;
+            case "Alarms":
+                filter = NotificationManager.INTERRUPTION_FILTER_ALARMS;
+                break;
+            case "TotalSilence":
+                filter = NotificationManager.INTERRUPTION_FILTER_NONE;
+                break;
+            default:
+                Log.w(TAG, "SetDnd: unknown mode " + mode);
+                return;
+        }
+        NotificationManager nm =
+                (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
+        if (nm == null) {
+            Log.w(TAG, "SetDnd: NotificationManager unavailable");
+            return;
+        }
+        if (!nm.isNotificationPolicyAccessGranted()) {
+            Log.w(TAG, "SetDnd: notification policy access not granted; deep-linking to settings");
+            try {
+                Intent intent = new Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS);
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                context.startActivity(intent);
+            } catch (RuntimeException error) {
+                Log.w(TAG, "SetDnd: failed to open policy settings: " + error.getMessage());
+            }
+            return;
+        }
+        try {
+            nm.setInterruptionFilter(filter);
+        } catch (SecurityException error) {
+            Log.w(TAG, "SetDnd blocked: " + error.getMessage());
+        } catch (RuntimeException error) {
+            Log.w(TAG, "SetDnd failed: " + error.getMessage());
+        }
+    }
+
+    private static void applySetBluetooth(Context context, ParsedCommand parsed) {
+        Boolean enabled = parsed.boolField("enabled");
+        if (enabled == null) {
+            Log.w(TAG, "SetBluetooth missing enabled field");
+            return;
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            // enable()/disable() are no-ops on API 33+; deep-link the user to settings.
+            openBluetoothSettings(context);
+            return;
+        }
+        if (!hasBluetoothConnectPermission(context)) {
+            Log.w(TAG, "SetBluetooth: BLUETOOTH_CONNECT not granted; deep-linking to settings");
+            openBluetoothSettings(context);
+            return;
+        }
+        BluetoothAdapter adapter;
+        BluetoothManager manager =
+                (BluetoothManager) context.getSystemService(Context.BLUETOOTH_SERVICE);
+        adapter = manager == null ? BluetoothAdapter.getDefaultAdapter() : manager.getAdapter();
+        if (adapter == null) {
+            Log.w(TAG, "SetBluetooth: no BluetoothAdapter on this device");
+            return;
+        }
+        try {
+            if (enabled) {
+                adapter.enable();
+            } else {
+                adapter.disable();
+            }
+        } catch (SecurityException error) {
+            Log.w(TAG, "SetBluetooth blocked, falling back to settings: " + error.getMessage());
+            openBluetoothSettings(context);
+        } catch (RuntimeException error) {
+            Log.w(TAG, "SetBluetooth failed: " + error.getMessage());
+        }
+    }
+
+    private static void openBluetoothSettings(Context context) {
+        try {
+            Intent intent = new Intent(Settings.ACTION_BLUETOOTH_SETTINGS);
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            context.startActivity(intent);
+        } catch (RuntimeException error) {
+            Log.w(TAG, "openBluetoothSettings failed: " + error.getMessage());
+        }
+    }
+
+    /**
+     * Parse a Rust {@code Debug} rendering of a command, e.g. {@code "Mute"} or
+     * {@code "SetVolume { percent: 73 }"}. Tolerates surrounding whitespace.
+     * Returns {@code null} when the input does not match either shape.
+     */
+    static ParsedCommand parseDebugCommand(String raw) {
+        if (raw == null) {
+            return null;
+        }
+        String trimmed = raw.trim();
+        if (trimmed.isEmpty()) {
+            return null;
+        }
+        int brace = trimmed.indexOf('{');
+        if (brace < 0) {
+            // Bare variant name (e.g. "Mute"); reject anything with stray punctuation.
+            if (!isIdentifier(trimmed)) {
+                return null;
+            }
+            return new ParsedCommand(trimmed, new LinkedHashMap<>());
+        }
+        String name = trimmed.substring(0, brace).trim();
+        if (!isIdentifier(name)) {
+            return null;
+        }
+        int close = trimmed.lastIndexOf('}');
+        if (close < brace) {
+            return null;
+        }
+        String body = trimmed.substring(brace + 1, close).trim();
+        Map<String, String> fields = new LinkedHashMap<>();
+        if (!body.isEmpty()) {
+            for (String part : splitTopLevelCommas(body)) {
+                String segment = part.trim();
+                if (segment.isEmpty()) {
+                    continue;
+                }
+                int colon = segment.indexOf(':');
+                if (colon < 0) {
+                    continue;
+                }
+                String key = segment.substring(0, colon).trim();
+                String value = segment.substring(colon + 1).trim();
+                if (key.isEmpty()) {
+                    continue;
+                }
+                fields.put(key, value);
+            }
+        }
+        return new ParsedCommand(name, fields);
+    }
+
+    private static boolean isIdentifier(String s) {
+        if (s.isEmpty()) {
+            return false;
+        }
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            boolean ok = Character.isLetterOrDigit(c) || c == '_';
+            if (!ok) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static java.util.List<String> splitTopLevelCommas(String body) {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        int depth = 0;
+        int start = 0;
+        for (int i = 0; i < body.length(); i++) {
+            char c = body.charAt(i);
+            if (c == '{' || c == '(' || c == '[') {
+                depth++;
+            } else if (c == '}' || c == ')' || c == ']') {
+                if (depth > 0) depth--;
+            } else if (c == ',' && depth == 0) {
+                out.add(body.substring(start, i));
+                start = i + 1;
+            }
+        }
+        out.add(body.substring(start));
+        return out;
+    }
+
+    static final class ParsedCommand {
+        final String name;
+        final Map<String, String> fields;
+
+        ParsedCommand(String name, Map<String, String> fields) {
+            this.name = name;
+            this.fields = fields;
+        }
+
+        String field(String key) {
+            return fields.get(key);
+        }
+
+        Integer intField(String key) {
+            String value = fields.get(key);
+            if (value == null) {
+                return null;
+            }
+            try {
+                return Integer.parseInt(value.trim());
+            } catch (NumberFormatException ignored) {
+                return null;
+            }
+        }
+
+        Boolean boolField(String key) {
+            String value = fields.get(key);
+            if (value == null) {
+                return null;
+            }
+            String v = value.trim();
+            if ("true".equalsIgnoreCase(v)) return Boolean.TRUE;
+            if ("false".equalsIgnoreCase(v)) return Boolean.FALSE;
+            return null;
+        }
     }
 
     public static void openApp(Context context, String packageName) {
