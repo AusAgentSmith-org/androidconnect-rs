@@ -1,21 +1,27 @@
 [package]
 name = "androidconnect-desktop-viewer"
 version = "0.2.0"
-edition.workspace = true
-license.workspace = true
-rust-version.workspace = true
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.88"
+publish = false
 
 [dependencies]
-androidconnect-protocol.workspace = true
-anyhow.workspace = true
+androidconnect-protocol = { path = "../../crates/protocol" }
+anyhow = "1.0.100"
 arboard = { version = "3.4", default-features = false, features = ["wayland-data-control"] }
 env_logger = "0.11"
 fluent-app = { path = "/home/sprooty/Working/Active/apps/FluentGUI/crates/fluent-app" }
 fluent-core = { path = "/home/sprooty/Working/Active/apps/FluentGUI/crates/fluent-core" }
 fluent-primitives = { path = "/home/sprooty/Working/Active/apps/FluentGUI/crates/fluent-primitives" }
-gpui = "0.2.2"
+gpui = "0.2.3"
 log = "0.4"
 openh264 = { version = "0.9", features = ["source"] }
 qrcode = { version = "0.14", default-features = false }
-serde.workspace = true
-serde_json.workspace = true
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+
+[workspace]
+
+[patch.crates-io]
+gpui = { path = "/home/sprooty/Working/Active/apps/FluentGUI/crates/gpui" }

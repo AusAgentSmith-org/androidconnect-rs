@@ -5,7 +5,12 @@ edition = "2024"
 rust-version = "1.88"
 publish = false
 
+[workspace]
+
 [dependencies]
 fluent-app    = { path = "/home/sprooty/Working/Active/apps/FluentGUI/crates/fluent-app" }
 fluent-core   = { path = "/home/sprooty/Working/Active/apps/FluentGUI/crates/fluent-core" }
-gpui          = "0.2.2"
+gpui          = "0.2.3"
+
+[patch.crates-io]
+gpui = { path = "/home/sprooty/Working/Active/apps/FluentGUI/crates/gpui" }
