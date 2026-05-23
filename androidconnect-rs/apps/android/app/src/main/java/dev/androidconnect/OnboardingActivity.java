@@ -206,6 +206,9 @@ public final class OnboardingActivity extends Activity {
             case ACCESSIBILITY:
                 safelyStart(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
                 return;
+            case DND_POLICY:
+                safelyStart(new Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS));
+                return;
             default:
                 String[] permissions = PermissionStatusRepository.runtimePermissionsFor(id);
                 if (permissions.length == 0) {
@@ -240,6 +243,7 @@ public final class OnboardingActivity extends Activity {
             switch (state.id) {
                 case NOTIFICATION_LISTENER:
                 case ACCESSIBILITY:
+                case DND_POLICY:
                     return "Open settings";
                 default:
                     return "Re-check";
@@ -250,6 +254,8 @@ public final class OnboardingActivity extends Activity {
                 return "Open notification access";
             case ACCESSIBILITY:
                 return "Open accessibility settings";
+            case DND_POLICY:
+                return "Open Do Not Disturb access";
             default:
                 return "Grant permission";
         }

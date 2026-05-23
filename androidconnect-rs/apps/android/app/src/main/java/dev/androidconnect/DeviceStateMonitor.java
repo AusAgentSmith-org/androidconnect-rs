@@ -15,12 +15,14 @@ import android.os.Build;
 /**
  * Bridges OS state changes (WiFi connectivity, audio volume, Bluetooth, DND)
  * to {@link AndroidUtilityBridge#pushDeviceStatus(Context)} so the desktop sees
- * fresh DeviceStatus updates without us polling. Lifecycle is owned by
- * {@link NativeBridge#startSession(Context)} / {@link NativeBridge#stopSession()}.
+ * fresh DeviceStatus updates without us polling. Lifecycle has two owners:
+ * the authenticated control connection and the optional mirror session.
  */
 final class DeviceStateMonitor {
     private static final Object LOCK = new Object();
     private static DeviceStateMonitor INSTANCE;
+    private static boolean connectionActive;
+    private static boolean sessionActive;
 
     private final Context appContext;
     private BroadcastReceiver volumeReceiver;
@@ -33,25 +35,51 @@ final class DeviceStateMonitor {
         this.appContext = context.getApplicationContext();
     }
 
-    static void start(Context context) {
+    static void startForConnection(Context context) {
         if (context == null) {
             return;
         }
         synchronized (LOCK) {
-            if (INSTANCE != null) {
-                return;
-            }
+            connectionActive = true;
+            ensureStartedLocked(context);
+        }
+    }
+
+    static void stopForConnection() {
+        synchronized (LOCK) {
+            connectionActive = false;
+            stopIfUnusedLocked();
+        }
+    }
+
+    static void startForSession(Context context) {
+        if (context == null) {
+            return;
+        }
+        synchronized (LOCK) {
+            sessionActive = true;
+            ensureStartedLocked(context);
+        }
+    }
+
+    static void stopForSession() {
+        synchronized (LOCK) {
+            sessionActive = false;
+            stopIfUnusedLocked();
+        }
+    }
+
+    private static void ensureStartedLocked(Context context) {
+        if (INSTANCE == null) {
             INSTANCE = new DeviceStateMonitor(context);
             INSTANCE.register();
         }
     }
 
-    static void stop() {
-        synchronized (LOCK) {
-            if (INSTANCE != null) {
-                INSTANCE.unregister();
-                INSTANCE = null;
-            }
+    private static void stopIfUnusedLocked() {
+        if (!connectionActive && !sessionActive && INSTANCE != null) {
+            INSTANCE.unregister();
+            INSTANCE = null;
         }
     }
 

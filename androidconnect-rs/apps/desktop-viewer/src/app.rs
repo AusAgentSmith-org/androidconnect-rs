@@ -1,5 +1,7 @@
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::Read;
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -35,6 +37,7 @@ pub struct App {
     status_rx: mpsc::Receiver<network::NetworkStatus>,
     event_rx: mpsc::Receiver<network::DesktopEvent>,
     status: DesktopStatus,
+    pair_addresses: Vec<String>,
     desktop_id: String,
     desktop_name: String,
     active_panel: Panel,
@@ -63,13 +66,15 @@ impl App {
     ) -> Self {
         let status = DesktopStatus::new(bind, pairing_code);
         let mut files_state = FilesState::default();
-        files_state.current_path = "/sdcard".to_owned();
+        files_state.current_path = "/".to_owned();
+        let pair_addresses = advertised_pair_addresses(&status.bind);
         Self {
             frame_rx,
             command_tx,
             status_rx,
             event_rx,
             status,
+            pair_addresses,
             desktop_id,
             desktop_name,
             active_panel: Panel::Mirror,
@@ -98,8 +103,13 @@ impl App {
     }
 
     fn drain_status(&mut self) {
+        let previous_bind = self.status.bind.clone();
         while let Ok(status) = self.status_rx.try_recv() {
             self.status.apply(status);
+        }
+        if self.status.bind != previous_bind {
+            self.pair_addresses = advertised_pair_addresses(&self.status.bind);
+            self.pair_qr_cache = None;
         }
     }
 
@@ -113,7 +123,7 @@ impl App {
                     self.notifications.clear();
                     self.phone_state = PhoneState::default();
                     self.files_state = FilesState::default();
-                    self.files_state.current_path = "/sdcard".to_owned();
+                    self.files_state.current_path = "/".to_owned();
                     self.frame_texture = None;
                     self.frame_w = 0;
                     self.frame_h = 0;
@@ -208,7 +218,12 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if !connected {
-                panels::pair::draw(ui, &self.status, pair_texture.as_ref());
+                panels::pair::draw(
+                    ui,
+                    &self.status,
+                    &self.pair_addresses,
+                    pair_texture.as_ref(),
+                );
                 return;
             }
             match self.active_panel {
@@ -353,6 +368,9 @@ fn draw_status_bar(ctx: &egui::Context, status: &DesktopStatus) {
 
 impl App {
     fn refresh_pair_qr(&mut self, ctx: &egui::Context) -> Option<TextureHandle> {
+        if self.pair_addresses.is_empty() {
+            return None;
+        }
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -360,7 +378,7 @@ impl App {
         let expires_ms = now_ms.saturating_add(5 * 60 * 1000);
 
         let payload = QrPairingPayload::new(
-            vec![self.status.bind.clone()],
+            self.pair_addresses.clone(),
             self.status.pairing_code.clone(),
             self.desktop_id.clone(),
             self.desktop_name.clone(),
@@ -686,6 +704,88 @@ pub fn shell_window_title() -> &'static str {
     SHELL_WINDOW_TITLE
 }
 
+fn advertised_pair_addresses(bind: &str) -> Vec<String> {
+    advertised_pair_addresses_from(
+        bind,
+        std::env::var("ANDROIDCONNECT_ADVERTISE_ADDR").ok(),
+        discover_default_route_addresses(),
+        std::env::var("HOSTNAME").ok(),
+    )
+}
+
+fn advertised_pair_addresses_from(
+    bind: &str,
+    configured: Option<String>,
+    discovered_ips: Vec<IpAddr>,
+    host_name: Option<String>,
+) -> Vec<String> {
+    let mut addresses = BTreeSet::new();
+    let mut wildcard_port = None;
+    let configured = configured.unwrap_or_default();
+    for value in configured
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        addresses.insert(value.to_owned());
+    }
+
+    if let Ok(socket) = bind.parse::<SocketAddr>() {
+        if socket.ip().is_unspecified() {
+            wildcard_port = Some(socket.port());
+            for ip in discovered_ips {
+                if !ip.is_unspecified() && !ip.is_loopback() {
+                    addresses.insert(format_socket_addr(ip, socket.port()));
+                }
+            }
+        } else {
+            addresses.insert(socket.to_string());
+        }
+    } else if !bind.trim().is_empty() {
+        addresses.insert(bind.trim().to_owned());
+    }
+
+    if addresses.is_empty()
+        && let Some(port) = wildcard_port
+        && let Some(host) = host_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+    {
+        addresses.insert(format!("{host}:{port}"));
+    }
+
+    if addresses.is_empty() && wildcard_port.is_none() && !bind.trim().is_empty() {
+        addresses.insert(bind.trim().to_owned());
+    }
+
+    addresses.into_iter().collect()
+}
+
+fn discover_default_route_addresses() -> Vec<IpAddr> {
+    let mut addresses = Vec::new();
+    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0")
+        && socket.connect("8.8.8.8:80").is_ok()
+        && let Ok(local) = socket.local_addr()
+    {
+        addresses.push(local.ip());
+    }
+    if let Ok(socket) = UdpSocket::bind("[::]:0")
+        && socket.connect("[2001:4860:4860::8888]:80").is_ok()
+        && let Ok(local) = socket.local_addr()
+    {
+        addresses.push(local.ip());
+    }
+    addresses
+}
+
+fn format_socket_addr(ip: IpAddr, port: u16) -> String {
+    match ip {
+        IpAddr::V4(ip) => format!("{ip}:{port}"),
+        IpAddr::V6(ip) => format!("[{ip}]:{port}"),
+    }
+}
+
 fn render_qr_image(uri: &str) -> Option<ColorImage> {
     const QUIET_MODULES: usize = 4;
     const MIN_MODULE_PX: usize = 8;
@@ -726,4 +826,66 @@ fn render_qr_image(uri: &str) -> Option<ColorImage> {
         pixels,
         source_size: Vec2::new(size_px as f32, size_px as f32),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wildcard_bind_advertises_discovered_addresses() {
+        let addresses = advertised_pair_addresses_from(
+            "0.0.0.0:48172",
+            None,
+            vec![
+                "192.168.1.10".parse().unwrap(),
+                "127.0.0.1".parse().unwrap(),
+            ],
+            None,
+        );
+
+        assert_eq!(addresses, vec!["192.168.1.10:48172".to_owned()]);
+    }
+
+    #[test]
+    fn explicit_bind_is_advertised_verbatim() {
+        let addresses = advertised_pair_addresses_from(
+            "10.0.0.5:48172",
+            None,
+            vec!["192.168.1.10".parse().unwrap()],
+            None,
+        );
+
+        assert_eq!(addresses, vec!["10.0.0.5:48172".to_owned()]);
+    }
+
+    #[test]
+    fn configured_advertise_addresses_take_part_in_qr_payload() {
+        let addresses = advertised_pair_addresses_from(
+            "0.0.0.0:48172",
+            Some("phone-visible.local:48172, 192.168.1.20:48172".to_owned()),
+            Vec::new(),
+            None,
+        );
+
+        assert_eq!(
+            addresses,
+            vec![
+                "192.168.1.20:48172".to_owned(),
+                "phone-visible.local:48172".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn wildcard_bind_falls_back_to_hostname_without_discovery() {
+        let addresses = advertised_pair_addresses_from(
+            "0.0.0.0:48172",
+            None,
+            Vec::new(),
+            Some("desktop-host".to_owned()),
+        );
+
+        assert_eq!(addresses, vec!["desktop-host:48172".to_owned()]);
+    }
 }

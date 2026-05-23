@@ -90,11 +90,12 @@ pub fn draw(ui: &mut egui::Ui, state: &mut NotificationsState) -> PendingActions
                         ui.label(RichText::new(&n.app_name).strong());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("⋮").on_hover_text("Per-app actions").clicked() {
+                                let enabled_after_click = suppressed;
                                 state.toggle_suppress(&n.app_package);
                                 pending.push(Payload::NotificationFilterUpdate(
                                     NotificationFilterUpdate {
                                         package_name: n.app_package.clone(),
-                                        enabled: !suppressed,
+                                        enabled: enabled_after_click,
                                     },
                                 ));
                             }

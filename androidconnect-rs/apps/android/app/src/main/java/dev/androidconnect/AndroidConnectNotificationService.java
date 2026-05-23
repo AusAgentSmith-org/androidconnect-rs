@@ -5,6 +5,7 @@ import android.app.PendingIntent;
 import android.app.RemoteInput;
 import android.content.ComponentName;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.media.MediaMetadata;
@@ -22,6 +23,8 @@ import org.json.JSONObject;
 import java.util.List;
 
 public final class AndroidConnectNotificationService extends NotificationListenerService {
+    private static final String FILTER_PREFS = "androidconnect_notification_filters";
+    private static final String FILTER_KEY_PREFIX = "package.";
     private static volatile AndroidConnectNotificationService activeService;
 
     @Override
@@ -41,6 +44,9 @@ public final class AndroidConnectNotificationService extends NotificationListene
     @Override
     public void onNotificationPosted(StatusBarNotification sbn) {
         AndroidUtilityBridge.rememberContext(this);
+        if (sbn != null && !isPackageEnabled(sbn.getPackageName())) {
+            return;
+        }
         pushNotificationPosted(sbn);
         refreshMediaStatus();
     }
@@ -64,6 +70,23 @@ public final class AndroidConnectNotificationService extends NotificationListene
             String actionId = json.optString("action_id", "");
             String replyText = json.optString("reply_text", null);
             service.performNotificationAction(notificationId, actionId, replyText);
+        } catch (JSONException ignored) {
+        }
+    }
+
+    public static void applyNotificationFilterUpdate(String filterJson) {
+        AndroidConnectNotificationService service = activeService;
+        if (service == null) {
+            return;
+        }
+        try {
+            JSONObject json = new JSONObject(filterJson);
+            String packageName = json.optString("package_name", "").trim();
+            if (packageName.isEmpty()) {
+                return;
+            }
+            boolean enabled = json.optBoolean("enabled", true);
+            service.setPackageEnabled(packageName, enabled);
         } catch (JSONException ignored) {
         }
     }
@@ -136,6 +159,25 @@ public final class AndroidConnectNotificationService extends NotificationListene
             }
             return;
         }
+    }
+
+    private boolean isPackageEnabled(String packageName) {
+        if (packageName == null || packageName.trim().isEmpty()) {
+            return true;
+        }
+        return getSharedPreferences(FILTER_PREFS, MODE_PRIVATE)
+                .getBoolean(FILTER_KEY_PREFIX + packageName, true);
+    }
+
+    private void setPackageEnabled(String packageName, boolean enabled) {
+        SharedPreferences.Editor editor = getSharedPreferences(FILTER_PREFS, MODE_PRIVATE).edit();
+        String key = FILTER_KEY_PREFIX + packageName;
+        if (enabled) {
+            editor.remove(key);
+        } else {
+            editor.putBoolean(key, false);
+        }
+        editor.apply();
     }
 
     private void refreshMediaStatus() {

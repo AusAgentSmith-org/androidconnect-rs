@@ -16,6 +16,7 @@ public final class NativeBridge {
     private static final Handler MAIN_HANDLER = new Handler(Looper.getMainLooper());
     private static final Set<StatusListener> STATUS_LISTENERS = new CopyOnWriteArraySet<>();
     private static volatile Context appContext;
+    private static volatile boolean utilitiesPrimedForConnection;
 
     // Scale factors from video space → physical display space, used by input dispatch.
     static volatile float inputScaleX = 1.0f;
@@ -60,16 +61,23 @@ public final class NativeBridge {
             return false;
         }
         rememberContext(context);
-        return nativeConnect(
+        utilitiesPrimedForConnection = false;
+        boolean connected = nativeConnect(
                 host,
                 port,
                 buildDeviceName(context),
                 context.getFilesDir().getAbsolutePath(),
                 pairingCode
         );
+        if (!connected) {
+            DeviceStateMonitor.stopForConnection();
+        }
+        return connected;
     }
 
     public static void disconnect() {
+        utilitiesPrimedForConnection = false;
+        DeviceStateMonitor.stopForConnection();
         if (AVAILABLE) {
             nativeDisconnect();
         }
@@ -80,7 +88,7 @@ public final class NativeBridge {
             return 0;
         }
         rememberContext(context);
-        DeviceStateMonitor.start(context);
+        DeviceStateMonitor.startForSession(context);
         return nativeStartSession(buildSessionConfig(context));
     }
 
@@ -90,7 +98,7 @@ public final class NativeBridge {
     }
 
     public static void stopSession() {
-        DeviceStateMonitor.stop();
+        DeviceStateMonitor.stopForSession();
         if (AVAILABLE) {
             nativeStopSession();
         }
@@ -158,6 +166,7 @@ public final class NativeBridge {
     }
 
     static void onNativeStatusChanged() {
+        maybePrimeUtilitiesAfterAuth();
         if (STATUS_LISTENERS.isEmpty()) {
             return;
         }
@@ -165,6 +174,40 @@ public final class NativeBridge {
             for (StatusListener listener : STATUS_LISTENERS) {
                 listener.onNativeStatusChanged();
             }
+        });
+    }
+
+    private static void maybePrimeUtilitiesAfterAuth() {
+        if (!AVAILABLE) {
+            return;
+        }
+        Context context = appContext;
+        if (context == null) {
+            return;
+        }
+        boolean connected;
+        boolean authenticated;
+        try {
+            JSONObject stats = new JSONObject(nativeStatsJson());
+            connected = stats.optBoolean("connected", false);
+            authenticated = stats.optBoolean("input_authenticated", false);
+        } catch (JSONException ignored) {
+            return;
+        }
+        if (!connected || !authenticated) {
+            utilitiesPrimedForConnection = false;
+            if (!connected) {
+                DeviceStateMonitor.stopForConnection();
+            }
+            return;
+        }
+        if (utilitiesPrimedForConnection) {
+            return;
+        }
+        utilitiesPrimedForConnection = true;
+        MAIN_HANDLER.post(() -> {
+            DeviceStateMonitor.startForConnection(context);
+            AndroidUtilityBridge.refreshAll(context);
         });
     }
 
@@ -209,6 +252,10 @@ public final class NativeBridge {
 
     static void onNotificationAction(String actionJson) {
         AndroidConnectNotificationService.performNotificationAction(actionJson);
+    }
+
+    static void onNotificationFilterUpdate(String filterJson) {
+        AndroidConnectNotificationService.applyNotificationFilterUpdate(filterJson);
     }
 
     static void onPhotoAssetTransfer(String transferJson) {

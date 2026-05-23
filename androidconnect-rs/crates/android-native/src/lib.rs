@@ -9,13 +9,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use androidconnect_protocol::{
     AUTH_CHALLENGE_BYTES, AuthChallenge, AuthMethod, AuthResult, ClipboardSource, ClipboardText,
-    DeviceHello, DeviceStatus, Envelope, FeatureStatus, FileBrowseRequest, FileBrowseResponse,
-    FileEntry, FileEntryType, FileMutation, FileMutationKind, FileTransferChunk,
-    FileTransferComplete, FileTransferStart, InputEvent, MAX_CONTROL_FRAME_BYTES,
-    MediaControlAction, PAIRED_SECRET_BYTES, PROTOCOL_VERSION, Payload, PointerButton,
-    PointerEvent, PointerPhase, SESSION_KEY_FINGERPRINT_BYTES, SystemAction, TransferDirection,
-    TransferStatus, UtilityFeature, VideoCodec, VideoFormat, VideoFrame, auth_responses_equal,
-    bytes_to_hex, derive_session_key, hex_to_fixed, normalize_pairing_code,
+    DeviceHello, DeviceStatus, Envelope, FeatureState, FeatureStatus, FileBrowseRequest,
+    FileBrowseResponse, FileEntry, FileEntryType, FileMutation, FileMutationKind,
+    FileTransferChunk, FileTransferComplete, FileTransferStart, InputEvent,
+    MAX_CONTROL_FRAME_BYTES, MediaControlAction, PAIRED_SECRET_BYTES, PROTOCOL_VERSION, Payload,
+    PointerButton, PointerEvent, PointerPhase, SESSION_KEY_FINGERPRINT_BYTES, SystemAction,
+    TransferDirection, TransferStatus, UtilityFeature, VideoCodec, VideoFormat, VideoFrame,
+    auth_responses_equal, bytes_to_hex, derive_session_key, hex_to_fixed, normalize_pairing_code,
     paired_secret_from_pairing_code, pairing_auth_response, read_length_prefixed,
     session_key_fingerprint, trusted_session_auth_response, video_flags_from_android_media_codec,
     write_length_prefixed,
@@ -1190,6 +1190,12 @@ fn handle_desktop_utility_payload(
             "onNotificationAction",
             serde_json::to_string(&action).unwrap_or_default(),
         ),
+        Payload::NotificationFilterUpdate(update) => call_static_void_string(
+            env,
+            bridge_class,
+            "onNotificationFilterUpdate",
+            serde_json::to_string(&update).unwrap_or_default(),
+        ),
         Payload::PhotoAssetTransfer(transfer) => call_static_void_string(
             env,
             bridge_class,
@@ -1308,11 +1314,25 @@ fn handle_file_transfer_complete(complete: FileTransferComplete) -> Result<(), S
 
 fn handle_file_browse_request(generation: u64, request: FileBrowseRequest) -> Result<(), String> {
     let root = active_storage_dir()?;
-    let path = resolve_storage_path(&root, &request.path)?;
+    let path = match resolve_storage_path(&root, &request.path) {
+        Ok(path) => path,
+        Err(error) => {
+            return send_file_browse_error(generation, request.request_id, request.path, error);
+        }
+    };
     let mut entries = Vec::new();
-    for entry in
-        fs::read_dir(&path).map_err(|error| format!("read {} failed: {error}", path.display()))?
-    {
+    let read_dir = match fs::read_dir(&path) {
+        Ok(read_dir) => read_dir,
+        Err(error) => {
+            return send_file_browse_error(
+                generation,
+                request.request_id,
+                request.path,
+                format!("read {} failed: {error}", path.display()),
+            );
+        }
+    };
+    for entry in read_dir {
         let entry = entry.map_err(|error| format!("read directory entry failed: {error}"))?;
         let metadata = entry
             .metadata()
@@ -1352,6 +1372,27 @@ fn handle_file_browse_request(generation: u64, request: FileBrowseRequest) -> Re
             path: relative_storage_path(&root, &path),
             entries,
             status: FeatureStatus::available(UtilityFeature::FileBrowser),
+        }),
+    )
+}
+
+fn send_file_browse_error(
+    generation: u64,
+    request_id: String,
+    path: String,
+    message: impl Into<String>,
+) -> Result<(), String> {
+    send_payload_if_generation(
+        generation,
+        Payload::FileBrowseResponse(FileBrowseResponse {
+            request_id,
+            path,
+            entries: Vec::new(),
+            status: FeatureStatus {
+                feature: UtilityFeature::FileBrowser,
+                state: FeatureState::Error,
+                message: message.into(),
+            },
         }),
     )
 }
@@ -1433,10 +1474,16 @@ fn resolve_storage_path(root: &Path, path: &str) -> Result<PathBuf, String> {
 }
 
 fn relative_storage_path(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
+    let relative = path
+        .strip_prefix(root)
         .unwrap_or(path)
         .to_string_lossy()
-        .replace('\\', "/")
+        .replace('\\', "/");
+    if relative.is_empty() {
+        "/".to_owned()
+    } else {
+        relative
+    }
 }
 
 fn unique_child_path(parent: &Path, file_name: &str) -> PathBuf {

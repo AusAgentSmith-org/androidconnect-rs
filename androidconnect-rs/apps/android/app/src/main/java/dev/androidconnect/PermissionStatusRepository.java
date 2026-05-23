@@ -1,6 +1,7 @@
 package dev.androidconnect;
 
 import android.Manifest;
+import android.app.NotificationManager;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.pm.PackageManager;
@@ -28,6 +29,7 @@ public final class PermissionStatusRepository {
         STORAGE,
         MICROPHONE,
         BLUETOOTH,
+        DND_POLICY,
         PHONE,
     }
 
@@ -83,6 +85,7 @@ public final class PermissionStatusRepository {
         map.put(PermissionId.STORAGE, storageState());
         map.put(PermissionId.MICROPHONE, microphoneState());
         map.put(PermissionId.BLUETOOTH, bluetoothState());
+        map.put(PermissionId.DND_POLICY, dndPolicyState());
         map.put(PermissionId.PHONE, phoneState());
         return map;
     }
@@ -131,6 +134,7 @@ public final class PermissionStatusRepository {
                         Manifest.permission.READ_PHONE_STATE,
                         Manifest.permission.CALL_PHONE,
                 };
+            case DND_POLICY:
             case NOTIFICATION_LISTENER:
             case ACCESSIBILITY:
             default:
@@ -234,6 +238,18 @@ public final class PermissionStatusRepository {
                 "Bluetooth",
                 "Optional. Reports paired-device count and lets the desktop manage Bluetooth.",
                 granted ? State.GRANTED : State.NOT_GRANTED,
+                false);
+    }
+
+    private PermissionState dndPolicyState() {
+        NotificationManager manager =
+                (NotificationManager) appContext.getSystemService(Context.NOTIFICATION_SERVICE);
+        boolean granted = manager != null && manager.isNotificationPolicyAccessGranted();
+        return new PermissionState(
+                PermissionId.DND_POLICY,
+                "Do not disturb access",
+                "Optional. Allows the desktop to change Android's interruption filter.",
+                granted ? State.GRANTED : State.NEEDS_SETTINGS_PAGE,
                 false);
     }
 

@@ -5,7 +5,12 @@ use egui::{
 
 use crate::status::{ConnectionState, DesktopStatus, format_pairing_code};
 
-pub fn draw(ui: &mut egui::Ui, status: &DesktopStatus, qr_texture: Option<&TextureHandle>) {
+pub fn draw(
+    ui: &mut egui::Ui,
+    status: &DesktopStatus,
+    pair_addresses: &[String],
+    qr_texture: Option<&TextureHandle>,
+) {
     ScrollArea::vertical().show(ui, |ui| {
         ui.add_space(40.0);
         ui.vertical_centered(|ui| {
@@ -43,7 +48,11 @@ pub fn draw(ui: &mut egui::Ui, status: &DesktopStatus, qr_texture: Option<&Textu
 
             ui.label(RichText::new("Manual pairing").heading());
             ui.add_space(6.0);
-            ui.label(format!("Address: {}", status.bind));
+            if pair_addresses.is_empty() {
+                ui.label(format!("Listening on: {}", status.bind));
+            } else {
+                ui.label(format!("Address: {}", pair_addresses.join(", ")));
+            }
             ui.label(format!(
                 "Pairing code: {}",
                 format_pairing_code(&status.pairing_code)
