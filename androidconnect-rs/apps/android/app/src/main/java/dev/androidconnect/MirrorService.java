@@ -11,8 +11,10 @@ import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.media.projection.MediaProjection;
 import android.media.projection.MediaProjectionManager;
+import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.IBinder;
+import android.os.PowerManager;
 import android.util.Log;
 
 public final class MirrorService extends Service {
@@ -23,8 +25,12 @@ public final class MirrorService extends Service {
     private static final String TAG = "AndroidConnectMirror";
     private static final String CHANNEL_ID = "mirroring";
     private static final int NOTIFICATION_ID = 17;
+    private static final String WAKE_LOCK_TAG = "AndroidConnect::Mirror";
+    private static final String WIFI_LOCK_TAG = "AndroidConnect::Mirror";
 
     private ScreenEncoder screenEncoder;
+    private PowerManager.WakeLock wakeLock;
+    private WifiManager.WifiLock wifiLock;
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
@@ -78,6 +84,7 @@ public final class MirrorService extends Service {
             return;
         }
 
+        acquireKeepAliveLocks();
         NativeBridge.startSession(this);
         screenEncoder = new ScreenEncoder(this, projection, this::stopSelf);
         try {
@@ -94,6 +101,49 @@ public final class MirrorService extends Service {
             screenEncoder = null;
         }
         NativeBridge.stopSession();
+        releaseKeepAliveLocks();
+    }
+
+    private void acquireKeepAliveLocks() {
+        // Without these the OS aggressively drops the projection + wifi when the
+        // screen locks (Samsung One UI is especially eager). Held for the lifetime
+        // of an active mirror; released in stopMirroring.
+        PowerManager power = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        if (power != null && wakeLock == null) {
+            wakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG);
+            wakeLock.setReferenceCounted(false);
+            wakeLock.acquire();
+            Log.i(TAG, "acquired partial wake lock");
+        }
+
+        WifiManager wifi = (WifiManager) getApplicationContext()
+                .getSystemService(Context.WIFI_SERVICE);
+        if (wifi != null && wifiLock == null) {
+            int mode = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+                    ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                    : WifiManager.WIFI_MODE_FULL_HIGH_PERF;
+            wifiLock = wifi.createWifiLock(mode, WIFI_LOCK_TAG);
+            wifiLock.setReferenceCounted(false);
+            wifiLock.acquire();
+            Log.i(TAG, "acquired wifi lock (mode=" + mode + ")");
+        }
+    }
+
+    private void releaseKeepAliveLocks() {
+        if (wakeLock != null) {
+            if (wakeLock.isHeld()) {
+                wakeLock.release();
+            }
+            wakeLock = null;
+            Log.i(TAG, "released partial wake lock");
+        }
+        if (wifiLock != null) {
+            if (wifiLock.isHeld()) {
+                wifiLock.release();
+            }
+            wifiLock = null;
+            Log.i(TAG, "released wifi lock");
+        }
     }
 
     private void startAsForegroundService() {
