@@ -8,6 +8,7 @@ use androidconnect_protocol::{
     FileTransferChunk, FileTransferComplete, FileTransferStart, InputEvent, Modifiers, Payload,
     PointerButton, PointerEvent, PointerPhase, SystemAction, TextInput, TransferDirection,
     TransferStatus,
+    qr::{QrPairingPayload, encode_qr_payload},
 };
 use anyhow::{Result, bail};
 use eframe::egui;
@@ -16,6 +17,7 @@ use egui::{
     PointerButton as EguiButton, Pos2, Rect, RichText, ScrollArea, Sense, Stroke, TextureHandle,
     TextureOptions, Vec2,
 };
+use qrcode::{Color as QrColor, QrCode};
 
 use crate::network;
 use crate::status::{ConnectionState, DesktopStatus};
@@ -57,6 +59,8 @@ pub struct App {
     command_tx: mpsc::SyncSender<network::DesktopCommand>,
     status_rx: mpsc::Receiver<network::NetworkStatus>,
     status: DesktopStatus,
+    desktop_id: String,
+    desktop_name: String,
     active_panel: Panel,
     /// Latest decoded frame as an egui texture. None until a frame arrives.
     frame_texture: Option<TextureHandle>,
@@ -64,15 +68,20 @@ pub struct App {
     frame_h: u32,
     last_mirror_rect: Option<Rect>,
     left_pressed: bool,
+    /// Cached QR rendering keyed on the URI we hashed.
+    pair_qr_cache: Option<(String, TextureHandle)>,
 }
 
 impl App {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         frame_rx: mpsc::Receiver<RgbaFrame>,
         command_tx: mpsc::SyncSender<network::DesktopCommand>,
         status_rx: mpsc::Receiver<network::NetworkStatus>,
         bind: String,
         pairing_code: String,
+        desktop_id: String,
+        desktop_name: String,
     ) -> Self {
         let status = DesktopStatus::new(bind, pairing_code);
         Self {
@@ -80,12 +89,15 @@ impl App {
             command_tx,
             status_rx,
             status,
+            desktop_id,
+            desktop_name,
             active_panel: Panel::Mirror,
             frame_texture: None,
             frame_w: 0,
             frame_h: 0,
             last_mirror_rect: None,
             left_pressed: false,
+            pair_qr_cache: None,
         }
     }
 
@@ -218,9 +230,14 @@ impl eframe::App for App {
             });
 
         // Central panel
+        let pair_texture = if !connected {
+            self.refresh_pair_qr(ctx)
+        } else {
+            None
+        };
         egui::CentralPanel::default().show(ctx, |ui| {
             if !connected {
-                draw_pair_screen(ui, &self.status);
+                draw_pair_screen(ui, &self.status, pair_texture.as_ref());
                 return;
             }
             match self.active_panel {
@@ -242,6 +259,46 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// Rebuild the QR texture when the pair URI changes. The URI moves only when bind,
+    /// pairing code, or desktop identity changes, so the cache hit rate is very high.
+    fn refresh_pair_qr(&mut self, ctx: &egui::Context) -> Option<TextureHandle> {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_default();
+        // 5-minute token lifetime to match the spirit of MVP3's pairing TTL.
+        let expires_ms = now_ms.saturating_add(5 * 60 * 1000);
+
+        let payload = QrPairingPayload::new(
+            vec![self.status.bind.clone()],
+            self.status.pairing_code.clone(),
+            self.desktop_id.clone(),
+            self.desktop_name.clone(),
+            now_ms,
+            expires_ms,
+        );
+        let uri = encode_qr_payload(&payload).ok()?;
+
+        // Drop the lifetime parts (timestamps) from the cache key so we don't rebuild
+        // every tick — the payload is the same as long as bind/code/identity hold.
+        let cache_key = format!(
+            "v={}|addrs={:?}|tok={}|id={}",
+            payload.protocol_version, payload.addresses, payload.pairing_token, payload.desktop_id,
+        );
+        if self
+            .pair_qr_cache
+            .as_ref()
+            .is_some_and(|(k, _)| k == &cache_key)
+        {
+            return self.pair_qr_cache.as_ref().map(|(_, h)| h.clone());
+        }
+
+        let image = render_qr_image(&uri)?;
+        let handle = ctx.load_texture("androidconnect-pair-qr", image, TextureOptions::NEAREST);
+        self.pair_qr_cache = Some((cache_key, handle.clone()));
+        Some(handle)
+    }
+
     fn forward_input_events(&mut self, ctx: &egui::Context) {
         let Some(mirror_rect) = self.last_mirror_rect else {
             return;
@@ -404,7 +461,7 @@ impl App {
     }
 }
 
-fn draw_pair_screen(ui: &mut egui::Ui, status: &DesktopStatus) {
+fn draw_pair_screen(ui: &mut egui::Ui, status: &DesktopStatus, qr_texture: Option<&TextureHandle>) {
     ScrollArea::vertical().show(ui, |ui| {
         ui.add_space(40.0);
         ui.vertical_centered(|ui| {
@@ -415,19 +472,28 @@ fn draw_pair_screen(ui: &mut egui::Ui, status: &DesktopStatus) {
             );
             ui.add_space(28.0);
 
-            // QR placeholder — real QR rendering lands in #23.
             Frame::new()
-                .stroke(Stroke::new(2.0, Color32::from_gray(120)))
+                .stroke(Stroke::new(1.0, Color32::from_gray(120)))
                 .corner_radius(4)
-                .inner_margin(Margin::same(20))
-                .show(ui, |ui| {
-                    ui.set_width(220.0);
-                    ui.set_height(220.0);
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(80.0);
-                        ui.label("[QR code]");
-                        ui.label("(rendered in #23)");
-                    });
+                .inner_margin(Margin::same(12))
+                .fill(Color32::WHITE)
+                .show(ui, |ui| match qr_texture {
+                    Some(handle) => {
+                        let size = Vec2::splat(256.0);
+                        ui.add(Image::from_texture((handle.id(), size)).fit_to_exact_size(size));
+                    }
+                    None => {
+                        ui.set_width(256.0);
+                        ui.set_height(256.0);
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(110.0);
+                            ui.label(
+                                RichText::new("QR unavailable")
+                                    .color(Color32::from_gray(40))
+                                    .italics(),
+                            );
+                        });
+                    }
                 });
             ui.add_space(20.0);
 
@@ -621,4 +687,44 @@ fn now_micros() -> u128 {
 
 pub fn shell_window_title() -> &'static str {
     SHELL_WINDOW_TITLE
+}
+
+/// Render the pair URI into a square QR ColorImage with a 4-module quiet zone, scaled
+/// up so each module is at least `MIN_MODULE_PX` pixels.
+fn render_qr_image(uri: &str) -> Option<ColorImage> {
+    const QUIET_MODULES: usize = 4;
+    const MIN_MODULE_PX: usize = 8;
+
+    let code = QrCode::new(uri.as_bytes()).ok()?;
+    let modules = code.width();
+    let colors = code.to_colors();
+    debug_assert_eq!(colors.len(), modules * modules);
+    let total_modules = modules + QUIET_MODULES * 2;
+    let size_px = total_modules * MIN_MODULE_PX;
+
+    let dark = Color32::BLACK;
+    let light = Color32::WHITE;
+    let mut pixels = vec![light; size_px * size_px];
+
+    for my in 0..modules {
+        for mx in 0..modules {
+            if colors[my * modules + mx] != QrColor::Dark {
+                continue;
+            }
+            let x0 = (mx + QUIET_MODULES) * MIN_MODULE_PX;
+            let y0 = (my + QUIET_MODULES) * MIN_MODULE_PX;
+            for py in 0..MIN_MODULE_PX {
+                let row_start = (y0 + py) * size_px + x0;
+                for px in 0..MIN_MODULE_PX {
+                    pixels[row_start + px] = dark;
+                }
+            }
+        }
+    }
+
+    Some(ColorImage {
+        size: [size_px, size_px],
+        pixels,
+        source_size: Vec2::new(size_px as f32, size_px as f32),
+    })
 }

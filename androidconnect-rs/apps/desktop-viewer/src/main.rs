@@ -63,6 +63,8 @@ fn main() -> Result<()> {
 
     let bind = config.bind.clone();
     let pairing_code = config.pairing_code.clone();
+    let desktop_id = desktop_identity.desktop_id.clone();
+    let desktop_name = desktop_identity.desktop_name.clone();
 
     let options = NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
@@ -82,6 +84,8 @@ fn main() -> Result<()> {
                 status_rx,
                 bind,
                 pairing_code,
+                desktop_id,
+                desktop_name,
             )))
         }),
     )
