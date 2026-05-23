@@ -11,10 +11,11 @@ use std::sync::mpsc;
 use std::thread;
 
 use anyhow::Result;
-use eframe::NativeOptions;
+use fluent_app::FluentApp;
+use gpui::AppContext as _;
 use log::error;
 
-use crate::app::{App, shell_window_title};
+use crate::app::AppModel;
 use crate::config::parse_config;
 use crate::streaming::RgbaFrame;
 
@@ -62,38 +63,73 @@ fn main() -> Result<()> {
         desktop_identity.desktop_name,
         desktop_identity.desktop_id
     );
-    log::info!("desktop trust store: {}", trust_store_path.display());
 
     let bind = config.bind.clone();
     let pairing_code = config.pairing_code.clone();
     let desktop_id = desktop_identity.desktop_id.clone();
     let desktop_name = desktop_identity.desktop_name.clone();
 
-    let options = NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_title(shell_window_title())
-            .with_inner_size([960.0, 720.0])
-            .with_min_inner_size([640.0, 480.0]),
-        ..NativeOptions::default()
-    };
+    FluentApp::new("AndroidConnect")
+        .window_size(960.0, 720.0)
+        .run(move |cx| {
+            let model = cx.new(|_| {
+                AppModel::new(
+                    command_tx.clone(),
+                    bind,
+                    pairing_code,
+                    desktop_id,
+                    desktop_name,
+                )
+            });
 
-    eframe::run_native(
-        shell_window_title(),
-        options,
-        Box::new(move |_cc| {
-            Ok(Box::new(App::new(
-                frame_rx,
-                command_tx,
-                status_rx,
-                event_rx,
-                bind,
-                pairing_code,
-                desktop_id,
-                desktop_name,
-            )))
-        }),
-    )
-    .map_err(|e| anyhow::anyhow!("eframe failed: {e}"))?;
+            let model_weak = model.downgrade();
+            cx.spawn({
+                let model_weak = model_weak.clone();
+                async move |cx| loop {
+                    while let Ok(frame) = frame_rx.try_recv() {
+                        model_weak
+                            .update(&mut cx.clone(), |m, cx| m.push_frame(frame, cx))
+                            .ok();
+                    }
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(5))
+                        .await;
+                }
+            })
+            .detach();
+
+            cx.spawn({
+                let model_weak = model_weak.clone();
+                async move |cx| loop {
+                    while let Ok(s) = status_rx.try_recv() {
+                        model_weak
+                            .update(&mut cx.clone(), |m, cx| m.push_status(s, cx))
+                            .ok();
+                    }
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(16))
+                        .await;
+                }
+            })
+            .detach();
+
+            cx.spawn({
+                let model_weak = model_weak.clone();
+                async move |cx| loop {
+                    while let Ok(ev) = event_rx.try_recv() {
+                        model_weak
+                            .update(&mut cx.clone(), |m, cx| m.push_event(ev, cx))
+                            .ok();
+                    }
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(16))
+                        .await;
+                }
+            })
+            .detach();
+
+            model
+        });
 
     Ok(())
 }

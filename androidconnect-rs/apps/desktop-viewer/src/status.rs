@@ -249,47 +249,6 @@ impl DesktopStatus {
         }
     }
 
-    pub fn window_title(&self) -> String {
-        let subject = self
-            .device_name
-            .as_deref()
-            .or(self.peer.as_deref())
-            .unwrap_or(self.bind.as_str());
-        let auth = if self.input_authenticated {
-            "input paired"
-        } else {
-            "pairing required"
-        };
-
-        let state = match self.connection {
-            ConnectionState::Listening => format!("listening on {}", self.bind),
-            ConnectionState::Connected => {
-                let mut state = format!("connected to {subject} - {auth}");
-                if let Some(video) = &self.video_format {
-                    state.push_str(" - ");
-                    state.push_str(video);
-                }
-                if let Some(nonce) = self.last_pong_nonce {
-                    state.push_str(&format!(" - heartbeat ok #{nonce}"));
-                }
-                if let Some(utilities) = self.utility_summary() {
-                    state.push_str(" - ");
-                    state.push_str(&truncate_title(&utilities, 120));
-                }
-                state
-            }
-            ConnectionState::Error => {
-                let message = self.last_error.as_deref().unwrap_or("connection error");
-                format!("error: {}", truncate_title(message, 72))
-            }
-        };
-
-        format!(
-            "AndroidConnect - code {} - {state}",
-            format_pairing_code(&self.pairing_code)
-        )
-    }
-
     fn clear_utility_status(&mut self) {
         self.battery_status = None;
         self.feature_summary = None;
@@ -307,33 +266,6 @@ impl DesktopStatus {
         self.bluetooth_enabled = None;
         self.dnd_mode = None;
         self.volume_percent = None;
-    }
-
-    fn utility_summary(&self) -> Option<String> {
-        let parts = [
-            self.battery_status.as_deref(),
-            self.feature_summary.as_deref(),
-            self.media_summary.as_deref(),
-            self.notification_summary.as_deref(),
-            self.transfer_summary.as_deref(),
-            self.file_browser_summary.as_deref(),
-            self.photo_summary.as_deref(),
-            self.message_summary.as_deref(),
-            self.call_summary.as_deref(),
-            self.relay_summary.as_deref(),
-            self.client_summary.as_deref(),
-            self.clipboard_summary.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        .filter(|part| !part.is_empty())
-        .take(5)
-        .collect::<Vec<_>>();
-        if parts.is_empty() {
-            None
-        } else {
-            Some(parts.join(" - "))
-        }
     }
 }
 
@@ -374,43 +306,5 @@ mod tests {
     fn formats_six_digit_pairing_code_for_title() {
         assert_eq!(format_pairing_code("123456"), "123 456");
         assert_eq!(format_pairing_code(" ab cd "), "ABCD");
-    }
-
-    #[test]
-    fn status_title_tracks_pairing_and_video() {
-        let mut status = DesktopStatus::new("0.0.0.0:48172".to_owned(), "123456".to_owned());
-        assert_eq!(
-            status.window_title(),
-            "AndroidConnect - code 123 456 - listening on 0.0.0.0:48172"
-        );
-
-        status.apply(network::NetworkStatus::DeviceHello {
-            device_name: "Pixel".to_owned(),
-        });
-        assert_eq!(
-            status.window_title(),
-            "AndroidConnect - code 123 456 - connected to Pixel - pairing required"
-        );
-
-        status.apply(network::NetworkStatus::PairingAuthenticated {
-            trusted: false,
-            session_key_fingerprint: None,
-        });
-        status.apply(network::NetworkStatus::VideoFormat {
-            width: 1080,
-            height: 2340,
-            frame_rate: 30,
-            rotation_degrees: 0,
-        });
-        assert_eq!(
-            status.window_title(),
-            "AndroidConnect - code 123 456 - connected to Pixel - input paired - 1080x2340@30fps rot 0"
-        );
-
-        status.apply(network::NetworkStatus::HeartbeatPong { nonce: 7 });
-        assert_eq!(
-            status.window_title(),
-            "AndroidConnect - code 123 456 - connected to Pixel - input paired - 1080x2340@30fps rot 0 - heartbeat ok #7"
-        );
     }
 }

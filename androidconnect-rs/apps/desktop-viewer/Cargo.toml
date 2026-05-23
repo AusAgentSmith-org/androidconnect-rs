@@ -9,13 +9,13 @@ rust-version.workspace = true
 androidconnect-protocol.workspace = true
 anyhow.workspace = true
 arboard = { version = "3.4", default-features = false, features = ["wayland-data-control"] }
-eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
-egui_extras = { version = "0.32", features = ["image"] }
 env_logger = "0.11"
-image = { version = "0.25", default-features = false, features = ["png"] }
+fluent-app = { path = "/home/sprooty/Working/Active/apps/FluentGUI/crates/fluent-app" }
+fluent-core = { path = "/home/sprooty/Working/Active/apps/FluentGUI/crates/fluent-core" }
+fluent-primitives = { path = "/home/sprooty/Working/Active/apps/FluentGUI/crates/fluent-primitives" }
+gpui = "0.2.2"
 log = "0.4"
 openh264 = { version = "0.9", features = ["source"] }
 qrcode = { version = "0.14", default-features = false }
-rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
 serde.workspace = true
 serde_json.workspace = true
