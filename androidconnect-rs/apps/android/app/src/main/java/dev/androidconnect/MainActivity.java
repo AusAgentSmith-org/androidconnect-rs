@@ -29,6 +29,8 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_NOTIFICATIONS = 1002;
     private static final int REQUEST_PICK_FILE = 1003;
     private static final int REQUEST_MEDIA_READ = 1004;
+    private static final int REQUEST_SCAN_QR = 1005;
+    private static final int REQUEST_CAMERA_FOR_QR = 1006;
     private static final int DEFAULT_PORT = 48172;
     private static final long STATUS_REFRESH_MS = 1_000L;
 
@@ -110,6 +112,16 @@ public final class MainActivity extends Activity {
         statusView.setTextSize(15);
         statusView.setPadding(0, dp(16), 0, dp(20));
         content.addView(statusView, matchWrap());
+
+        Button scanQr = new Button(this);
+        scanQr.setText(getString(R.string.scan_to_connect));
+        scanQr.setOnClickListener(view -> launchQrScanner());
+        content.addView(scanQr, matchWrap());
+
+        TextView manualLabel = new TextView(this);
+        manualLabel.setText("Or enter the desktop manually:");
+        manualLabel.setPadding(0, dp(8), 0, dp(4));
+        content.addView(manualLabel, matchWrap());
 
         hostField = new EditText(this);
         hostField.setHint("Desktop host");
@@ -240,6 +252,75 @@ public final class MainActivity extends Activity {
         }, "AndroidConnectDesktopConnect").start();
     }
 
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions,
+                                            int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQUEST_CAMERA_FOR_QR) {
+            if (grantResults.length > 0
+                    && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                startActivityForResult(
+                        new Intent(this, ScanQrActivity.class),
+                        REQUEST_SCAN_QR);
+            } else {
+                Toast.makeText(this,
+                        "Camera permission is required to scan a QR code",
+                        Toast.LENGTH_LONG).show();
+            }
+        }
+        updateStatus();
+    }
+
+    private void launchQrScanner() {
+        if (checkSelfPermission(Manifest.permission.CAMERA)
+                != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[] { Manifest.permission.CAMERA },
+                    REQUEST_CAMERA_FOR_QR);
+            return;
+        }
+        startActivityForResult(new Intent(this, ScanQrActivity.class), REQUEST_SCAN_QR);
+    }
+
+    private void handleQrResult(Intent data) {
+        String bind = data.getStringExtra(ScanQrActivity.EXTRA_BIND);
+        String pairing = data.getStringExtra(ScanQrActivity.EXTRA_PAIRING_CODE);
+        if (bind == null || bind.isEmpty()) {
+            showError("Scanned QR was missing an address.");
+            return;
+        }
+        String host;
+        int port = DEFAULT_PORT;
+        int lastColon = bind.lastIndexOf(':');
+        // Accept IPv4 "host:port" and "[v6]:port"; for bare IPv6 fall back to default port.
+        if (bind.startsWith("[")) {
+            int closing = bind.indexOf(']');
+            if (closing > 0) {
+                host = bind.substring(1, closing);
+                if (closing + 1 < bind.length() && bind.charAt(closing + 1) == ':') {
+                    try {
+                        port = Integer.parseInt(bind.substring(closing + 2));
+                    } catch (NumberFormatException ignored) {
+                    }
+                }
+            } else {
+                host = bind;
+            }
+        } else if (lastColon > 0 && bind.indexOf(':') == lastColon) {
+            host = bind.substring(0, lastColon);
+            try {
+                port = Integer.parseInt(bind.substring(lastColon + 1));
+            } catch (NumberFormatException ignored) {
+            }
+        } else {
+            host = bind;
+        }
+
+        hostField.setText(host);
+        portField.setText(String.valueOf(port));
+        pairingField.setText(pairing == null ? "" : pairing);
+        connectDesktop();
+    }
+
     private void requestScreenCapture() {
         MediaProjectionManager manager =
                 (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
@@ -253,6 +334,12 @@ public final class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQUEST_SCAN_QR) {
+            if (resultCode == RESULT_OK && data != null) {
+                handleQrResult(data);
+            }
+            return;
+        }
         if (requestCode != REQUEST_MEDIA_PROJECTION) {
             if (requestCode == REQUEST_PICK_FILE && resultCode == RESULT_OK && data != null) {
                 Uri uri = data.getData();

@@ -21,6 +21,7 @@
     <uses-permission android:name="android.permission.READ_SMS" />
     <uses-permission android:name="android.permission.SEND_SMS" />
     <uses-permission android:name="android.permission.RECEIVE_SMS" />
+    <uses-permission android:name="android.permission.CAMERA" />
 
     <application
         android:allowBackup="false"
@@ -59,6 +60,11 @@
             android:name=".OnboardingActivity"
             android:exported="false"
             android:label="@string/onboarding_title" />
+
+        <activity
+            android:name=".ScanQrActivity"
+            android:exported="false"
+            android:label="@string/scan_to_connect" />
 
         <service
             android:name=".MirrorService"
