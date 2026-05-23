@@ -39,7 +39,7 @@ fn run(command_tx: SyncSender<DesktopCommand>, apply_rx: Receiver<String>) {
         }
     };
 
-    info!("clipboard sync enabled (poll interval {:?})", POLL_INTERVAL);
+    info!("clipboard sync enabled (poll interval {POLL_INTERVAL:?})");
 
     let mut sequence: u64 = 0;
     let mut last_text: Option<String> = clipboard.get_text().ok();

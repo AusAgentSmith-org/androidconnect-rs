@@ -23,7 +23,7 @@ fn round_trip_encode_decode() {
     let original = sample_payload();
     let encoded = encode_qr_payload(&original).expect("encode");
     assert!(encoded.starts_with("androidconnect://pair?"));
-    assert!(encoded.contains(&format!("v={}", PROTOCOL_VERSION)));
+    assert!(encoded.contains(&format!("v={PROTOCOL_VERSION}")));
 
     let decoded = decode_qr_payload(&encoded).expect("decode");
     assert_eq!(decoded, original);
