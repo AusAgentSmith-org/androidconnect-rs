@@ -124,6 +124,7 @@ pub fn run(
     pairing_code: String,
     trust_store_path: PathBuf,
     status_tx: Sender<NetworkStatus>,
+    clipboard_apply_tx: Sender<String>,
 ) -> Result<()> {
     let listener = TcpListener::bind(bind)?;
     info!("listening on {bind}");
@@ -155,6 +156,7 @@ pub fn run(
                     &pairing_code,
                     trust_store,
                     status_tx.clone(),
+                    clipboard_apply_tx.clone(),
                 ) {
                     if is_clean_disconnect(&e) {
                         info!("client disconnected");
@@ -193,6 +195,7 @@ fn handle_client(
     pairing_code: &str,
     trust_store: TrustStore,
     status_tx: Sender<NetworkStatus>,
+    clipboard_apply_tx: Sender<String>,
 ) -> Result<()> {
     stream.set_nodelay(true)?;
     let writer = stream.try_clone()?;
@@ -208,6 +211,7 @@ fn handle_client(
             trust_store,
             writer_command_tx,
             status_tx,
+            clipboard_apply_tx,
         );
         let _ = reader_done_tx.send(result);
     });
@@ -368,6 +372,7 @@ fn read_client_loop(
     mut trust_store: TrustStore,
     writer_command_tx: Sender<WriterCommand>,
     status_tx: Sender<NetworkStatus>,
+    clipboard_apply_tx: Sender<String>,
 ) -> Result<()> {
     let mut decoder = Decoder::new().map_err(|e| anyhow::anyhow!("decoder init failed: {e:?}"))?;
     let desktop_identity = trust_store.identity();
@@ -599,6 +604,11 @@ fn read_client_loop(
                         characters: clipboard.text.chars().count(),
                     },
                 );
+                if matches!(clipboard.source, ClipboardSource::Android)
+                    && !clipboard.text.is_empty()
+                {
+                    let _ = clipboard_apply_tx.send(clipboard.text);
+                }
             }
             Payload::FileTransferStart(start) => {
                 handle_incoming_file_start(&mut incoming_transfers, &status_tx, start)?;
@@ -1056,6 +1066,7 @@ mod tests {
         let (frame_tx, _frame_rx) = mpsc::sync_channel(2);
         let (writer_command_tx, _writer_command_rx) = mpsc::channel();
         let (status_tx, status_rx) = mpsc::channel();
+        let (clipboard_apply_tx, _clipboard_apply_rx) = mpsc::channel();
 
         let reader = std::thread::spawn(move || {
             read_client_loop(
@@ -1065,6 +1076,7 @@ mod tests {
                 test_trust_store("reader-reports-pong")?,
                 writer_command_tx,
                 status_tx,
+                clipboard_apply_tx,
             )
         });
 

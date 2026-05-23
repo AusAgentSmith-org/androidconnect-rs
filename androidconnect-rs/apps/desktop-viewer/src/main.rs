@@ -1,3 +1,4 @@
+mod clipboard;
 mod network;
 mod trust;
 
@@ -954,6 +955,8 @@ fn main() -> Result<()> {
     let (command_tx, command_rx) = mpsc::sync_channel::<network::DesktopCommand>(1024);
     let (status_tx, status_rx) = mpsc::channel::<network::NetworkStatus>();
 
+    let clipboard_apply_tx = clipboard::spawn(command_tx.clone());
+
     let bind_for_thread = config.bind.clone();
     let pairing_code_for_thread = config.pairing_code.clone();
     let trust_store_path_for_thread = trust_store_path.clone();
@@ -966,6 +969,7 @@ fn main() -> Result<()> {
             pairing_code_for_thread,
             trust_store_path_for_thread,
             status_tx,
+            clipboard_apply_tx,
         ) {
             error!("network thread: {e:#}");
             let _ = status_tx_for_error.send(network::NetworkStatus::ClientError {
