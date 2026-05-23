@@ -10,10 +10,10 @@ use std::sync::mpsc;
 use std::thread;
 
 use anyhow::Result;
+use eframe::NativeOptions;
 use log::error;
-use winit::event_loop::EventLoop;
 
-use crate::app::App;
+use crate::app::{App, shell_window_title};
 use crate::config::parse_config;
 use crate::streaming::RgbaFrame;
 
@@ -61,14 +61,31 @@ fn main() -> Result<()> {
     );
     log::info!("desktop trust store: {}", trust_store_path.display());
 
-    let event_loop = EventLoop::new()?;
-    event_loop.run_app(&mut App::new(
-        frame_rx,
-        command_tx,
-        status_rx,
-        config.bind,
-        config.pairing_code,
-    ))?;
+    let bind = config.bind.clone();
+    let pairing_code = config.pairing_code.clone();
+
+    let options = NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_title(shell_window_title())
+            .with_inner_size([960.0, 720.0])
+            .with_min_inner_size([640.0, 480.0]),
+        ..NativeOptions::default()
+    };
+
+    eframe::run_native(
+        shell_window_title(),
+        options,
+        Box::new(move |_cc| {
+            Ok(Box::new(App::new(
+                frame_rx,
+                command_tx,
+                status_rx,
+                bind,
+                pairing_code,
+            )))
+        }),
+    )
+    .map_err(|e| anyhow::anyhow!("eframe failed: {e}"))?;
 
     Ok(())
 }

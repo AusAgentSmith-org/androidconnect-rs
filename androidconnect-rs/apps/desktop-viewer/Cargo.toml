@@ -9,10 +9,12 @@ rust-version.workspace = true
 androidconnect-protocol.workspace = true
 anyhow.workspace = true
 arboard = { version = "3.4", default-features = false, features = ["wayland-data-control"] }
+eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui_extras = { version = "0.32", features = ["image"] }
 env_logger = "0.11"
+image = { version = "0.25", default-features = false, features = ["png"] }
 log = "0.4"
 openh264 = { version = "0.9", features = ["source"] }
-pixels = "0.17"
+qrcode = { version = "0.14", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
-winit = "0.30"
