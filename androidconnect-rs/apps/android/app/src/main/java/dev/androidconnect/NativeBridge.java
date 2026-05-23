@@ -150,6 +150,22 @@ public final class NativeBridge {
         return AVAILABLE && nativePushSharedFile(fileName, mimeType, path, size);
     }
 
+    public static boolean pushSharedFileForRequest(
+            String fileName,
+            String mimeType,
+            String path,
+            long size,
+            String requestedPath
+    ) {
+        return AVAILABLE && nativePushSharedFileForRequest(
+                fileName,
+                mimeType,
+                path,
+                size,
+                requestedPath
+        );
+    }
+
     public static boolean pushPhotoAssetListJson(String json) {
         return AVAILABLE && nativePushPhotoAssetList(json);
     }
@@ -357,6 +373,13 @@ public final class NativeBridge {
             String mimeType,
             String path,
             long sizeBytes
+    );
+    private static native boolean nativePushSharedFileForRequest(
+            String fileName,
+            String mimeType,
+            String path,
+            long sizeBytes,
+            String requestedPath
     );
     private static native boolean nativePushPhotoAssetList(String listJson);
     private static native boolean nativePushMessageThreadList(String listJson);

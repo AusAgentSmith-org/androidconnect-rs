@@ -124,9 +124,10 @@ final class SmsBridge {
                         }
                     }
                 }
-                if (recipients.isEmpty() && threadId != null) {
+                if (threadId != null) {
                     String fromThread = lookupRecipientFromThread(context, threadId);
-                    if (fromThread != null) {
+                    if (fromThread != null && !fromThread.trim().isEmpty()) {
+                        recipients.clear();
                         recipients.add(fromThread);
                     }
                 }
@@ -347,7 +348,7 @@ final class SmsBridge {
                     return name;
                 }
             }
-        } catch (SecurityException | RuntimeException ignored) {
+        } catch (RuntimeException ignored) {
         }
         return null;
     }

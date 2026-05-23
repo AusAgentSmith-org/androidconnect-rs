@@ -583,7 +583,8 @@ public final class AndroidUtilityBridge {
 
                 Log.d(TAG, "FileTransferRequest[" + requestId + "]: pushing " + fileName
                         + " (" + size + " bytes)");
-                NativeBridge.pushSharedFile(fileName, mimeType, target.getAbsolutePath(), size);
+                NativeBridge.pushSharedFileForRequest(
+                        fileName, mimeType, target.getAbsolutePath(), size, relativePath);
             } catch (JSONException je) {
                 Log.w(TAG, "FileTransferRequest[" + requestId + "]: malformed JSON", je);
             } catch (java.io.IOException ie) {

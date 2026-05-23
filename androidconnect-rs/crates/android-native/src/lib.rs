@@ -609,7 +609,66 @@ pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativePushSharedFile
         }
     };
 
-    match push_shared_file(file_name, mime_type, PathBuf::from(path), size_bytes) {
+    match push_shared_file(file_name, mime_type, PathBuf::from(path), size_bytes, None) {
+        Ok(()) => JNI_TRUE,
+        Err(error) => {
+            set_last_error(error);
+            notify_native_status_changed(&mut env);
+            JNI_FALSE
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativePushSharedFileForRequest(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    file_name: JString<'_>,
+    mime_type: JString<'_>,
+    path: JString<'_>,
+    size_bytes: jlong,
+    requested_path: JString<'_>,
+) -> jboolean {
+    let file_name = match jstring_to_string(&mut env, file_name, "shared file name") {
+        Ok(value) => value,
+        Err(error) => {
+            set_last_error(error);
+            notify_native_status_changed(&mut env);
+            return JNI_FALSE;
+        }
+    };
+    let mime_type = match jstring_to_string(&mut env, mime_type, "shared mime type") {
+        Ok(value) => value,
+        Err(error) => {
+            set_last_error(error);
+            notify_native_status_changed(&mut env);
+            return JNI_FALSE;
+        }
+    };
+    let path = match jstring_to_string(&mut env, path, "shared file path") {
+        Ok(value) => value,
+        Err(error) => {
+            set_last_error(error);
+            notify_native_status_changed(&mut env);
+            return JNI_FALSE;
+        }
+    };
+    let requested_path = match jstring_to_string(&mut env, requested_path, "requested file path") {
+        Ok(value) => value,
+        Err(error) => {
+            set_last_error(error);
+            notify_native_status_changed(&mut env);
+            return JNI_FALSE;
+        }
+    };
+
+    match push_shared_file(
+        file_name,
+        mime_type,
+        PathBuf::from(path),
+        size_bytes,
+        Some(requested_path),
+    ) {
         Ok(()) => JNI_TRUE,
         Err(error) => {
             set_last_error(error);
@@ -852,6 +911,7 @@ fn push_shared_file(
     mime_type: String,
     path: PathBuf,
     size_bytes: jlong,
+    target_path: Option<String>,
 ) -> Result<(), String> {
     let mut file = File::open(&path)
         .map_err(|error| format!("open shared file {} failed: {error}", path.display()))?;
@@ -867,7 +927,7 @@ fn push_shared_file(
         file_name: sanitize_file_name(&file_name),
         mime_type: empty_to_none(mime_type),
         size_bytes: size,
-        target_path: None,
+        target_path,
     }))?;
 
     let mut offset = 0_u64;

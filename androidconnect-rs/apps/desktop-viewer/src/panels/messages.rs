@@ -119,12 +119,6 @@ impl MessagesState {
             return None;
         }
         let thread_id = self.active_thread.clone()?;
-        let recipients: Vec<String> = self
-            .threads
-            .iter()
-            .find(|t| t.thread_id == thread_id)
-            .map(|t| vec![t.display_name.clone()])
-            .unwrap_or_default();
         let request_id = format!("msg-send-{}", new_request_token());
         self.pending_send = Some(PendingSend {
             request_id: request_id.clone(),
@@ -150,7 +144,7 @@ impl MessagesState {
         Some(Payload::MessageSendRequest(MessageSendRequest {
             request_id,
             thread_id: Some(thread_id),
-            recipients,
+            recipients: Vec::new(),
             body,
             attachments: Vec::new(),
         }))
@@ -163,4 +157,32 @@ fn new_request_token() -> String {
         .map(|d| d.as_micros())
         .unwrap_or_default();
     format!("{micros}-{}", std::process::id())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reply_to_existing_thread_uses_thread_lookup_not_display_name() {
+        let mut state = MessagesState {
+            threads: vec![MessageThreadSummary {
+                thread_id: "42".to_owned(),
+                display_name: "Ada Lovelace".to_owned(),
+                last_message: None,
+                timestamp_unix_ms: None,
+                unread_count: 0,
+            }],
+            active_thread: Some("42".to_owned()),
+            ..MessagesState::default()
+        };
+
+        let Some(Payload::MessageSendRequest(request)) = state.build_send("hello".to_owned())
+        else {
+            panic!("expected message send request");
+        };
+
+        assert_eq!(request.thread_id.as_deref(), Some("42"));
+        assert!(request.recipients.is_empty());
+    }
 }
