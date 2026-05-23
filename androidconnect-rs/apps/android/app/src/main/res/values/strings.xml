@@ -15,4 +15,6 @@
     <string name="notification_title">AndroidConnect mirroring</string>
     <string name="notification_text">Screen capture is running</string>
     <string name="accessibility_description">Allows AndroidConnect to apply pointer and system navigation events sent by your paired desktop.</string>
+    <string name="onboarding_title">AndroidConnect setup</string>
+    <string name="open_onboarding">Review permissions</string>
 </resources>

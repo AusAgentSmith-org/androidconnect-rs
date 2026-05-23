@@ -55,6 +55,11 @@ public final class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        if (!OnboardingActivity.isCompleted(this)) {
+            startActivity(new Intent(this, OnboardingActivity.class));
+            finish();
+            return;
+        }
         setContentView(createContentView());
         requestNotificationsIfNeeded();
         AndroidUtilityBridge.rememberContext(this);
@@ -121,6 +126,12 @@ public final class MainActivity extends Activity {
         pairingField.setHint("Pairing code from desktop (first connection)");
         pairingField.setSingleLine(true);
         content.addView(pairingField, matchWrap());
+
+        Button reviewPermissions = new Button(this);
+        reviewPermissions.setText(getString(R.string.open_onboarding));
+        reviewPermissions.setOnClickListener(view ->
+                startActivity(new Intent(this, OnboardingActivity.class)));
+        content.addView(reviewPermissions, matchWrap());
 
         Button connect = new Button(this);
         connect.setText(getString(R.string.connect_desktop));
