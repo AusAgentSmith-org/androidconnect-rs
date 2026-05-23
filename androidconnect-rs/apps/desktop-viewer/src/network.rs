@@ -559,6 +559,13 @@ fn read_client_loop(
             Payload::AuthResponse(_) => {}
             Payload::Input(_) => {}
             Payload::DeviceStatus(status) => {
+                info!(
+                    "device_status: battery={:?}% charging={:?} interactive={:?} features={}",
+                    status.battery_percent,
+                    status.charging,
+                    status.interactive,
+                    feature_summary(&status.features)
+                );
                 send_status(
                     &status_tx,
                     NetworkStatus::DeviceStatus {
@@ -579,6 +586,12 @@ fn read_client_loop(
             }
             Payload::MediaControl(_) | Payload::ClipboardImage(_) => {}
             Payload::ClipboardText(clipboard) => {
+                info!(
+                    "clipboard_text: source={:?} chars={} preview={:?}",
+                    clipboard.source,
+                    clipboard.text.chars().count(),
+                    clipboard.text.chars().take(40).collect::<String>()
+                );
                 send_status(
                     &status_tx,
                     NetworkStatus::ClipboardText {
@@ -623,6 +636,14 @@ fn read_client_loop(
                 );
             }
             Payload::NotificationPosted(notification) => {
+                info!(
+                    "notification_posted: app={:?} pkg={:?} title={:?} sensitive={} actions={}",
+                    notification.app_name,
+                    notification.app_package,
+                    notification.title,
+                    notification.sensitive,
+                    notification.actions.len()
+                );
                 send_status(
                     &status_tx,
                     NetworkStatus::NotificationPosted {
@@ -633,6 +654,7 @@ fn read_client_loop(
                 );
             }
             Payload::NotificationRemoved(removed) => {
+                info!("notification_removed: id={:?}", removed.notification_id);
                 send_status(
                     &status_tx,
                     NetworkStatus::NotificationRemoved {

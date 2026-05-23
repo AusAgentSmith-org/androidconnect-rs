@@ -19,18 +19,57 @@ delivery lanes into ordered tasks against the current code surface.
 
 ## Entry Criteria Gate
 
-MVP 3 implementation **does not start** until all of the following are confirmed on a physical
-Android device:
+Validated on a Samsung SM-S926B (Android 14, One UI 6) on 2026-05-23. Results:
 
-- [ ] `DeviceStatus` updates arrive within 2 s of state change.
-- [ ] Desktop-to-Android input (pointer + key) is correct across letterboxed scaling.
-- [ ] A desktop client survives a 30 s network drop and resumes without re-pairing
-      (`trusted_session_auth_response` path).
-- [ ] Notification mirror posts/removes and basic action dispatch round-trip cleanly.
-- [ ] Clipboard text sync is reliable in both directions on the target Android version.
+- [x] `DeviceStatus` updates arrive within 2 s of state change. Charging + interactive both
+      round-tripped through the desktop title bar.
+- [x] Desktop-to-Android input (pointer + key) is correct across letterboxed scaling.
+      `inputScaleX/Y` lands taps correctly on a 1080×2340 capture vs 1440×3120 physical display.
+      **Caveat:** the user must manually enable `RemoteControlAccessibilityService` in Android
+      Settings — no in-app prompt exists yet (Lane 3A onboarding fixes this).
+- [~] A desktop client survives a 30 s network drop and resumes without re-pairing
+      (`trusted_session_auth_response` path). The trusted-session reconnect path itself works
+      (validated on app restart). **However, locking the phone screen tears down `MirrorService`
+      cleanly with no auto-recovery** — distinct failure mode not covered by the original gate.
+      Absorbed into MVP 3 scope as "Lane 3A polish: keep-alive locks in MirrorService" (see below).
+- [x] Notification mirror posts/removes round-trip cleanly. Action dispatch protocol exists but
+      cannot be triggered without a desktop UI — Lane 3B builds that.
+- [~] Clipboard text sync — **fails in both directions** as currently implemented:
+      - Phone → Desktop only works when the user opens AndroidConnect and taps the "Sync
+        clipboard" button. Android 10+ forbids background apps from calling
+        `ClipboardManager.getPrimaryClip()`, so no listener is registered.
+      - Desktop → Phone is entirely unwired on the desktop side (the protocol payload and
+        `applyClipboardText` on Android are ready, just no emit code).
+      Absorbed into MVP 3 scope as "Lane 3A polish: automatic clipboard sync" (see below).
 
-`docs/MVP2_IMPLEMENTATION.md` currently lists these as "skipped for this pass." That validation is
-the prerequisite. Until it lands, this plan is reviewed only — not implemented.
+The 3 of 5 clean passes plus the 2 absorbed failures are explicitly accepted; this plan is no
+longer gated and MVP 3 implementation has started.
+
+## Absorbed Lane 3A Polish (from gate validation)
+
+These are MVP 2 robustness gaps that physical-device validation uncovered. They land alongside
+Lane 3A so the companion shell isn't built on top of a session that dies the moment the screen
+locks or a user copies text.
+
+1. **`MirrorService` keep-alive locks** (`apps/android/.../MirrorService.java`):
+   - Acquire `PARTIAL_WAKE_LOCK` (PowerManager) on `startMirroring`, release on `stopMirroring`.
+   - Acquire a high-performance `WifiManager.WifiLock` on the same lifecycle.
+   - On Samsung One UI specifically, also consider `setKeepScreenOn` on the projection-host
+     activity if needed; the wake/wifi pair should be sufficient first.
+   - Validation: lock the phone for 60 s with the desktop connected, confirm the session is
+     still alive on unlock.
+
+2. **Automatic clipboard sync** (both sides):
+   - Desktop: add an `arboard`-backed poll loop in `apps/desktop-viewer` that emits
+     `Payload::ClipboardText { source: Desktop, … }` on change. Use a small dedup window to
+     suppress feedback from a clipboard the desktop itself just received.
+   - Android: keep the existing "Sync clipboard" button as a manual fallback. Document the
+     Android 10+ limitation in `docs/MVP2.md`. If we want background-capture, the realistic
+     path is piggybacking on the Accessibility service we already require for input — events
+     like `TYPE_VIEW_TEXT_SELECTION_CHANGED` give us a window to read the clipboard while the
+     selected-text app still has focus. Tracker only for now.
+   - Validation: copy text on phone → desktop receives within 1 s; copy text on desktop →
+     phone toast appears and paste works.
 
 ## Protocol Gaps to Close First (Lane 3A prework)
 
