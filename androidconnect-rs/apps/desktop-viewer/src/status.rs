@@ -1,6 +1,17 @@
-use androidconnect_protocol::{DndMode, normalize_pairing_code};
+use androidconnect_protocol::{
+    DndMode, MediaControlAction, MediaPlaybackState, normalize_pairing_code,
+};
 
 use crate::network;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaInfo {
+    pub app_name: Option<String>,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub playback_state: MediaPlaybackState,
+    pub supported_actions: Vec<MediaControlAction>,
+}
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -23,6 +34,7 @@ pub struct DesktopStatus {
     pub battery_status: Option<String>,
     pub feature_summary: Option<String>,
     pub media_summary: Option<String>,
+    pub media_info: Option<MediaInfo>,
     pub notification_summary: Option<String>,
     pub transfer_summary: Option<String>,
     pub file_browser_summary: Option<String>,
@@ -53,6 +65,7 @@ impl DesktopStatus {
             battery_status: None,
             feature_summary: None,
             media_summary: None,
+            media_info: None,
             notification_summary: None,
             transfer_summary: None,
             file_browser_summary: None,
@@ -162,7 +175,15 @@ impl DesktopStatus {
                 self.volume_percent = volume_percent;
                 self.connection = ConnectionState::Connected;
             }
-            network::NetworkStatus::MediaStatus { active, summary } => {
+            network::NetworkStatus::MediaStatus {
+                active,
+                summary,
+                app_name,
+                title,
+                artist,
+                playback_state,
+                supported_actions,
+            } => {
                 self.media_summary = Some(if active {
                     summary
                 } else if summary.is_empty() {
@@ -170,6 +191,17 @@ impl DesktopStatus {
                 } else {
                     summary
                 });
+                self.media_info = if active {
+                    Some(MediaInfo {
+                        app_name,
+                        title,
+                        artist,
+                        playback_state,
+                        supported_actions,
+                    })
+                } else {
+                    None
+                };
             }
             network::NetworkStatus::ClipboardText { source, characters } => {
                 self.clipboard_summary = Some(format!("{source:?} clipboard {characters} chars"));
@@ -253,6 +285,7 @@ impl DesktopStatus {
         self.battery_status = None;
         self.feature_summary = None;
         self.media_summary = None;
+        self.media_info = None;
         self.notification_summary = None;
         self.transfer_summary = None;
         self.file_browser_summary = None;

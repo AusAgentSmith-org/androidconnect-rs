@@ -9,11 +9,11 @@ use std::time::{Duration, Instant};
 use androidconnect_protocol::{
     AUTH_CHALLENGE_BYTES, AuthMethod, AuthResponse, ClipboardSource, DndMode, Envelope,
     FeatureStatus, FileBrowseResponse, FileTransferChunk, FileTransferComplete, FileTransferStart,
-    InputEvent, MAX_VIDEO_FRAME_BYTES, MediaStatus, NotificationPosted, NotificationRemoved,
-    PAIRED_SECRET_BYTES, PROTOCOL_VERSION, Payload, TransferDirection, TransferStatus, WireError,
-    bytes_to_hex, derive_session_key, paired_secret_from_pairing_code, pairing_auth_response,
-    read_length_prefixed, session_key_fingerprint, trusted_session_auth_response,
-    write_length_prefixed,
+    InputEvent, MAX_VIDEO_FRAME_BYTES, MediaControlAction, MediaPlaybackState, MediaStatus,
+    NotificationPosted, NotificationRemoved, PAIRED_SECRET_BYTES, PROTOCOL_VERSION, Payload,
+    TransferDirection, TransferStatus, WireError, bytes_to_hex, derive_session_key,
+    paired_secret_from_pairing_code, pairing_auth_response, read_length_prefixed,
+    session_key_fingerprint, trusted_session_auth_response, write_length_prefixed,
 };
 use anyhow::{Result, bail};
 use log::{error, info, warn};
@@ -69,6 +69,11 @@ pub enum NetworkStatus {
     MediaStatus {
         active: bool,
         summary: String,
+        app_name: Option<String>,
+        title: Option<String>,
+        artist: Option<String>,
+        playback_state: MediaPlaybackState,
+        supported_actions: Vec<MediaControlAction>,
     },
     ClipboardText {
         source: ClipboardSource,
@@ -634,6 +639,11 @@ fn read_client_loop(
                     NetworkStatus::MediaStatus {
                         active: status.active,
                         summary: media_summary(&status),
+                        app_name: status.app_name.clone(),
+                        title: status.title.clone(),
+                        artist: status.artist.clone(),
+                        playback_state: status.playback_state,
+                        supported_actions: status.supported_actions.clone(),
                     },
                 );
             }

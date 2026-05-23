@@ -13,8 +13,8 @@ use gpui::{
 use qrcode::{Color as QrColor, QrCode};
 
 use androidconnect_protocol::{
-    AudioControl, AudioControlCommand, DndMode, InputEvent, Payload, PointerButton, PointerEvent,
-    PointerPhase,
+    AudioControl, AudioControlCommand, DndMode, InputEvent, MediaControl, MediaControlAction,
+    MediaPlaybackState, Payload, PointerButton, PointerEvent, PointerPhase,
     qr::{QrPairingPayload, encode_qr_payload},
 };
 
@@ -640,6 +640,7 @@ impl AppModel {
             .or(self.status.bluetooth_enabled);
         let bt_pending = self.phone_state.pending_bluetooth.is_some();
         let error_msg = self.phone_state.error.clone();
+        let media_info = self.status.media_info.clone();
 
         // Volume row
         let entity_vol_down = entity.clone();
@@ -651,6 +652,9 @@ impl AppModel {
             entity.clone(),
         ];
         let entity_bt = entity.clone();
+        let entity_media_prev = entity.clone();
+        let entity_media_play = entity.clone();
+        let entity_media_next = entity.clone();
 
         div()
             .size_full()
@@ -659,6 +663,109 @@ impl AppModel {
             .flex_col()
             .gap(px(12.0))
             .bg(colors.surface)
+            .child(if let Some(info) = media_info {
+                let has_prev = info
+                    .supported_actions
+                    .contains(&MediaControlAction::Previous);
+                let has_next = info.supported_actions.contains(&MediaControlAction::Next);
+                let has_play_pause = info
+                    .supported_actions
+                    .contains(&MediaControlAction::PlayPause);
+                let has_play = info.supported_actions.contains(&MediaControlAction::Play);
+                let has_pause = info.supported_actions.contains(&MediaControlAction::Pause);
+
+                let play_action = if has_play_pause {
+                    Some(MediaControlAction::PlayPause)
+                } else if matches!(
+                    info.playback_state,
+                    MediaPlaybackState::Playing | MediaPlaybackState::Buffering
+                ) && has_pause
+                {
+                    Some(MediaControlAction::Pause)
+                } else if has_play {
+                    Some(MediaControlAction::Play)
+                } else {
+                    None
+                };
+
+                let play_label = if matches!(
+                    info.playback_state,
+                    MediaPlaybackState::Playing | MediaPlaybackState::Buffering
+                ) {
+                    "⏸"
+                } else {
+                    "▶"
+                };
+
+                let title_str = info.title.clone().unwrap_or_else(|| "Unknown".to_owned());
+                let artist_str = info.artist.clone().unwrap_or_default();
+                let app_str = info.app_name.clone().unwrap_or_default();
+
+                let mut controls = div().flex().flex_row().gap(px(4.0));
+                if has_prev {
+                    let ep = entity_media_prev.clone();
+                    controls = controls.child(Button::new("media-prev").label("⏮").on_click(
+                        move |_: &ClickEvent, _, app: &mut App| {
+                            ep.update(app, |m, cx| {
+                                m.send_utility(Payload::MediaControl(MediaControl {
+                                    action: MediaControlAction::Previous,
+                                }));
+                                cx.notify();
+                            });
+                        },
+                    ));
+                }
+                if let Some(action) = play_action {
+                    let ep = entity_media_play.clone();
+                    controls =
+                        controls.child(Button::new("media-play").label(play_label).on_click(
+                            move |_: &ClickEvent, _, app: &mut App| {
+                                ep.update(app, |m, cx| {
+                                    m.send_utility(Payload::MediaControl(MediaControl { action }));
+                                    cx.notify();
+                                });
+                            },
+                        ));
+                }
+                if has_next {
+                    let en = entity_media_next.clone();
+                    controls = controls.child(Button::new("media-next").label("⏭").on_click(
+                        move |_: &ClickEvent, _, app: &mut App| {
+                            en.update(app, |m, cx| {
+                                m.send_utility(Payload::MediaControl(MediaControl {
+                                    action: MediaControlAction::Next,
+                                }));
+                                cx.notify();
+                            });
+                        },
+                    ));
+                }
+
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(Label::new("Now Playing").size(LabelSize::Subtitle))
+                    .child(Divider::horizontal())
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(div().font_weight(FontWeight::BOLD).child(title_str))
+                            .child(div().text_color(colors.on_subtle).child(artist_str))
+                            .child(
+                                div()
+                                    .text_color(colors.on_subtle_disabled)
+                                    .text_size(px(11.0))
+                                    .child(app_str),
+                            ),
+                    )
+                    .child(controls)
+                    .into_any_element()
+            } else {
+                div().into_any_element()
+            })
             .child(Label::new("Quick settings").size(LabelSize::Subtitle))
             .child(Divider::horizontal())
             // Volume
