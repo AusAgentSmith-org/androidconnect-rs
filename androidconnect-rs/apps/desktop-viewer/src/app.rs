@@ -4,31 +4,34 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use arboard::Clipboard;
 use fluent_app::TitleBar;
 use fluent_core::{ThemeProvider as _, gradient_from_hue, tint};
 use fluent_primitives::{
     AppDot, Avatar, Button, ButtonAppearance, ButtonShape, ButtonSize, Card, ConnectionBadge,
-    ConnectionBadgeState, Divider, FluentTextExt as _, Icon, IconSize, Label, LabelSize,
-    SectionHeader, Skeleton, SkeletonRow, Switch, TextInput,
+    ConnectionBadgeState, Divider, FluentTextExt as _, Icon, IconButton, IconSize, Label, LabelSize,
+    SectionHeader, Skeleton, SkeletonRow, Switch, TextInput, ToggleButton,
 };
 use gpui::{
     Animation, AnimationExt, App, Bounds, ClickEvent, Context, Entity, FontWeight, IntoElement,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta,
-    ScrollWheelEvent, SharedString, VideoTextureId, Window, backdrop_blur, canvas, div, hsla,
+    Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
+    ScrollDelta, ScrollWheelEvent, SharedString, VideoTextureId, Window, backdrop_blur, canvas, div,
+    hsla,
     linear_color_stop, linear_gradient, prelude::*, pulsating_between, px,
 };
 use qrcode::{Color as QrColor, QrCode};
 
 use androidconnect_protocol::{
-    AudioControl, AudioControlCommand, DndMode, FeatureState, FeatureStatus, InputEvent,
-    MediaPlaybackState, MessageDirection, MessageSendResult, Payload, PointerButton, PointerEvent,
-    PointerPhase, UtilityFeature,
+    AudioControl, AudioControlCommand, DndMode, FeatureState, FeatureStatus, FileEntry,
+    FileEntryType, InputEvent, MediaPlaybackState, MessageDirection, MessageSendResult, Payload,
+    PointerButton, PointerEvent, PointerPhase, UtilityFeature,
     qr::{QrPairingPayload, encode_qr_payload},
 };
 
 use crate::network;
 use crate::panels::{
-    ActivityIcon, ActivityLog, MessagesState, Panel, files::FilesState,
+    ActivityIcon, ActivityLog, MessagesState, Panel,
+    files::{FilesState, FilesViewMode},
     notifications::NotificationsState, phone::PhoneState,
 };
 use crate::status::{ConnectionState, DesktopStatus, format_pairing_code};
@@ -61,6 +64,8 @@ pub struct AppModel {
     qr_data: Option<Arc<Vec<u8>>>,
     qr_size: u32,
     qr_cache_key: String,
+    qr_expires_at_ms: u64,
+    pair_code_copied_at: Option<Instant>,
 
     // Mirror input forwarding
     mirror_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
@@ -159,6 +164,26 @@ impl AppModel {
         })
         .detach();
 
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                if this
+                    .update(cx, |m, cx| {
+                        if (!m.connected() && m.qr_expires_at_ms > 0)
+                            || m.pair_code_copied_at
+                                .is_some_and(|copied_at| copied_at.elapsed() < Duration::from_secs(2))
+                        {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+
         Self {
             command_tx,
             status,
@@ -178,6 +203,8 @@ impl AppModel {
             qr_data: None,
             qr_size: 0,
             qr_cache_key: String::new(),
+            qr_expires_at_ms: 0,
+            pair_code_copied_at: None,
             mirror_bounds: Arc::new(Mutex::new(None)),
             left_pressed: false,
             last_mirror_mouse_move: None,
@@ -303,7 +330,11 @@ impl AppModel {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or_default();
-        let expires_ms = now_ms.saturating_add(5 * 60 * 1000);
+        let expires_ms = if self.qr_expires_at_ms > now_ms {
+            self.qr_expires_at_ms
+        } else {
+            now_ms.saturating_add(5 * 60 * 1000)
+        };
         let payload = QrPairingPayload::new(
             self.pair_addresses.clone(),
             self.status.pairing_code.clone(),
@@ -313,8 +344,12 @@ impl AppModel {
             expires_ms,
         );
         let cache_key = format!(
-            "v={}|addrs={:?}|tok={}|id={}",
-            payload.protocol_version, payload.addresses, payload.pairing_token, payload.desktop_id,
+            "v={}|addrs={:?}|tok={}|id={}|exp={}",
+            payload.protocol_version,
+            payload.addresses,
+            payload.pairing_token,
+            payload.desktop_id,
+            expires_ms,
         );
         if !self.qr_cache_key.is_empty() && self.qr_cache_key == cache_key {
             return;
@@ -335,6 +370,7 @@ impl AppModel {
         self.qr_data = Some(Arc::new(pixels));
         self.qr_size = size_px;
         self.qr_cache_key = cache_key;
+        self.qr_expires_at_ms = expires_ms;
     }
 
     fn connected(&self) -> bool {
@@ -363,6 +399,7 @@ impl AppModel {
         let entity = cx.entity();
         let refresh_entity = entity.clone();
         let settings_entity = entity.clone();
+        let device_entity = entity.clone();
 
         let subject = self
             .status
@@ -383,8 +420,8 @@ impl AppModel {
             .border_b_1()
             .border_color(colors.stroke_neutral_subtle)
             .child(
-                // Device chip (pill)
                 div()
+                    .id("topbar-device-chip")
                     .flex()
                     .flex_row()
                     .items_center()
@@ -396,6 +433,15 @@ impl AppModel {
                     .border_1()
                     .border_color(colors.stroke_neutral)
                     .bg(colors.neutral)
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(colors.neutral_hover))
+                    .on_click(move |_, _, app| {
+                        device_entity.update(app, |m, cx| {
+                            m.active_panel = Panel::Overview;
+                            m.status.input_authenticated = false;
+                            cx.notify();
+                        });
+                    })
                     .child(Avatar::initials(initials).size(24.0))
                     .child(
                         div()
@@ -1227,6 +1273,17 @@ impl AppModel {
         let qr_id = self.qr_texture;
         let qr_side = px(208.0);
         let qr_native = self.qr_size;
+        let countdown = pair_countdown_label(self.qr_expires_at_ms);
+        let copy_icon = if self
+            .pair_code_copied_at
+            .is_some_and(|copied_at| copied_at.elapsed() < Duration::from_millis(1500))
+        {
+            "icons/check.svg"
+        } else {
+            "icons/copy.svg"
+        };
+        let copy_entity = cx.entity();
+        let copy_code = self.status.pairing_code.clone();
 
         // Left column: instructions
         let mut left = div()
@@ -1333,6 +1390,30 @@ impl AppModel {
             .tabular_nums()
             .child(pairing_code_fmt);
 
+        let code_row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(spacing.sm))
+            .child(code_chip)
+            .child(
+                IconButton::new("pair-copy-code", copy_icon)
+                    .size(ButtonSize::Normal)
+                    .appearance(ButtonAppearance::Subtle)
+                    .on_click(move |_, _, app| {
+                        let code = copy_code.clone();
+                        copy_entity.update(app, |m, cx| {
+                            if Clipboard::new()
+                                .and_then(|mut clipboard| clipboard.set_text(code))
+                                .is_ok()
+                            {
+                                m.pair_code_copied_at = Some(Instant::now());
+                            }
+                            cx.notify();
+                        });
+                    }),
+            );
+
         let right = div()
             .w(px(280.0))
             .flex()
@@ -1346,7 +1427,14 @@ impl AppModel {
                     .text_size(px(typography.caption.size))
                     .child("or enter the code manually"),
             )
-            .child(code_chip)
+            .child(code_row)
+            .child(
+                div()
+                    .text_color(colors.on_subtle)
+                    .text_size(px(typography.caption.size))
+                    .tabular_nums()
+                    .child(countdown),
+            )
             .child(if let Some(err) = last_error {
                 div()
                     .px(px(spacing.lg))
@@ -1878,7 +1966,19 @@ impl AppModel {
                 .iter_items()
                 .map(|(id, n)| (id.clone(), n.clone()))
                 .collect();
-            for (id, notif) in items {
+            let now_ms = current_time_ms();
+            let (now_items, earlier_items): (Vec<_>, Vec<_>) =
+                items.into_iter().partition(|(_, notif)| {
+                    now_ms.saturating_sub(notif.timestamp_unix_ms) <= 30 * 60 * 1000
+                });
+            for (group_label, group_items) in
+                [("Now", now_items), ("Earlier", earlier_items)]
+            {
+                if group_items.is_empty() {
+                    continue;
+                }
+                body = body.child(Label::eyebrow(group_label));
+                for (id, notif) in group_items {
                 let suppressed = self.notifications.is_suppressed(&notif.app_package);
                 let hide = self.notifications.hide_sensitive && notif.sensitive;
                 let app_package = notif.app_package.clone();
@@ -2106,12 +2206,17 @@ impl AppModel {
                         .p(px(spacing.lg))
                         .rounded(px(radii.md))
                         .hover(move |s| s.bg(hover_bg))
-                        .child(AppDot::new(notif.app_name.clone()).size(28.0))
+                        .child(
+                            AppDot::new(notif.app_name.clone())
+                                .hue(brand_hue(&notif.app_package, &notif.app_name))
+                                .size(28.0),
+                        )
                         .child(body_col)
                         .child(actions_col),
                 );
 
                 body = body.child(card);
+            }
             }
         }
 
@@ -2156,11 +2261,21 @@ impl AppModel {
             .responses
             .get(&self.files_state.current_path)
             .cloned();
+        let selected_entry = response.as_ref().and_then(|resp| {
+            self.files_state
+                .selected_path
+                .as_ref()
+                .and_then(|path| resp.entries.iter().find(|entry| &entry.path == path).cloned())
+        });
 
         let e_refresh = entity.clone();
         let e_back = entity.clone();
         let e_new_folder = entity.clone();
         let path_for_refresh = current_path.clone();
+        let view_mode = self.files_state.view_mode;
+        let breadcrumb = files_breadcrumb(&current_path, entity.clone(), cx);
+        let e_list = entity.clone();
+        let e_grid = entity.clone();
 
         let toolbar = div()
             .flex()
@@ -2222,13 +2337,31 @@ impl AppModel {
                         });
                     }),
             )
+            .child(breadcrumb)
             .child(div().flex_1())
             .child(
-                div()
-                    .text_color(colors.on_subtle)
-                    .text_size(px(typography.caption.size))
-                    .font_family("monospace")
-                    .child(current_path.clone()),
+                ToggleButton::new("files-view-list")
+                    .label("List")
+                    .selected(matches!(view_mode, FilesViewMode::List))
+                    .size(ButtonSize::Compact)
+                    .on_click(move |_, _, _, app| {
+                        e_list.update(app, |m, cx| {
+                            m.files_state.view_mode = FilesViewMode::List;
+                            cx.notify();
+                        });
+                    }),
+            )
+            .child(
+                ToggleButton::new("files-view-grid")
+                    .label("Grid")
+                    .selected(matches!(view_mode, FilesViewMode::Grid))
+                    .size(ButtonSize::Compact)
+                    .on_click(move |_, _, _, app| {
+                        e_grid.update(app, |m, cx| {
+                            m.files_state.view_mode = FilesViewMode::Grid;
+                            cx.notify();
+                        });
+                    }),
             );
 
         let mut body = div()
@@ -2342,33 +2475,130 @@ impl AppModel {
                 body = body.child(banner);
             }
 
-            for entry in &resp.entries {
-                let icon = match entry.entry_type {
-                    androidconnect_protocol::FileEntryType::Directory => "folder",
-                    androidconnect_protocol::FileEntryType::File => "doc",
-                    androidconnect_protocol::FileEntryType::Media => "image",
-                };
-                let icon_color = match entry.entry_type {
-                    androidconnect_protocol::FileEntryType::Directory => colors.on_neutral_accent,
-                    _ => colors.on_subtle,
-                };
-                let size_label = entry
-                    .size_bytes
-                    .map(crate::status::format_bytes_short)
-                    .unwrap_or_else(|| "—".to_owned());
-                let entry_path = entry.path.clone();
-                let entry_type = entry.entry_type;
-                let entry_name = entry.name.clone();
-                let e_nav = entity.clone();
-                let e_del = entity.clone();
-                let e_rename = entity.clone();
-                let e_download = entity.clone();
-                let e_path_del = entry.path.clone();
-                let e_path_rename = entry.path.clone();
-                let e_name_rename = entry.name.clone();
-                let e_path_download = entry.path.clone();
+            if matches!(view_mode, FilesViewMode::Grid) {
+                let mut grid = div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap(px(spacing.lg))
+                    .p(px(spacing.xl));
+                for entry in &resp.entries {
+                    let icon = file_icon_name(entry);
+                    let icon_color = filetype_colour(entry, &colors);
+                    let meta_label = file_entry_meta(entry);
+                    let entry_path = entry.path.clone();
+                    let entry_type = entry.entry_type;
+                    let entry_name = entry.name.clone();
+                    let selected = self.files_state.selected_path.as_deref() == Some(&entry.path);
+                    let e_select = entity.clone();
+                    let tile_bg = if selected {
+                        tint(colors.accent, 0.12)
+                    } else {
+                        colors.neutral
+                    };
+                    let tile_border = if selected {
+                        colors.accent
+                    } else {
+                        colors.stroke_neutral_subtle
+                    };
+                    let thumb_bg = if file_is_image(entry) {
+                        gradient_from_hue(hue_for_filename(&entry.name))
+                    } else {
+                        colors.surface_dim.into()
+                    };
 
-                let mut row = div()
+                    grid = grid.child(
+                        div()
+                            .id(SharedString::from(format!("file-tile-{entry_path}")))
+                            .flex()
+                            .flex_col()
+                            .flex_basis(px(140.0))
+                            .max_w(px(180.0))
+                            .gap(px(spacing.md))
+                            .p(px(spacing.lg))
+                            .rounded(px(radii.md))
+                            .border_1()
+                            .border_color(tile_border)
+                            .bg(tile_bg)
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(colors.neutral_hover))
+                            .on_click(move |_, _, app| {
+                                let path = entry_path.clone();
+                                let is_dir = matches!(entry_type, FileEntryType::Directory);
+                                e_select.update(app, |m, cx| {
+                                    let now = Instant::now();
+                                    let is_double = m.files_state.last_click_path.as_deref()
+                                        == Some(path.as_str())
+                                        && m.files_state.last_click_time.is_some_and(|last| {
+                                            now.duration_since(last) <= Duration::from_millis(350)
+                                        });
+                                    m.files_state.last_click_path = Some(path.clone());
+                                    m.files_state.last_click_time = Some(now);
+                                    m.files_state.selected_path = Some(path.clone());
+                                    if is_double {
+                                        if is_dir {
+                                            let payload = m.files_state.navigate_to(path);
+                                            m.send_utility(payload);
+                                        } else {
+                                            m.request_download(path);
+                                        }
+                                    }
+                                    cx.notify();
+                                });
+                            })
+                            .child(
+                                div()
+                                    .w_full()
+                                    .h(px(116.0))
+                                    .rounded(px(radii.lg))
+                                    .bg(thumb_bg)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_color(icon_color)
+                                    .child(Icon::new(icon).size(IconSize::Lg)),
+                            )
+                            .child(
+                                div()
+                                    .text_color(colors.on_neutral)
+                                    .text_size(px(12.0))
+                                    .overflow_hidden()
+                                    .child(truncate(&entry_name, 18)),
+                            )
+                            .child(
+                                div()
+                                    .text_color(colors.on_subtle)
+                                    .text_size(px(10.0))
+                                    .child(meta_label),
+                            ),
+                    );
+                }
+                body = body.child(grid);
+            } else {
+                for entry in &resp.entries {
+                    let icon = file_icon_name(entry);
+                    let icon_color = filetype_colour(entry, &colors);
+                    let size_label = file_entry_meta(entry);
+                    let selected = self.files_state.selected_path.as_deref() == Some(&entry.path);
+                    let entry_path = entry.path.clone();
+                    let entry_type = entry.entry_type;
+                    let entry_name = entry.name.clone();
+                    let e_nav = entity.clone();
+                    let e_del = entity.clone();
+                    let e_rename = entity.clone();
+                    let e_download = entity.clone();
+                    let e_path_del = entry.path.clone();
+                    let e_path_rename = entry.path.clone();
+                    let e_name_rename = entry.name.clone();
+                    let e_path_download = entry.path.clone();
+
+                    let row_bg = if selected {
+                        tint(colors.accent, 0.12)
+                    } else {
+                        gpui::transparent_black()
+                    };
+
+                    let mut row = div()
                     .id(SharedString::from(format!("fentry-{entry_path}")))
                     .flex()
                     .flex_row()
@@ -2378,18 +2608,29 @@ impl AppModel {
                     .py(px(6.0))
                     .rounded(px(radii.md))
                     .cursor_pointer()
+                    .bg(row_bg)
                     .hover(move |s| s.bg(colors.subtle_hover))
                     .on_click(move |_, _, app| {
-                        if !matches!(
-                            entry_type,
-                            androidconnect_protocol::FileEntryType::Directory
-                        ) {
-                            return;
-                        }
                         let p = entry_path.clone();
                         e_nav.update(app, |m, cx| {
-                            let payload = m.files_state.navigate_to(p);
-                            m.send_utility(payload);
+                            let now = Instant::now();
+                            let is_dir = matches!(entry_type, FileEntryType::Directory);
+                            let is_double = m.files_state.last_click_path.as_deref()
+                                == Some(p.as_str())
+                                && m.files_state.last_click_time.is_some_and(|last| {
+                                    now.duration_since(last) <= Duration::from_millis(350)
+                                });
+                            m.files_state.last_click_path = Some(p.clone());
+                            m.files_state.last_click_time = Some(now);
+                            m.files_state.selected_path = Some(p.clone());
+                            if is_double {
+                                if is_dir {
+                                    let payload = m.files_state.navigate_to(p);
+                                    m.send_utility(payload);
+                                } else {
+                                    m.request_download(p);
+                                }
+                            }
                             cx.notify();
                         });
                     })
@@ -2403,10 +2644,7 @@ impl AppModel {
                             .flex_1()
                             .text_color(colors.on_neutral)
                             .font_weight(
-                                if matches!(
-                                    entry_type,
-                                    androidconnect_protocol::FileEntryType::Directory
-                                ) {
+                                if matches!(entry_type, FileEntryType::Directory) {
                                     FontWeight::SEMIBOLD
                                 } else {
                                     FontWeight::NORMAL
@@ -2423,26 +2661,23 @@ impl AppModel {
                             .child(size_label),
                     );
 
-                if !matches!(
-                    entry_type,
-                    androidconnect_protocol::FileEntryType::Directory
-                ) {
-                    row = row.child(
-                        Button::new(SharedString::from(format!("dl-{}", entry.path)))
-                            .label("Save to PC")
-                            .appearance(ButtonAppearance::Subtle)
-                            .size(ButtonSize::Compact)
-                            .on_click(move |_, _, app| {
-                                let path = e_path_download.clone();
-                                e_download.update(app, |m, cx| {
-                                    m.request_download(path);
-                                    cx.notify();
-                                });
-                            }),
-                    );
-                }
+                    if !matches!(entry_type, FileEntryType::Directory) {
+                        row = row.child(
+                            Button::new(SharedString::from(format!("dl-{}", entry.path)))
+                                .label("Save to PC")
+                                .appearance(ButtonAppearance::Subtle)
+                                .size(ButtonSize::Compact)
+                                .on_click(move |_, _, app| {
+                                    let path = e_path_download.clone();
+                                    e_download.update(app, |m, cx| {
+                                        m.request_download(path);
+                                        cx.notify();
+                                    });
+                                }),
+                        );
+                    }
 
-                row = row
+                    row = row
                     .child(
                         Button::new(SharedString::from(format!("rn-{}", entry.path)))
                             .label("Rename")
@@ -2490,7 +2725,8 @@ impl AppModel {
                             }),
                     );
 
-                body = body.child(row);
+                    body = body.child(row);
+                }
             }
         } else {
             body = body.child(
@@ -2502,14 +2738,19 @@ impl AppModel {
             );
         }
 
-        div()
+        let mut panel = div()
             .size_full()
             .bg(colors.surface)
             .flex()
             .flex_col()
             .child(toolbar)
-            .child(body)
-            .into_any_element()
+            .child(body);
+
+        if let Some(entry) = selected_entry {
+            panel = panel.child(files_selection_footer(&entry, cx));
+        }
+
+        panel.into_any_element()
     }
 
     fn render_messages_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -2534,6 +2775,21 @@ impl AppModel {
 
         let state = self.messages_state.clone();
         let composer = self.sms_composer.clone();
+        let submit_entity = entity.clone();
+        self.sms_composer.update(cx, |input, _| {
+            input.set_on_submit(move |text, app| {
+                let body = text.to_string();
+                submit_entity.update(app, |m, cx| {
+                    if let Some(payload) = m.messages_state.build_send(body) {
+                        m.send_utility(payload);
+                        cx.notify();
+                        true
+                    } else {
+                        false
+                    }
+                })
+            });
+        });
 
         // Thread list (left)
         let mut thread_list = div()
@@ -2785,7 +3041,23 @@ impl AppModel {
                         .child("No messages in this thread yet."),
                 );
             } else {
+                let mut last_ts = None;
                 for entry in &messages {
+                    if last_ts.is_none_or(|prev| {
+                        entry.timestamp_unix_ms.abs_diff(prev) > 30 * 60 * 1000
+                    }) {
+                        history = history.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .py(px(spacing.md))
+                                .text_color(colors.on_subtle_disabled)
+                                .text_size(px(typography.caption.size))
+                                .child(format_full_time(entry.timestamp_unix_ms)),
+                        );
+                    }
+                    last_ts = Some(entry.timestamp_unix_ms);
                     let outbound = matches!(entry.direction, MessageDirection::Outbound);
                     let bubble = div()
                         .max_w(px(420.0))
@@ -3036,6 +3308,20 @@ fn new_request_token() -> String {
     format!("{micros}-{}", std::process::id())
 }
 
+fn current_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+fn pair_countdown_label(expires_at_ms: u64) -> String {
+    let remaining_secs = expires_at_ms.saturating_sub(current_time_ms()) / 1000;
+    let minutes = remaining_secs / 60;
+    let seconds = remaining_secs % 60;
+    format!("Code expires in {minutes}:{seconds:02}")
+}
+
 fn advertised_pair_addresses(bind: &str) -> Vec<String> {
     advertised_pair_addresses_from(
         bind,
@@ -3211,6 +3497,200 @@ fn file_skeleton_row(idx: usize, cx: &Context<AppModel>) -> impl IntoElement {
         .py(px(6.0))
         .child(Skeleton::new(("file-loading-icon", idx)).w(16.0).h(16.0))
         .child(Skeleton::new(("file-loading-line", idx)).w(220.0).h(10.0))
+}
+
+fn files_breadcrumb(
+    current_path: &str,
+    entity: Entity<AppModel>,
+    cx: &Context<AppModel>,
+) -> impl IntoElement + use<> {
+    let colors = cx.theme().colors.clone();
+    let typography = cx.theme().typography;
+    let spacing = cx.theme().spacing;
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(spacing.sm))
+        .text_size(px(typography.body.size));
+
+    let root_entity = entity.clone();
+    row = row.child(
+        div()
+            .id("files-breadcrumb-root")
+            .cursor_pointer()
+            .text_color(colors.on_neutral)
+            .hover(move |s| s.text_color(colors.on_neutral_accent))
+            .on_click(move |_, _, app| {
+                root_entity.update(app, |m, cx| {
+                    let payload = m.files_state.navigate_to("/".to_owned());
+                    m.send_utility(payload);
+                    cx.notify();
+                });
+            })
+            .child("Phone"),
+    );
+
+    let mut prefix = String::new();
+    for segment in current_path.split('/').filter(|segment| !segment.is_empty()) {
+        prefix.push('/');
+        prefix.push_str(segment);
+        let target = prefix.clone();
+        let e = entity.clone();
+        row = row
+            .child(
+                div()
+                    .text_color(colors.on_subtle_disabled)
+                    .child(Icon::new("chevron").size(IconSize::Sm)),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("files-breadcrumb-{target}")))
+                    .cursor_pointer()
+                    .text_color(colors.on_neutral)
+                    .hover(move |s| s.text_color(colors.on_neutral_accent))
+                    .on_click(move |_, _, app| {
+                        let target = target.clone();
+                        e.update(app, |m, cx| {
+                            let payload = m.files_state.navigate_to(target);
+                            m.send_utility(payload);
+                            cx.notify();
+                        });
+                    })
+                    .child(segment.to_owned()),
+            );
+    }
+
+    row
+}
+
+fn files_selection_footer(entry: &FileEntry, cx: &Context<AppModel>) -> impl IntoElement {
+    let colors = cx.theme().colors.clone();
+    let typography = cx.theme().typography;
+    let spacing = cx.theme().spacing;
+    let icon = file_icon_name(entry);
+    let icon_color = filetype_colour(entry, &colors);
+    let meta = file_entry_meta(entry);
+    let modified = file_entry_modified(entry);
+
+    div()
+        .border_t_1()
+        .border_color(colors.stroke_neutral_subtle)
+        .bg(colors.surface_dim)
+        .px(px(20.0))
+        .py(px(spacing.md))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(spacing.sm))
+        .text_size(px(typography.caption.size))
+        .child(div().text_color(icon_color).child(Icon::new(icon).size(IconSize::Sm)))
+        .child(
+            div()
+                .text_color(colors.on_neutral)
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(entry.name.clone()),
+        )
+        .child(div().text_color(colors.on_subtle).child("·"))
+        .child(div().text_color(colors.on_subtle).child(meta))
+        .child(div().text_color(colors.on_subtle).child("·"))
+        .child(div().text_color(colors.on_subtle).child(modified))
+}
+
+fn file_icon_name(entry: &FileEntry) -> &'static str {
+    match entry.entry_type {
+        FileEntryType::Directory => "folder",
+        FileEntryType::Media if file_is_video(entry) => "video",
+        FileEntryType::Media => "image",
+        FileEntryType::File if file_is_archive(entry) => "zip",
+        FileEntryType::File => "doc",
+    }
+}
+
+fn filetype_colour(entry: &FileEntry, colors: &fluent_core::ColorScheme) -> Hsla {
+    match entry.entry_type {
+        FileEntryType::Directory => colors.on_neutral_accent,
+        FileEntryType::Media if file_is_video(entry) => hsla(350.0 / 360.0, 0.6, 0.55, 1.0),
+        FileEntryType::Media => hsla(80.0 / 360.0, 0.6, 0.55, 1.0),
+        FileEntryType::File if file_is_archive(entry) => hsla(110.0 / 360.0, 0.45, 0.55, 1.0),
+        FileEntryType::File => hsla(200.0 / 360.0, 0.45, 0.55, 1.0),
+    }
+}
+
+fn file_entry_meta(entry: &FileEntry) -> String {
+    if matches!(entry.entry_type, FileEntryType::Directory) {
+        entry
+            .size_bytes
+            .map(|count| format!("{count} items"))
+            .unwrap_or_else(|| "Folder".to_owned())
+    } else {
+        entry
+            .size_bytes
+            .map(crate::status::format_bytes_short)
+            .unwrap_or_else(|| "—".to_owned())
+    }
+}
+
+fn file_entry_modified(entry: &FileEntry) -> String {
+    entry
+        .modified_unix_ms
+        .map(relative_timestamp)
+        .unwrap_or_else(|| "—".to_owned())
+}
+
+fn file_extension(entry: &FileEntry) -> String {
+    entry
+        .name
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+fn file_is_video(entry: &FileEntry) -> bool {
+    let ext = file_extension(entry);
+    matches!(ext.as_str(), "mp4" | "mov" | "mkv" | "webm" | "avi")
+}
+
+fn file_is_archive(entry: &FileEntry) -> bool {
+    let lower = entry.name.to_ascii_lowercase();
+    lower.ends_with(".zip")
+        || lower.ends_with(".tar.gz")
+        || lower.ends_with(".tgz")
+        || lower.ends_with(".rar")
+        || lower.ends_with(".7z")
+}
+
+fn file_is_image(entry: &FileEntry) -> bool {
+    let ext = file_extension(entry);
+    matches!(
+        ext.as_str(),
+        "jpg" | "jpeg" | "png" | "webp" | "gif" | "heic" | "avif"
+    )
+}
+
+fn hue_for_filename(name: &str) -> f32 {
+    let mut hash: u32 = 2166136261;
+    for b in name.bytes() {
+        hash ^= b as u32;
+        hash = hash.wrapping_mul(16777619);
+    }
+    (hash % 360) as f32
+}
+
+fn brand_hue(package: &str, fallback_name: &str) -> f32 {
+    match package {
+        "com.whatsapp" => 145.0,
+        "com.google.android.apps.messaging" => 210.0,
+        "com.spotify.music" => 140.0,
+        "com.discord" => 235.0,
+        "com.instagram.android" => 320.0,
+        "com.slack" => 30.0,
+        "com.google.android.gm" => 8.0,
+        "com.facebook.katana" => 220.0,
+        "com.twitter.android" | "com.x.android" => 210.0,
+        "org.telegram.messenger" => 205.0,
+        _ => fluent_core::hue_for(fallback_name),
+    }
 }
 
 fn pending_dot(cx: &Context<AppModel>) -> impl IntoElement {
@@ -3914,7 +4394,11 @@ fn recent_notifications(
                 .items_start()
                 .gap(px(10.0))
                 .py(px(6.0))
-                .child(AppDot::new(n.app_name.clone()).size(24.0))
+                .child(
+                    AppDot::new(n.app_name.clone())
+                        .hue(brand_hue(&n.app_package, &n.app_name))
+                        .size(24.0),
+                )
                 .child(
                     div()
                         .flex_1()
@@ -4191,6 +4675,26 @@ fn relative_timestamp(ms: u64) -> String {
         format!("{}h ago", diff_secs / 3600)
     } else {
         format!("{}d ago", diff_secs / 86400)
+    }
+}
+
+fn format_full_time(ms: u64) -> String {
+    let secs = ms / 1000;
+    let days = (secs / 86400) as i64;
+    let minutes = (secs % 86400) / 60;
+    let hour = minutes / 60;
+    let minute = minutes % 60;
+    let now_days = (current_time_ms() / 1000 / 86400) as i64;
+    let time = format!("{hour:02}:{minute:02}");
+    match now_days.saturating_sub(days) {
+        0 => format!("Today {time}"),
+        1 => format!("Yesterday {time}"),
+        _ => {
+            let (y, m, d) = civil_from_days(days);
+            let weekday = weekday_name(y, m, d);
+            let short_weekday = weekday.get(..3).unwrap_or(weekday);
+            format!("{short_weekday} {d} {}", month_name(m))
+        }
     }
 }
 

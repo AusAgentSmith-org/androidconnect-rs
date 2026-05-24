@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use androidconnect_protocol::{FileBrowseRequest, FileBrowseResponse, Payload};
 
@@ -9,7 +9,18 @@ pub struct FilesState {
     pub history: Vec<String>,
     pub responses: HashMap<String, FileBrowseResponse>,
     pub pending_request: Option<String>,
+    pub view_mode: FilesViewMode,
+    pub selected_path: Option<String>,
+    pub last_click_path: Option<String>,
+    pub last_click_time: Option<Instant>,
     requested_once: bool,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+pub enum FilesViewMode {
+    #[default]
+    List,
+    Grid,
 }
 
 impl FilesState {
@@ -18,6 +29,7 @@ impl FilesState {
             self.pending_request = None;
         }
         self.current_path = response.path.clone();
+        self.selected_path = None;
         self.responses.insert(response.path.clone(), response);
     }
 
@@ -46,12 +58,14 @@ impl FilesState {
     pub fn navigate_to(&mut self, path: String) -> Payload {
         self.history.push(self.current_path.clone());
         self.current_path = path.clone();
+        self.selected_path = None;
         self.request_browse(path)
     }
 
     pub fn navigate_back(&mut self) -> Option<Payload> {
         let prev = self.history.pop()?;
         self.current_path = prev.clone();
+        self.selected_path = None;
         Some(self.request_browse(prev))
     }
 }
