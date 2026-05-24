@@ -12,10 +12,10 @@ use androidconnect_protocol::{
     FeatureStatus, FileBrowseResponse, FileTransferChunk, FileTransferComplete, FileTransferStart,
     InputEvent, MAX_VIDEO_FRAME_BYTES, MediaControlAction, MediaPlaybackState, MediaStatus,
     MessageEvent, MessageSendResponse, MessageThreadDetail, MessageThreadList, NotificationPosted,
-    NotificationRemoved, PAIRED_SECRET_BYTES, PROTOCOL_VERSION, Payload, TransferDirection,
-    TransferStatus, WireError, bytes_to_hex, derive_session_key, paired_secret_from_pairing_code,
-    pairing_auth_response, read_length_prefixed, session_key_fingerprint, StorageBreakdown,
-    trusted_session_auth_response, write_length_prefixed,
+    NotificationRemoved, PAIRED_SECRET_BYTES, PROTOCOL_VERSION, Payload, StorageBreakdown,
+    TransferDirection, TransferStatus, WireError, bytes_to_hex, derive_session_key,
+    paired_secret_from_pairing_code, pairing_auth_response, read_length_prefixed,
+    session_key_fingerprint, trusted_session_auth_response, write_length_prefixed,
 };
 use anyhow::{Result, bail};
 use log::{error, info, warn};

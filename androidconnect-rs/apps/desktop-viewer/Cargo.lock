@@ -1786,6 +1786,8 @@ checksum = "8bf7cc16383c4b8d58b9905a8509f02926ce3058053c056376248d958c9df1e8"
 [[package]]
 name = "fluent-app"
 version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25876e3322fb4e602d02430ebdda359d4653cd5c77e0f19e3d803aed58d5195f"
 dependencies = [
  "fluent-core",
  "fluent-layout",
@@ -1795,6 +1797,8 @@ dependencies = [
 [[package]]
 name = "fluent-core"
 version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1875b4dbbfda5fcdf467887e3d5aadff09bb298587392bcb11bd02503fb7a0cd"
 dependencies = [
  "gpui",
 ]
@@ -1802,6 +1806,8 @@ dependencies = [
 [[package]]
 name = "fluent-layout"
 version = "2.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a33a7907b2a7779394af52a2a2fbc9ca0c2c0ad20b237a6074c7f5877b48be8b"
 dependencies = [
  "fluent-core",
  "fluent-ribbon",
@@ -1810,7 +1816,9 @@ dependencies = [
 
 [[package]]
 name = "fluent-primitives"
-version = "2.2.0"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "405d12c46590ae14ce43f25747c233c36f6c0a7cd01b4e7f2de26b009324d32c"
 dependencies = [
  "fluent-core",
  "gpui",
@@ -1820,6 +1828,8 @@ dependencies = [
 [[package]]
 name = "fluent-ribbon"
 version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4322927a852505ce3b8044cf27ec9f4c035d7a7791c083f009d34b724001852"
 dependencies = [
  "fluent-core",
  "fluent-primitives",
@@ -2214,7 +2224,8 @@ dependencies = [
 
 [[package]]
 name = "gpui"
-version = "0.2.3"
+version = "0.2.4"
+source = "git+https://github.com/AusAgentSmith-org/fluent-gpui?rev=f2ac9130f6e90422304b951fd961806d3b40ec20#f2ac9130f6e90422304b951fd961806d3b40ec20"
 dependencies = [
  "anyhow",
  "as-raw-xcb-connection",

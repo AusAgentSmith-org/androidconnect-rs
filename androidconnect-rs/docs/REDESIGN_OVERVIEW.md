@@ -4,10 +4,12 @@ The B/C/D stages of the Fluent 2 redesign shipped, but a number of items
 from the original critique were missed. This index points to the five
 passes that close those gaps.
 
-**Current status:** A-D have since mostly landed. Use
+**Current status:** A-D have since mostly landed, and the automated gap
+closure is implemented. Use
 [REDESIGN_GAP_CLOSURE_PLAN.md](REDESIGN_GAP_CLOSURE_PLAN.md) for the
-remaining work found in the latest holistic audit. The pass docs below are
-kept as historical execution notes and deeper implementation references.
+completion summary, verification record, and remaining manual paired-device
+checks. The pass docs below are kept as historical execution notes and deeper
+implementation references.
 
 Each pass is self-contained — pick one up and execute it without needing
 the others. Pass A is the cheapest and most overdue; do it first.

@@ -8,23 +8,23 @@ use arboard::Clipboard;
 use fluent_app::TitleBar;
 use fluent_core::{ThemeProvider as _, gradient_from_hue, tint};
 use fluent_primitives::{
-    AppDot, Avatar, Button, ButtonAppearance, ButtonShape, ButtonSize, Card, ConnectionBadge,
-    ConnectionBadgeState, Divider, FluentTextExt as _, Icon, IconButton, IconSize, Label, LabelSize,
-    SectionHeader, Skeleton, SkeletonRow, Switch, TextInput, ToggleButton,
+    AppDot, Avatar, Button, ButtonAppearance, ButtonSize, Card, ConnectionBadge,
+    ConnectionBadgeState, Divider, FluentTextExt as _, Icon, IconButton, IconSize, Label,
+    LabelSize, SectionHeader, Skeleton, SkeletonRow, Switch, TextInput, ToggleButton,
 };
 use gpui::{
-    Animation, AnimationExt, App, Bounds, ClickEvent, Context, Entity, FontWeight, IntoElement,
-    Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
-    ScrollDelta, ScrollWheelEvent, SharedString, VideoTextureId, Window, backdrop_blur, canvas, div,
-    hsla, relative,
-    linear_color_stop, linear_gradient, prelude::*, pulsating_between, px,
+    Animation, AnimationExt, App, Bounds, ClickEvent, Context, Entity, FontWeight, Hsla,
+    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
+    ScrollDelta, ScrollWheelEvent, SharedString, VideoTextureId, Window, backdrop_blur, canvas,
+    div, hsla, linear_color_stop, linear_gradient, prelude::*, pulsating_between, px, relative,
 };
 use qrcode::{Color as QrColor, QrCode};
 
 use androidconnect_protocol::{
     AudioControl, AudioControlCommand, DndMode, FeatureState, FeatureStatus, FileEntry,
-    FileEntryType, InputEvent, MediaPlaybackState, MessageDirection, MessageSendResult, Payload,
-    PointerButton, PointerEvent, PointerPhase, StorageBreakdown, UtilityFeature,
+    FileEntryType, InputEvent, MediaControl, MediaControlAction, MediaPlaybackState,
+    MessageDirection, MessageSendResult, Payload, PointerButton, PointerEvent, PointerPhase,
+    StorageBreakdown, UtilityFeature,
     qr::{QrPairingPayload, encode_qr_payload},
 };
 
@@ -32,14 +32,29 @@ use crate::network;
 use crate::panels::{
     ActivityIcon, ActivityLog, MessagesState, Panel,
     files::{FilesState, FilesViewMode},
-    notifications::NotificationsState, phone::PhoneState,
+    notifications::NotificationsState,
+    phone::PhoneState,
 };
 use crate::status::{ConnectionState, DesktopStatus, format_pairing_code};
 use crate::streaming::{RgbaFrame, letterbox_bounds, map_window_to_frame};
 
+// Fixed Layout Dimensions
+//
+// These values size stable app chrome, anchored overlays, and illustrative
+// assets. They are intentionally not theme spacing/radius tokens because
+// changing them with density would alter layout contracts rather than rhythm.
 const SIDEBAR_WIDTH: f32 = 220.0;
 const TOPBAR_HEIGHT: f32 = 48.0;
 const STATUSBAR_HEIGHT: f32 = 28.0;
+const DEVICE_POPOVER_WIDTH: f32 = 320.0;
+const OVERVIEW_MEDIA_CARD_WIDTH: f32 = 360.0;
+const MIRROR_CHROME_OFFSET: f32 = 20.0;
+const PAIR_QR_SIDE: f32 = 208.0;
+const PAIR_CODE_CARD_WIDTH: f32 = 280.0;
+const FILE_TILE_WIDTH: f32 = 140.0;
+const FILE_TILE_MAX_WIDTH: f32 = 180.0;
+const FAKE_PHONE_WIDTH: f32 = 96.0;
+const FAKE_PHONE_HEIGHT: f32 = 180.0;
 
 pub struct AppModel {
     command_tx: mpsc::SyncSender<network::DesktopCommand>,
@@ -48,6 +63,8 @@ pub struct AppModel {
     desktop_id: String,
     desktop_name: String,
     active_panel: Panel,
+    device_popover_open: bool,
+    pairing_requested: bool,
     title_bar: Entity<TitleBar>,
 
     // Video mirror
@@ -170,8 +187,9 @@ impl AppModel {
                 if this
                     .update(cx, |m, cx| {
                         if (!m.connected() && m.qr_expires_at_ms > 0)
-                            || m.pair_code_copied_at
-                                .is_some_and(|copied_at| copied_at.elapsed() < Duration::from_secs(2))
+                            || m.pair_code_copied_at.is_some_and(|copied_at| {
+                                copied_at.elapsed() < Duration::from_secs(2)
+                            })
                         {
                             cx.notify();
                         }
@@ -191,6 +209,8 @@ impl AppModel {
             desktop_id,
             desktop_name,
             active_panel: Panel::Overview,
+            device_popover_open: false,
+            pairing_requested: false,
             title_bar,
             video_texture: None,
             video_alloc_w: 0,
@@ -300,6 +320,8 @@ impl AppModel {
                 }
                 self.left_pressed = false;
                 self.last_mirror_mouse_move = None;
+                self.device_popover_open = false;
+                self.pairing_requested = false;
                 self.logged_initial_pair = false;
             }
         }
@@ -320,6 +342,29 @@ impl AppModel {
 
     fn send_refresh_ping(&self) {
         let _ = self.command_tx.try_send(network::DesktopCommand::PingNow);
+    }
+
+    fn set_active_panel(&mut self, panel: Panel) {
+        let entering_mirror =
+            !matches!(self.active_panel, Panel::Mirror) && matches!(panel, Panel::Mirror);
+        self.active_panel = panel;
+        self.device_popover_open = false;
+        self.pairing_requested = false;
+        if entering_mirror {
+            self.last_mirror_mouse_move = Some(Instant::now());
+        }
+    }
+
+    fn request_pairing(&mut self) {
+        self.active_panel = Panel::Overview;
+        self.device_popover_open = false;
+        self.pairing_requested = true;
+    }
+
+    fn show_permission_steps(&mut self) {
+        self.request_pairing();
+        self.activity
+            .push(ActivityIcon::Pair, "Opened phone permission steps");
     }
 
     fn refresh_pair_qr(&mut self, window: &mut Window) {
@@ -409,9 +454,10 @@ impl AppModel {
             .unwrap_or_else(|| "No device".to_owned());
         let initials = device_initials(&subject);
 
-        div()
+        let mut bar = div()
             .h(px(TOPBAR_HEIGHT))
             .px(px(spacing.xl))
+            .relative()
             .flex()
             .flex_row()
             .items_center()
@@ -437,8 +483,7 @@ impl AppModel {
                     .hover(move |s| s.bg(colors.neutral_hover))
                     .on_click(move |_, _, app| {
                         device_entity.update(app, |m, cx| {
-                            m.active_panel = Panel::Overview;
-                            m.status.input_authenticated = false;
+                            m.device_popover_open = !m.device_popover_open;
                             cx.notify();
                         });
                     })
@@ -489,11 +534,130 @@ impl AppModel {
                 cx,
                 move |_, _, app| {
                     settings_entity.update(app, |m, cx| {
-                        m.active_panel = Panel::Settings;
+                        m.set_active_panel(Panel::Settings);
                         cx.notify();
                     });
                 },
-            ))
+            ));
+
+        if self.device_popover_open {
+            bar = bar.child(self.render_device_popover(cx));
+        }
+
+        bar
+    }
+
+    fn render_device_popover(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let colors = cx.theme().colors.clone();
+        let typography = cx.theme().typography;
+        let spacing = cx.theme().spacing;
+        let radii = cx.theme().radii;
+        let entity = cx.entity();
+        let pair_entity = entity.clone();
+        let refresh_entity = entity.clone();
+        let subject = self
+            .status
+            .device_name
+            .clone()
+            .or_else(|| self.status.peer.clone())
+            .unwrap_or_else(|| "No device paired".to_owned());
+        let peer = self
+            .status
+            .peer
+            .clone()
+            .unwrap_or_else(|| "No peer connected".to_owned());
+
+        div()
+            .absolute()
+            .top(px(TOPBAR_HEIGHT + spacing.sm))
+            .left(px(spacing.xl))
+            .w(px(DEVICE_POPOVER_WIDTH))
+            .p(px(spacing.lg))
+            .flex()
+            .flex_col()
+            .gap(px(spacing.md))
+            .rounded(px(radii.lg))
+            .bg(colors.surface)
+            .border_1()
+            .border_color(colors.stroke_neutral)
+            .shadow_md()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(spacing.md))
+                    .child(Avatar::initials(device_initials(&subject)).size(36.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap(px(spacing.xs))
+                            .child(
+                                div()
+                                    .text_color(colors.on_neutral)
+                                    .text_size(px(typography.body.size))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(subject),
+                            )
+                            .child(
+                                div()
+                                    .text_color(colors.on_subtle)
+                                    .text_size(px(typography.caption.size))
+                                    .child(peer),
+                            ),
+                    )
+                    .child(ConnectionBadge::new(
+                        "device-popover-conn",
+                        self.badge_state(),
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(spacing.xs))
+                    .text_color(colors.on_subtle)
+                    .text_size(px(typography.caption.size))
+                    .child(div().child(format!("Listening on {}", self.status.bind)))
+                    .child(div().child(if self.status.input_authenticated {
+                        "Current pairing remains active"
+                    } else {
+                        "Waiting for pairing"
+                    })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(spacing.sm))
+                    .child(
+                        Button::new("device-popover-pair")
+                            .label("Pair new device")
+                            .appearance(ButtonAppearance::Accent)
+                            .size(ButtonSize::Compact)
+                            .on_click(move |_, _, app| {
+                                pair_entity.update(app, |m, cx| {
+                                    m.request_pairing();
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("device-popover-refresh")
+                            .label("Refresh status")
+                            .appearance(ButtonAppearance::Subtle)
+                            .size(ButtonSize::Compact)
+                            .on_click(move |_, _, app| {
+                                refresh_entity.update(app, |m, cx| {
+                                    m.device_popover_open = false;
+                                    m.send_refresh_ping();
+                                    cx.notify();
+                                });
+                            }),
+                    ),
+            )
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -554,7 +718,7 @@ impl AppModel {
                 })
                 .on_click(move |_: &ClickEvent, _win, app: &mut App| {
                     entity2.update(app, |m, cx| {
-                        m.active_panel = panel;
+                        m.set_active_panel(panel);
                         cx.notify();
                     });
                 });
@@ -605,6 +769,7 @@ impl AppModel {
                         .text_size(px(10.0))
                         .text_color(gpui::white())
                         .font_weight(FontWeight::BOLD)
+                        .tabular_nums()
                         .child(format!("{unread}")),
                 );
             }
@@ -627,7 +792,7 @@ impl AppModel {
                     let e = entity.clone();
                     move |_: &ClickEvent, _, app: &mut App| {
                         e.update(app, |m, cx| {
-                            m.status.input_authenticated = false;
+                            m.request_pairing();
                             cx.notify();
                         });
                     }
@@ -792,7 +957,7 @@ impl AppModel {
                                                         .appearance(ButtonAppearance::Accent)
                                                         .on_click(move |_, _, app| {
                                                             e_pair.update(app, |m, cx| {
-                                                                m.status.input_authenticated = false;
+                                                                m.request_pairing();
                                                                 cx.notify();
                                                             });
                                                         }),
@@ -865,7 +1030,11 @@ impl AppModel {
             cx,
         )));
         if let Some(media) = self.status.media_info.clone() {
-            hero_row = hero_row.child(div().w(px(360.0)).child(now_playing_card(&media, cx)));
+            hero_row = hero_row.child(
+                div()
+                    .w(px(OVERVIEW_MEDIA_CARD_WIDTH))
+                    .child(now_playing_card(&media, entity.clone(), cx)),
+            );
         }
         root = root.child(hero_row);
 
@@ -884,7 +1053,7 @@ impl AppModel {
                         let e = entity_quick.clone();
                         move |_, _, app| {
                             e.update(app, |m, cx| {
-                                m.active_panel = Panel::Mirror;
+                                m.set_active_panel(Panel::Mirror);
                                 cx.notify();
                             });
                         }
@@ -900,7 +1069,7 @@ impl AppModel {
                         let e = entity_quick.clone();
                         move |_, _, app| {
                             e.update(app, |m, cx| {
-                                m.active_panel = Panel::Messages;
+                                m.set_active_panel(Panel::Messages);
                                 cx.notify();
                             });
                         }
@@ -916,7 +1085,7 @@ impl AppModel {
                         let e = entity_quick.clone();
                         move |_, _, app| {
                             e.update(app, |m, cx| {
-                                m.active_panel = Panel::Files;
+                                m.set_active_panel(Panel::Files);
                                 cx.notify();
                             });
                         }
@@ -924,11 +1093,19 @@ impl AppModel {
                     cx,
                 ))
                 .child(quick_action(
-                    "qa-find",
+                    "qa-phone",
                     "phone",
-                    "Find my phone",
-                    "Ring at full volume",
-                    move |_, _, _| {},
+                    "Phone controls",
+                    "Volume, DND, Bluetooth",
+                    {
+                        let e = entity_quick.clone();
+                        move |_, _, app| {
+                            e.update(app, |m, cx| {
+                                m.set_active_panel(Panel::Phone);
+                                cx.notify();
+                            });
+                        }
+                    },
                     cx,
                 )),
         );
@@ -953,7 +1130,7 @@ impl AppModel {
                                         .size(ButtonSize::Compact)
                                         .on_click(move |_, _, app| {
                                             e_notifs.update(app, |m, cx| {
-                                                m.active_panel = Panel::Notifications;
+                                                m.set_active_panel(Panel::Notifications);
                                                 cx.notify();
                                             });
                                         }),
@@ -974,7 +1151,7 @@ impl AppModel {
                                         .size(ButtonSize::Compact)
                                         .on_click(move |_, _, app| {
                                             e_msgs.update(app, |m, cx| {
-                                                m.active_panel = Panel::Messages;
+                                                m.set_active_panel(Panel::Messages);
                                                 cx.notify();
                                             });
                                         }),
@@ -993,7 +1170,7 @@ impl AppModel {
                 .children(activity_rows(self, 8, cx)),
         );
 
-        root = root.child(storage_card(self, cx));
+        root = root.child(storage_card(self, entity.clone(), cx));
 
         root.into_any_element()
     }
@@ -1012,6 +1189,8 @@ impl AppModel {
         let frame_w = self.frame_w;
         let frame_h = self.frame_h;
         let chrome_opacity = mirror_chrome_opacity(self.last_mirror_mouse_move);
+        let mirror_settings_entity = entity.clone();
+        let mirror_refresh_entity = entity.clone();
 
         if !self.connected() {
             return mirror_disconnected_panel(entity, cx).into_any_element();
@@ -1029,7 +1208,7 @@ impl AppModel {
                 .child(
                     div()
                         .size(px(64.0))
-                        .rounded(px(16.0))
+                        .rounded(px(2.0 * radii.lg))
                         .bg(colors.neutral)
                         .flex()
                         .items_center()
@@ -1181,13 +1360,13 @@ impl AppModel {
                 )
                 .size_full(),
             )
-            // Floating control rail — top-right, three icon buttons backed by
+            // Floating control rail — top-right, icon buttons backed by
             // backdrop-blurred glass.
             .child(
                 div()
                     .absolute()
-                    .top(px(20.0))
-                    .right(px(20.0))
+                    .top(px(MIRROR_CHROME_OFFSET))
+                    .right(px(MIRROR_CHROME_OFFSET))
                     .opacity(chrome_opacity)
                     .flex()
                     .flex_col()
@@ -1196,19 +1375,38 @@ impl AppModel {
                     .rounded(px(10.0))
                     // Backdrop blur background — samples the video frame
                     // beneath, blurs it 16px, tints it ~10% black.
-                    .bg(backdrop_blur(16.0, hsla(0.0, 0.0, 0.0, 0.25)))
+                    .bg(backdrop_blur(16.0, mirror_glass_fill()))
                     .border_1()
-                    .border_color(hsla(0.0, 0.0, 1.0, 0.08))
-                    .child(mirror_chip_icon("mirror-settings", "settings", cx))
-                    .child(mirror_chip_icon("mirror-snapshot", "image", cx))
-                    .child(mirror_chip_icon("mirror-refresh", "refresh", cx)),
+                    .border_color(mirror_glass_stroke())
+                    .child(mirror_chip_icon(
+                        "mirror-settings",
+                        "settings",
+                        move |_, _, app| {
+                            mirror_settings_entity.update(app, |m, cx| {
+                                m.set_active_panel(Panel::Settings);
+                                cx.notify();
+                            });
+                        },
+                        cx,
+                    ))
+                    .child(mirror_chip_icon(
+                        "mirror-refresh",
+                        "refresh",
+                        move |_, _, app| {
+                            mirror_refresh_entity.update(app, |m, cx| {
+                                m.send_refresh_ping();
+                                cx.notify();
+                            });
+                        },
+                        cx,
+                    )),
             )
             // Stream-info pill — bottom-left.
             .child(
                 div()
                     .absolute()
-                    .bottom(px(20.0))
-                    .left(px(20.0))
+                    .bottom(px(MIRROR_CHROME_OFFSET))
+                    .left(px(MIRROR_CHROME_OFFSET))
                     .opacity(chrome_opacity)
                     .flex()
                     .flex_row()
@@ -1217,9 +1415,9 @@ impl AppModel {
                     .px(px(spacing.lg))
                     .py(px(6.0))
                     .rounded(px(radii.pill))
-                    .bg(backdrop_blur(16.0, hsla(0.0, 0.0, 0.0, 0.25)))
+                    .bg(backdrop_blur(16.0, mirror_glass_fill()))
                     .border_1()
-                    .border_color(hsla(0.0, 0.0, 1.0, 0.08))
+                    .border_color(mirror_glass_stroke())
                     .text_color(gpui::white())
                     .text_size(px(typography.caption.size))
                     .child(
@@ -1273,7 +1471,7 @@ impl AppModel {
         let last_error = self.status.last_error.clone();
         let qr_data = self.qr_data.clone();
         let qr_id = self.qr_texture;
-        let qr_side = px(208.0);
+        let qr_side = px(PAIR_QR_SIDE);
         let qr_native = self.qr_size;
         let countdown = pair_countdown_label(self.qr_expires_at_ms);
         let copy_icon = if self
@@ -1417,7 +1615,7 @@ impl AppModel {
             );
 
         let right = div()
-            .w(px(280.0))
+            .w(px(PAIR_CODE_CARD_WIDTH))
             .flex()
             .flex_col()
             .gap(px(spacing.xl))
@@ -1490,7 +1688,7 @@ impl AppModel {
             && let Some(banner) = permission_banner(
                 status,
                 "Device status mirroring is unavailable.",
-                onboarding_action(),
+                onboarding_action(entity.clone()),
                 cx,
             )
         {
@@ -1539,7 +1737,7 @@ impl AppModel {
         let mut grid = div().flex().flex_col().gap(px(spacing.xl));
 
         if let Some(media) = media_info {
-            grid = grid.child(now_playing_card(&media, cx));
+            grid = grid.child(now_playing_card(&media, entity.clone(), cx));
         }
 
         let mut row1 = div().flex().flex_row().gap(px(spacing.xl));
@@ -1771,7 +1969,7 @@ impl AppModel {
                     .border_color(colors.stroke_neutral_subtle)
                     .child(
                         div()
-                            .w(px(208.0 * (p as f32) / 100.0))
+                            .w(px(PAIR_QR_SIDE * (p as f32) / 100.0))
                             .h_full()
                             .rounded(px(6.0))
                             .bg(if p > 20 {
@@ -1898,6 +2096,7 @@ impl AppModel {
                     .border_color(colors.stroke_neutral_subtle)
                     .text_color(colors.on_subtle)
                     .text_size(px(typography.caption.size))
+                    .tabular_nums()
                     .child(format!("{count}")),
             )
             .child(div().flex_1())
@@ -1938,7 +2137,7 @@ impl AppModel {
             && let Some(banner) = permission_banner(
                 status,
                 "Enable Notification access on the phone to see alerts here.",
-                onboarding_action(),
+                onboarding_action(entity.clone()),
                 cx,
             )
         {
@@ -1973,252 +2172,256 @@ impl AppModel {
                 items.into_iter().partition(|(_, notif)| {
                     now_ms.saturating_sub(notif.timestamp_unix_ms) <= 30 * 60 * 1000
                 });
-            for (group_label, group_items) in
-                [("Now", now_items), ("Earlier", earlier_items)]
-            {
+            for (group_label, group_items) in [("Now", now_items), ("Earlier", earlier_items)] {
                 if group_items.is_empty() {
                     continue;
                 }
                 body = body.child(Label::eyebrow(group_label));
                 for (id, notif) in group_items {
-                let suppressed = self.notifications.is_suppressed(&notif.app_package);
-                let hide = self.notifications.hide_sensitive && notif.sensitive;
-                let app_package = notif.app_package.clone();
-                let notif_id = notif.notification_id.clone();
-                let meta_time = relative_timestamp(notif.timestamp_unix_ms);
+                    let suppressed = self.notifications.is_suppressed(&notif.app_package);
+                    let hide = self.notifications.hide_sensitive && notif.sensitive;
+                    let app_package = notif.app_package.clone();
+                    let notif_id = notif.notification_id.clone();
+                    let meta_time = relative_timestamp(notif.timestamp_unix_ms);
 
-                let mut meta = div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(6.0))
-                    .text_size(px(typography.caption.size))
-                    .text_color(colors.on_subtle)
-                    .child(
-                        div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(notif.app_name.clone()),
-                    )
-                    .child(div().child("·"))
-                    .child(div().child(meta_time));
-                if hide {
-                    meta = meta.child(
-                        div()
-                            .px(px(6.0))
-                            .py(px(1.0))
-                            .rounded(px(radii.pill))
-                            .bg(colors.status_warning_bg)
-                            .text_color(colors.status_warning)
-                            .text_size(px(10.0))
-                            .child("sensitive"),
-                    );
-                }
-                if suppressed {
-                    meta = meta.child(
-                        div()
-                            .px(px(6.0))
-                            .py(px(1.0))
-                            .rounded(px(radii.pill))
-                            .bg(colors.neutral)
-                            .text_color(colors.on_subtle_disabled)
-                            .text_size(px(10.0))
-                            .child("muted"),
-                    );
-                }
-
-                let title_text = if hide {
-                    "Content hidden".to_owned()
-                } else {
-                    notif.title.clone().unwrap_or_default()
-                };
-
-                let mut body_col = div().flex_1().flex().flex_col().gap(px(3.0)).child(meta);
-                if !title_text.is_empty() {
-                    body_col = body_col.child(
-                        div()
-                            .text_color(colors.on_neutral)
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_size(px(typography.body.size))
-                            .child(title_text),
-                    );
-                }
-                if let Some(text) = &notif.text
-                    && !hide
-                    && !text.is_empty()
-                {
-                    body_col = body_col.child(
-                        div()
-                            .text_color(colors.on_subtle)
-                            .text_size(px(typography.body.size))
-                            .child(text.clone()),
-                    );
-                }
-
-                // Action buttons
-                if !notif.actions.is_empty() && !hide {
-                    let mut actions_row = div()
-                        .mt(px(spacing.sm))
+                    let mut meta = div()
                         .flex()
                         .flex_row()
-                        .gap(px(spacing.sm));
-                    for action in &notif.actions {
-                        let nid = notif_id.clone();
-                        let aid = action.action_id.clone();
-                        let title = action.title.clone();
-                        let allows_reply = action.allows_reply;
-                        let e2 = entity.clone();
-                        actions_row = actions_row.child(
-                            Button::new(SharedString::from(format!("action-{nid}-{aid}")))
-                                .label(title)
-                                .appearance(ButtonAppearance::Subtle)
-                                .size(ButtonSize::Compact)
-                                .on_click(move |_: &ClickEvent, _, app: &mut App| {
-                                    let nid2 = nid.clone();
-                                    let aid2 = aid.clone();
-                                    e2.update(app, |m, cx| {
-                                        if allows_reply {
-                                            let key = (nid2.clone(), aid2.clone());
-                                            if m.quick_reply.open_on.as_ref() == Some(&key) {
-                                                m.quick_reply.open_on = None;
-                                            } else {
-                                                m.quick_reply.open_on = Some(key);
-                                                m.quick_reply_input.update(cx, |t, cx| {
-                                                    t.set_value("", cx);
-                                                });
-                                            }
-                                            cx.notify();
-                                            return;
-                                        }
-                                        m.send_utility(Payload::NotificationAction(
-                                            androidconnect_protocol::NotificationAction {
-                                                notification_id: nid2,
-                                                action_id: aid2,
-                                                reply_text: None,
-                                            },
-                                        ));
-                                        cx.notify();
-                                    });
-                                }),
+                        .items_center()
+                        .gap(px(6.0))
+                        .text_size(px(typography.caption.size))
+                        .text_color(colors.on_subtle)
+                        .child(
+                            div()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(notif.app_name.clone()),
+                        )
+                        .child(div().child("·"))
+                        .child(div().child(meta_time));
+                    if hide {
+                        meta = meta.child(
+                            div()
+                                .px(px(6.0))
+                                .py(px(1.0))
+                                .rounded(px(radii.pill))
+                                .bg(colors.status_warning_bg)
+                                .text_color(colors.status_warning)
+                                .text_size(px(10.0))
+                                .child("sensitive"),
                         );
                     }
-                    body_col = body_col.child(actions_row);
+                    if suppressed {
+                        meta = meta.child(
+                            div()
+                                .px(px(6.0))
+                                .py(px(1.0))
+                                .rounded(px(radii.pill))
+                                .bg(colors.neutral)
+                                .text_color(colors.on_subtle_disabled)
+                                .text_size(px(10.0))
+                                .child("muted"),
+                        );
+                    }
 
-                    if let Some((open_nid, open_aid)) = &self.quick_reply.open_on
-                        && *open_nid == notif.notification_id
-                    {
-                        let nid_send = notif.notification_id.clone();
-                        let aid_send = open_aid.clone();
-                        let e_send = entity.clone();
+                    let title_text = if hide {
+                        "Content hidden".to_owned()
+                    } else {
+                        notif.title.clone().unwrap_or_default()
+                    };
+
+                    let mut body_col = div().flex_1().flex().flex_col().gap(px(3.0)).child(meta);
+                    if !title_text.is_empty() {
                         body_col = body_col.child(
                             div()
-                                .mt(px(spacing.sm))
-                                .flex()
-                                .flex_row()
-                                .gap(px(spacing.sm))
-                                .items_center()
-                                .child(div().flex_1().child(self.quick_reply_input.clone()))
-                                .child(
-                                    Button::new(SharedString::from(format!("qr-send-{nid_send}")))
-                                        .label("Send")
-                                        .appearance(ButtonAppearance::Accent)
-                                        .size(ButtonSize::Compact)
-                                        .on_click(move |_: &ClickEvent, _, app: &mut App| {
-                                            let nid = nid_send.clone();
-                                            let aid = aid_send.clone();
-                                            e_send.update(app, |m, cx| {
-                                                let text =
-                                                    m.quick_reply_input.read(cx).text().to_string();
-                                                if text.trim().is_empty() {
-                                                    return;
+                                .text_color(colors.on_neutral)
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_size(px(typography.body.size))
+                                .child(title_text),
+                        );
+                    }
+                    if let Some(text) = &notif.text
+                        && !hide
+                        && !text.is_empty()
+                    {
+                        body_col = body_col.child(
+                            div()
+                                .text_color(colors.on_subtle)
+                                .text_size(px(typography.body.size))
+                                .child(text.clone()),
+                        );
+                    }
+
+                    // Action buttons
+                    if !notif.actions.is_empty() && !hide {
+                        let mut actions_row = div()
+                            .mt(px(spacing.sm))
+                            .flex()
+                            .flex_row()
+                            .gap(px(spacing.sm));
+                        for action in &notif.actions {
+                            let nid = notif_id.clone();
+                            let aid = action.action_id.clone();
+                            let title = action.title.clone();
+                            let allows_reply = action.allows_reply;
+                            let e2 = entity.clone();
+                            actions_row = actions_row.child(
+                                Button::new(SharedString::from(format!("action-{nid}-{aid}")))
+                                    .label(title)
+                                    .appearance(ButtonAppearance::Subtle)
+                                    .size(ButtonSize::Compact)
+                                    .on_click(move |_: &ClickEvent, _, app: &mut App| {
+                                        let nid2 = nid.clone();
+                                        let aid2 = aid.clone();
+                                        e2.update(app, |m, cx| {
+                                            if allows_reply {
+                                                let key = (nid2.clone(), aid2.clone());
+                                                if m.quick_reply.open_on.as_ref() == Some(&key) {
+                                                    m.quick_reply.open_on = None;
+                                                } else {
+                                                    m.quick_reply.open_on = Some(key);
+                                                    m.quick_reply_input.update(cx, |t, cx| {
+                                                        t.set_value("", cx);
+                                                    });
                                                 }
-                                                m.send_utility(Payload::NotificationAction(
+                                                cx.notify();
+                                                return;
+                                            }
+                                            m.send_utility(Payload::NotificationAction(
+                                                androidconnect_protocol::NotificationAction {
+                                                    notification_id: nid2,
+                                                    action_id: aid2,
+                                                    reply_text: None,
+                                                },
+                                            ));
+                                            cx.notify();
+                                        });
+                                    }),
+                            );
+                        }
+                        body_col = body_col.child(actions_row);
+
+                        if let Some((open_nid, open_aid)) = &self.quick_reply.open_on
+                            && *open_nid == notif.notification_id
+                        {
+                            let nid_send = notif.notification_id.clone();
+                            let aid_send = open_aid.clone();
+                            let e_send = entity.clone();
+                            body_col =
+                                body_col.child(
+                                    div()
+                                        .mt(px(spacing.sm))
+                                        .flex()
+                                        .flex_row()
+                                        .gap(px(spacing.sm))
+                                        .items_center()
+                                        .child(div().flex_1().child(self.quick_reply_input.clone()))
+                                        .child(
+                                            Button::new(SharedString::from(format!(
+                                                "qr-send-{nid_send}"
+                                            )))
+                                            .label("Send")
+                                            .appearance(ButtonAppearance::Accent)
+                                            .size(ButtonSize::Compact)
+                                            .on_click(move |_: &ClickEvent, _, app: &mut App| {
+                                                let nid = nid_send.clone();
+                                                let aid = aid_send.clone();
+                                                e_send.update(app, |m, cx| {
+                                                    let text = m
+                                                        .quick_reply_input
+                                                        .read(cx)
+                                                        .text()
+                                                        .to_string();
+                                                    if text.trim().is_empty() {
+                                                        return;
+                                                    }
+                                                    m.send_utility(Payload::NotificationAction(
                                                     androidconnect_protocol::NotificationAction {
                                                         notification_id: nid,
                                                         action_id: aid,
                                                         reply_text: Some(text),
                                                     },
                                                 ));
-                                                m.quick_reply.open_on = None;
-                                                m.quick_reply_input.update(cx, |t, cx| {
-                                                    t.set_value("", cx);
+                                                    m.quick_reply.open_on = None;
+                                                    m.quick_reply_input.update(cx, |t, cx| {
+                                                        t.set_value("", cx);
+                                                    });
+                                                    cx.notify();
                                                 });
-                                                cx.notify();
-                                            });
-                                        }),
-                                ),
-                        );
+                                            }),
+                                        ),
+                                );
+                        }
                     }
-                }
 
-                let pkg_for_mute = app_package.clone();
-                let e_mute = entity.clone();
-                let nid_for_dismiss = notif_id.clone();
-                let e_dismiss = entity.clone();
+                    let pkg_for_mute = app_package.clone();
+                    let e_mute = entity.clone();
+                    let nid_for_dismiss = notif_id.clone();
+                    let e_dismiss = entity.clone();
 
-                let actions_col = div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(spacing.sm))
-                    .child(
-                        Button::new(SharedString::from(format!("notif-mute-{}", id)))
-                            .label(if suppressed { "Unmute" } else { "Mute" })
-                            .appearance(ButtonAppearance::Subtle)
-                            .size(ButtonSize::Compact)
-                            .on_click(move |_, _, app| {
-                                let pkg = pkg_for_mute.clone();
-                                e_mute.update(app, |m, cx| {
-                                    let enabled = m.notifications.is_suppressed(&pkg);
-                                    m.notifications.toggle_suppress(&pkg);
-                                    m.send_utility(Payload::NotificationFilterUpdate(
-                                        androidconnect_protocol::NotificationFilterUpdate {
-                                            package_name: pkg,
-                                            enabled,
-                                        },
-                                    ));
-                                    cx.notify();
-                                });
-                            }),
-                    )
-                    .child(
-                        Button::new(SharedString::from(format!("notif-close-{}", id)))
-                            .label("✕")
-                            .appearance(ButtonAppearance::Subtle)
-                            .size(ButtonSize::Compact)
-                            .on_click(move |_, _, app| {
-                                let nid = nid_for_dismiss.clone();
-                                e_dismiss.update(app, |m, cx| {
-                                    m.notifications.removed(
-                                        androidconnect_protocol::NotificationRemoved {
-                                            notification_id: nid,
-                                        },
-                                    );
-                                    cx.notify();
-                                });
-                            }),
+                    let actions_col = div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(spacing.sm))
+                        .child(
+                            Button::new(SharedString::from(format!("notif-mute-{}", id)))
+                                .label(if suppressed { "Unmute" } else { "Mute" })
+                                .appearance(ButtonAppearance::Subtle)
+                                .size(ButtonSize::Compact)
+                                .on_click(move |_, _, app| {
+                                    let pkg = pkg_for_mute.clone();
+                                    e_mute.update(app, |m, cx| {
+                                        let enabled = m.notifications.is_suppressed(&pkg);
+                                        m.notifications.toggle_suppress(&pkg);
+                                        m.send_utility(Payload::NotificationFilterUpdate(
+                                            androidconnect_protocol::NotificationFilterUpdate {
+                                                package_name: pkg,
+                                                enabled,
+                                            },
+                                        ));
+                                        cx.notify();
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("notif-close-{}", id)))
+                                .label("✕")
+                                .appearance(ButtonAppearance::Subtle)
+                                .size(ButtonSize::Compact)
+                                .on_click(move |_, _, app| {
+                                    let nid = nid_for_dismiss.clone();
+                                    e_dismiss.update(app, |m, cx| {
+                                        m.notifications.removed(
+                                            androidconnect_protocol::NotificationRemoved {
+                                                notification_id: nid,
+                                            },
+                                        );
+                                        cx.notify();
+                                    });
+                                }),
+                        );
+
+                    let hover_bg = colors.neutral_hover;
+                    let card = Card::new().padding(0.0).child(
+                        div()
+                            .id(SharedString::from(format!("notif-card-{id}")))
+                            .flex()
+                            .flex_row()
+                            .gap(px(spacing.lg))
+                            .items_start()
+                            .p(px(spacing.lg))
+                            .rounded(px(radii.md))
+                            .hover(move |s| s.bg(hover_bg))
+                            .child(
+                                AppDot::new(notif.app_name.clone())
+                                    .hue(brand_hue(&notif.app_package, &notif.app_name))
+                                    .size(28.0),
+                            )
+                            .child(body_col)
+                            .child(actions_col),
                     );
 
-                let hover_bg = colors.neutral_hover;
-                let card = Card::new().padding(0.0).child(
-                    div()
-                        .id(SharedString::from(format!("notif-card-{id}")))
-                        .flex()
-                        .flex_row()
-                        .gap(px(spacing.lg))
-                        .items_start()
-                        .p(px(spacing.lg))
-                        .rounded(px(radii.md))
-                        .hover(move |s| s.bg(hover_bg))
-                        .child(
-                            AppDot::new(notif.app_name.clone())
-                                .hue(brand_hue(&notif.app_package, &notif.app_name))
-                                .size(28.0),
-                        )
-                        .child(body_col)
-                        .child(actions_col),
-                );
-
-                body = body.child(card);
-            }
+                    body = body.child(card);
+                }
             }
         }
 
@@ -2264,10 +2467,12 @@ impl AppModel {
             .get(&self.files_state.current_path)
             .cloned();
         let selected_entry = response.as_ref().and_then(|resp| {
-            self.files_state
-                .selected_path
-                .as_ref()
-                .and_then(|path| resp.entries.iter().find(|entry| &entry.path == path).cloned())
+            self.files_state.selected_path.as_ref().and_then(|path| {
+                resp.entries
+                    .iter()
+                    .find(|entry| &entry.path == path)
+                    .cloned()
+            })
         });
 
         let e_refresh = entity.clone();
@@ -2471,7 +2676,7 @@ impl AppModel {
             if let Some(banner) = permission_banner(
                 &resp.status,
                 "Cannot browse this folder.",
-                onboarding_action(),
+                onboarding_action(entity.clone()),
                 cx,
             ) {
                 body = body.child(banner);
@@ -2514,8 +2719,8 @@ impl AppModel {
                             .id(SharedString::from(format!("file-tile-{entry_path}")))
                             .flex()
                             .flex_col()
-                            .flex_basis(px(140.0))
-                            .max_w(px(180.0))
+                            .flex_basis(px(FILE_TILE_WIDTH))
+                            .max_w(px(FILE_TILE_MAX_WIDTH))
                             .gap(px(spacing.md))
                             .p(px(spacing.lg))
                             .rounded(px(radii.md))
@@ -2563,7 +2768,7 @@ impl AppModel {
                             .child(
                                 div()
                                     .text_color(colors.on_neutral)
-                                    .text_size(px(12.0))
+                                    .text_size(px(typography.caption.size))
                                     .overflow_hidden()
                                     .child(truncate(&entry_name, 18)),
                             )
@@ -2601,67 +2806,65 @@ impl AppModel {
                     };
 
                     let mut row = div()
-                    .id(SharedString::from(format!("fentry-{entry_path}")))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(10.0))
-                    .px(px(spacing.lg))
-                    .py(px(6.0))
-                    .rounded(px(radii.md))
-                    .cursor_pointer()
-                    .bg(row_bg)
-                    .hover(move |s| s.bg(colors.subtle_hover))
-                    .on_click(move |_, _, app| {
-                        let p = entry_path.clone();
-                        e_nav.update(app, |m, cx| {
-                            let now = Instant::now();
-                            let is_dir = matches!(entry_type, FileEntryType::Directory);
-                            let is_double = m.files_state.last_click_path.as_deref()
-                                == Some(p.as_str())
-                                && m.files_state.last_click_time.is_some_and(|last| {
-                                    now.duration_since(last) <= Duration::from_millis(350)
-                                });
-                            m.files_state.last_click_path = Some(p.clone());
-                            m.files_state.last_click_time = Some(now);
-                            m.files_state.selected_path = Some(p.clone());
-                            if is_double {
-                                if is_dir {
-                                    let payload = m.files_state.navigate_to(p);
-                                    m.send_utility(payload);
-                                } else {
-                                    m.request_download(p);
+                        .id(SharedString::from(format!("fentry-{entry_path}")))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(10.0))
+                        .px(px(spacing.lg))
+                        .py(px(6.0))
+                        .rounded(px(radii.md))
+                        .cursor_pointer()
+                        .bg(row_bg)
+                        .hover(move |s| s.bg(colors.subtle_hover))
+                        .on_click(move |_, _, app| {
+                            let p = entry_path.clone();
+                            e_nav.update(app, |m, cx| {
+                                let now = Instant::now();
+                                let is_dir = matches!(entry_type, FileEntryType::Directory);
+                                let is_double = m.files_state.last_click_path.as_deref()
+                                    == Some(p.as_str())
+                                    && m.files_state.last_click_time.is_some_and(|last| {
+                                        now.duration_since(last) <= Duration::from_millis(350)
+                                    });
+                                m.files_state.last_click_path = Some(p.clone());
+                                m.files_state.last_click_time = Some(now);
+                                m.files_state.selected_path = Some(p.clone());
+                                if is_double {
+                                    if is_dir {
+                                        let payload = m.files_state.navigate_to(p);
+                                        m.send_utility(payload);
+                                    } else {
+                                        m.request_download(p);
+                                    }
                                 }
-                            }
-                            cx.notify();
-                        });
-                    })
-                    .child(
-                        div()
-                            .text_color(icon_color)
-                            .child(Icon::new(icon).size(IconSize::Sm)),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_color(colors.on_neutral)
-                            .font_weight(
-                                if matches!(entry_type, FileEntryType::Directory) {
+                                cx.notify();
+                            });
+                        })
+                        .child(
+                            div()
+                                .text_color(icon_color)
+                                .child(Icon::new(icon).size(IconSize::Sm)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_color(colors.on_neutral)
+                                .font_weight(if matches!(entry_type, FileEntryType::Directory) {
                                     FontWeight::SEMIBOLD
                                 } else {
                                     FontWeight::NORMAL
-                                },
-                            )
-                            .text_size(px(typography.body.size))
-                            .child(entry_name),
-                    )
-                    .child(
-                        div()
-                            .w(px(80.0))
-                            .text_color(colors.on_subtle)
-                            .text_size(px(typography.caption.size))
-                            .child(size_label),
-                    );
+                                })
+                                .text_size(px(typography.body.size))
+                                .child(entry_name),
+                        )
+                        .child(
+                            div()
+                                .w(px(80.0))
+                                .text_color(colors.on_subtle)
+                                .text_size(px(typography.caption.size))
+                                .child(size_label),
+                        );
 
                     if !matches!(entry_type, FileEntryType::Directory) {
                         row = row.child(
@@ -2680,38 +2883,38 @@ impl AppModel {
                     }
 
                     row = row
-                    .child(
-                        Button::new(SharedString::from(format!("rn-{}", entry.path)))
-                            .label("Rename")
-                            .appearance(ButtonAppearance::Subtle)
-                            .size(ButtonSize::Compact)
-                            .on_click(move |_, _, app| {
-                                let path = e_path_rename.clone();
-                                let name = e_name_rename.clone();
-                                e_rename.update(app, |m, cx| {
-                                    m.file_action = FileActionDialog {
-                                        kind: Some(FileActionKind::Rename),
-                                        target_path: Some(path),
-                                    };
-                                    m.file_action_input.update(cx, |t, cx| {
-                                        t.set_value(name, cx);
-                                        t.set_placeholder("New name");
+                        .child(
+                            Button::new(SharedString::from(format!("rn-{}", entry.path)))
+                                .label("Rename")
+                                .appearance(ButtonAppearance::Subtle)
+                                .size(ButtonSize::Compact)
+                                .on_click(move |_, _, app| {
+                                    let path = e_path_rename.clone();
+                                    let name = e_name_rename.clone();
+                                    e_rename.update(app, |m, cx| {
+                                        m.file_action = FileActionDialog {
+                                            kind: Some(FileActionKind::Rename),
+                                            target_path: Some(path),
+                                        };
+                                        m.file_action_input.update(cx, |t, cx| {
+                                            t.set_value(name, cx);
+                                            t.set_placeholder("New name");
+                                            cx.notify();
+                                        });
                                         cx.notify();
                                     });
-                                    cx.notify();
-                                });
-                            }),
-                    )
-                    .child(
-                        Button::new(SharedString::from(format!("del-{}", entry.path)))
-                            .label("Delete")
-                            .appearance(ButtonAppearance::Subtle)
-                            .size(ButtonSize::Compact)
-                            .on_click(move |_, _, app| {
-                                let path = e_path_del.clone();
-                                e_del.update(app, |m, cx| {
-                                    let parent_path = m.files_state.current_path.clone();
-                                    m.send_utility(Payload::FileMutation(
+                                }),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("del-{}", entry.path)))
+                                .label("Delete")
+                                .appearance(ButtonAppearance::Subtle)
+                                .size(ButtonSize::Compact)
+                                .on_click(move |_, _, app| {
+                                    let path = e_path_del.clone();
+                                    e_del.update(app, |m, cx| {
+                                        let parent_path = m.files_state.current_path.clone();
+                                        m.send_utility(Payload::FileMutation(
                                         androidconnect_protocol::FileMutation {
                                             request_id: format!("mut-{}", new_request_token()),
                                             mutation:
@@ -2720,12 +2923,12 @@ impl AppModel {
                                             new_path: None,
                                         },
                                     ));
-                                    let refresh = m.files_state.request_browse(parent_path);
-                                    m.send_utility(refresh);
-                                    cx.notify();
-                                });
-                            }),
-                    );
+                                        let refresh = m.files_state.request_browse(parent_path);
+                                        m.send_utility(refresh);
+                                        cx.notify();
+                                    });
+                                }),
+                        );
 
                     body = body.child(row);
                 }
@@ -2826,7 +3029,7 @@ impl AppModel {
             && let Some(banner) = permission_banner(
                 status,
                 "SMS access required — enable in onboarding.",
-                onboarding_action(),
+                onboarding_action(entity.clone()),
                 cx,
             )
         {
@@ -2865,6 +3068,7 @@ impl AppModel {
                         .text_color(colors.on_accent)
                         .text_size(px(10.0))
                         .font_weight(FontWeight::BOLD)
+                        .tabular_nums()
                         .child(format!("{}", thread.unread_count))
                         .into_any_element()
                 } else {
@@ -3022,8 +3226,12 @@ impl AppModel {
                 .py(px(spacing.xl));
 
             if let Some(status) = detail_status
-                && let Some(banner) =
-                    permission_banner(&status, "Cannot read this thread.", onboarding_action(), cx)
+                && let Some(banner) = permission_banner(
+                    &status,
+                    "Cannot read this thread.",
+                    onboarding_action(entity.clone()),
+                    cx,
+                )
             {
                 history = history.child(banner);
             }
@@ -3045,9 +3253,9 @@ impl AppModel {
             } else {
                 let mut last_ts = None;
                 for entry in &messages {
-                    if last_ts.is_none_or(|prev| {
-                        entry.timestamp_unix_ms.abs_diff(prev) > 30 * 60 * 1000
-                    }) {
+                    if last_ts
+                        .is_none_or(|prev| entry.timestamp_unix_ms.abs_diff(prev) > 30 * 60 * 1000)
+                    {
                         history = history.child(
                             div()
                                 .flex()
@@ -3189,7 +3397,7 @@ impl Render for AppModel {
         }
 
         // Refresh QR when on pair screen
-        if !connected {
+        if !connected || self.pairing_requested {
             self.refresh_pair_qr(window);
         }
 
@@ -3197,15 +3405,19 @@ impl Render for AppModel {
         let sidebar = self.render_sidebar(cx);
         let status_bar = self.render_status_bar(cx);
 
-        let content = match self.active_panel {
-            Panel::Mirror => self.render_mirror_panel(cx).into_any_element(),
-            Panel::Settings => self.render_settings_panel(cx).into_any_element(),
-            _ if !connected => self.render_pair_panel(cx).into_any_element(),
-            Panel::Overview => self.render_overview_panel(cx).into_any_element(),
-            Panel::Notifications => self.render_notifications_panel(cx).into_any_element(),
-            Panel::Messages => self.render_messages_panel(cx).into_any_element(),
-            Panel::Files => self.render_files_panel(cx).into_any_element(),
-            Panel::Phone => self.render_phone_panel(cx).into_any_element(),
+        let content = if self.pairing_requested {
+            self.render_pair_panel(cx).into_any_element()
+        } else {
+            match self.active_panel {
+                Panel::Mirror => self.render_mirror_panel(cx).into_any_element(),
+                Panel::Settings => self.render_settings_panel(cx).into_any_element(),
+                _ if !connected => self.render_pair_panel(cx).into_any_element(),
+                Panel::Overview => self.render_overview_panel(cx).into_any_element(),
+                Panel::Notifications => self.render_notifications_panel(cx).into_any_element(),
+                Panel::Messages => self.render_messages_panel(cx).into_any_element(),
+                Panel::Files => self.render_files_panel(cx).into_any_element(),
+                Panel::Phone => self.render_phone_panel(cx).into_any_element(),
+            }
         };
 
         div()
@@ -3239,7 +3451,7 @@ fn local_pos(pos: Point<Pixels>, bounds: Bounds<Pixels>) -> (f64, f64) {
 
 fn mirror_chrome_opacity(last_move: Option<Instant>) -> f32 {
     let Some(last_move) = last_move else {
-        return 1.0;
+        return 0.0;
     };
     let elapsed = last_move.elapsed();
     if elapsed < Duration::from_secs(3) {
@@ -3438,6 +3650,7 @@ fn action_icon_button(
 fn mirror_chip_icon(
     id: &'static str,
     icon_name: &'static str,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     _cx: &Context<AppModel>,
 ) -> impl IntoElement {
     div()
@@ -3449,8 +3662,23 @@ fn mirror_chip_icon(
         .rounded(px(6.0))
         .text_color(gpui::white())
         .cursor_pointer()
-        .hover(|s| s.bg(hsla(0.0, 0.0, 1.0, 0.12)))
+        .hover(|s| s.bg(mirror_chip_hover_fill()))
+        .on_click(on_click)
         .child(Icon::new(icon_name).size(IconSize::Sm))
+}
+
+// Mirror glass uses literal alpha overlays because backdrop blur chips sit
+// over video frames rather than themed app surfaces.
+fn mirror_glass_fill() -> Hsla {
+    hsla(0.0, 0.0, 0.0, 0.25)
+}
+
+fn mirror_glass_stroke() -> Hsla {
+    hsla(0.0, 0.0, 1.0, 0.08)
+}
+
+fn mirror_chip_hover_fill() -> Hsla {
+    hsla(0.0, 0.0, 1.0, 0.12)
 }
 
 fn stat_chip(icon_name: &'static str, value: &str, cx: &Context<AppModel>) -> impl IntoElement {
@@ -3534,7 +3762,10 @@ fn files_breadcrumb(
     );
 
     let mut prefix = String::new();
-    for segment in current_path.split('/').filter(|segment| !segment.is_empty()) {
+    for segment in current_path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+    {
         prefix.push('/');
         prefix.push_str(segment);
         let target = prefix.clone();
@@ -3586,7 +3817,11 @@ fn files_selection_footer(entry: &FileEntry, cx: &Context<AppModel>) -> impl Int
         .items_center()
         .gap(px(spacing.sm))
         .text_size(px(typography.caption.size))
-        .child(div().text_color(icon_color).child(Icon::new(icon).size(IconSize::Sm)))
+        .child(
+            div()
+                .text_color(icon_color)
+                .child(Icon::new(icon).size(IconSize::Sm)),
+        )
         .child(
             div()
                 .text_color(colors.on_neutral)
@@ -3610,6 +3845,7 @@ fn file_icon_name(entry: &FileEntry) -> &'static str {
 }
 
 fn filetype_colour(entry: &FileEntry, colors: &fluent_core::ColorScheme) -> Hsla {
+    // File type hues are illustrative category colors, not app surface tokens.
     match entry.entry_type {
         FileEntryType::Directory => colors.on_neutral_accent,
         FileEntryType::Media if file_is_video(entry) => hsla(350.0 / 360.0, 0.6, 0.55, 1.0),
@@ -3726,8 +3962,16 @@ type BannerAction = (
     Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>,
 );
 
-fn onboarding_action() -> Option<BannerAction> {
-    Some(("Open onboarding".into(), Box::new(|_, _, _| {})))
+fn onboarding_action(entity: Entity<AppModel>) -> Option<BannerAction> {
+    Some((
+        "Show permission steps".into(),
+        Box::new(move |_, _, app| {
+            entity.update(app, |m, cx| {
+                m.show_permission_steps();
+                cx.notify();
+            });
+        }),
+    ))
 }
 
 fn permission_banner(
@@ -3793,7 +4037,7 @@ fn permission_banner(
                 heading.to_ascii_lowercase().replace(' ', "-")
             )))
             .label(label)
-            .appearance(ButtonAppearance::Subtle)
+            .appearance(ButtonAppearance::Accent)
             .size(ButtonSize::Compact)
             .on_click(move |event, window, app| {
                 on_click(event, window, app);
@@ -3854,6 +4098,7 @@ fn mirror_disconnected_panel(
     let colors = cx.theme().colors.clone();
     let typography = cx.theme().typography;
     let spacing = cx.theme().spacing;
+    let radii = cx.theme().radii;
     let pair_entity = entity.clone();
 
     div()
@@ -3873,7 +4118,7 @@ fn mirror_disconnected_panel(
                 .child(
                     div()
                         .size(px(96.0))
-                        .rounded(px(24.0))
+                        .rounded(px(3.0 * radii.lg))
                         .bg(tint(colors.accent, 0.18))
                         .border_1()
                         .border_color(tint(colors.accent, 0.35))
@@ -3898,8 +4143,7 @@ fn mirror_disconnected_panel(
                         .appearance(ButtonAppearance::Accent)
                         .on_click(move |_, _, app| {
                             pair_entity.update(app, |m, cx| {
-                                m.active_panel = Panel::Overview;
-                                m.status.input_authenticated = false;
+                                m.request_pairing();
                                 cx.notify();
                             });
                         }),
@@ -4007,24 +4251,15 @@ fn quick_action(
     let typography = cx.theme().typography;
     let spacing = cx.theme().spacing;
     let radii = cx.theme().radii;
-    div()
+    Card::new()
         .id(id)
         .flex_1()
-        .p(px(14.0))
-        .rounded(px(radii.md))
-        .bg(colors.neutral)
-        .border_1()
-        .border_color(colors.stroke_neutral_subtle)
-        .cursor_pointer()
-        .hover(move |s| {
-            s.bg(colors.neutral_hover)
-                .border_color(colors.stroke_neutral)
-        })
-        .on_click(on_click)
-        .flex()
-        .flex_row()
+        .row()
         .items_center()
-        .gap(px(spacing.lg))
+        .hoverable()
+        .on_click(on_click)
+        .padding(14.0)
+        .gap(spacing.lg)
         .child(
             div()
                 .size(px(36.0))
@@ -4057,7 +4292,11 @@ fn quick_action(
         )
 }
 
-fn storage_card(model: &AppModel, cx: &Context<AppModel>) -> impl IntoElement {
+fn storage_card(
+    model: &AppModel,
+    entity: Entity<AppModel>,
+    cx: &Context<AppModel>,
+) -> impl IntoElement {
     let colors = cx.theme().colors.clone();
     let typography = cx.theme().typography;
     let spacing = cx.theme().spacing;
@@ -4074,7 +4313,7 @@ fn storage_card(model: &AppModel, cx: &Context<AppModel>) -> impl IntoElement {
         if let Some(banner) = permission_banner(
             status,
             "Enable storage access on the phone.",
-            onboarding_action(),
+            onboarding_action(entity),
             cx,
         ) {
             card = card.child(banner);
@@ -4093,7 +4332,11 @@ fn storage_card(model: &AppModel, cx: &Context<AppModel>) -> impl IntoElement {
                     .child(Skeleton::new("storage-used-skel").w(96.0).h(34.0))
                     .child(Skeleton::new("storage-total-skel").w(140.0).h(12.0)),
             )
-            .child(Skeleton::new("storage-bar-skel").h(10.0).rounded(radii.pill))
+            .child(
+                Skeleton::new("storage-bar-skel")
+                    .h(10.0)
+                    .rounded(radii.pill),
+            )
             .child(
                 div()
                     .flex()
@@ -4282,6 +4525,8 @@ fn phone_illustration(cx: &Context<AppModel>) -> impl IntoElement {
     let spacing = cx.theme().spacing;
     let radii = cx.theme().radii;
     let typography = cx.theme().typography;
+    // The phone mock is an illustration; its gradients and highlights are
+    // intentionally literal so they do not shift with neutral app surfaces.
     let phone_bg = linear_gradient(
         145.0,
         linear_color_stop(hsla(250.0 / 360.0, 0.38, 0.30, 1.0), 0.0),
@@ -4304,10 +4549,10 @@ fn phone_illustration(cx: &Context<AppModel>) -> impl IntoElement {
     }
 
     div()
-        .w(px(96.0))
-        .h(px(180.0))
+        .w(px(FAKE_PHONE_WIDTH))
+        .h(px(FAKE_PHONE_HEIGHT))
         .flex_none()
-        .rounded(px(16.0))
+        .rounded(px(2.0 * radii.lg))
         .p(px(spacing.md))
         .bg(phone_bg)
         .border_1()
@@ -4509,7 +4754,37 @@ fn stat_block(label: &str, value: &str, cx: &Context<AppModel>) -> impl IntoElem
         )
 }
 
-fn now_playing_card(media: &crate::status::MediaInfo, cx: &Context<AppModel>) -> impl IntoElement {
+fn media_toggle_action(
+    media: &crate::status::MediaInfo,
+) -> Option<(MediaControlAction, &'static str)> {
+    let supports = |action| media.supported_actions.contains(&action);
+    let is_playing = matches!(
+        media.playback_state,
+        MediaPlaybackState::Playing | MediaPlaybackState::Buffering
+    );
+
+    if is_playing {
+        if supports(MediaControlAction::Pause) {
+            Some((MediaControlAction::Pause, "Pause"))
+        } else if supports(MediaControlAction::PlayPause) {
+            Some((MediaControlAction::PlayPause, "Pause"))
+        } else {
+            None
+        }
+    } else if supports(MediaControlAction::Play) {
+        Some((MediaControlAction::Play, "Play"))
+    } else if supports(MediaControlAction::PlayPause) {
+        Some((MediaControlAction::PlayPause, "Play"))
+    } else {
+        None
+    }
+}
+
+fn now_playing_card(
+    media: &crate::status::MediaInfo,
+    entity: Entity<AppModel>,
+    cx: &Context<AppModel>,
+) -> impl IntoElement {
     let colors = cx.theme().colors.clone();
     let typography = cx.theme().typography;
     let spacing = cx.theme().spacing;
@@ -4517,10 +4792,7 @@ fn now_playing_card(media: &crate::status::MediaInfo, cx: &Context<AppModel>) ->
     let title = media.title.clone().unwrap_or_else(|| "Unknown".to_owned());
     let artist = media.artist.clone().unwrap_or_default();
     let app_name = media.app_name.clone().unwrap_or_default();
-    let is_playing = matches!(
-        media.playback_state,
-        MediaPlaybackState::Playing | MediaPlaybackState::Buffering
-    );
+    let control = media_toggle_action(media);
 
     Card::new().padding(16.0).gap(12.0).child(
         div()
@@ -4560,13 +4832,25 @@ fn now_playing_card(media: &crate::status::MediaInfo, cx: &Context<AppModel>) ->
                             .child(artist),
                     ),
             )
-            .child(
+            .child(if let Some((action, label)) = control {
                 Button::new("now-play")
-                    .label(if is_playing { "⏸" } else { "▶" })
+                    .label(label)
                     .appearance(ButtonAppearance::Accent)
-                    .shape(ButtonShape::Circular)
-                    .on_click(|_, _, _| { /* wired separately on Phone panel */ }),
-            ),
+                    .size(ButtonSize::Compact)
+                    .on_click(move |_, _, app| {
+                        entity.update(app, |m, cx| {
+                            m.send_utility(Payload::MediaControl(MediaControl { action }));
+                            m.activity.push(
+                                ActivityIcon::Send,
+                                format!("Sent media {} command", label.to_ascii_lowercase()),
+                            );
+                            cx.notify();
+                        });
+                    })
+                    .into_any_element()
+            } else {
+                div().into_any_element()
+            }),
     )
 }
 

@@ -10,6 +10,24 @@ and framework follow-ups whose docs overstate the implementation.
 This plan supersedes the old Pass A-D docs for remaining work. Treat the old
 pass docs as historical detail; execute this file top to bottom.
 
+## Completion summary
+
+**Automated close-out completed:** 2026-05-24.
+
+- Desktop interactive gaps were closed: DeviceChip now opens a device popover,
+  permission banners route to visible permission steps, Mirror controls are
+  wired or hidden, and the reviewed no-op sweep is clean.
+- `app.rs` now documents fixed layout dimensions, uses the Card primitive for
+  quick action tiles, keeps token-equivalent literals out of the verified
+  sweep, and documents remaining illustrative/raw color exceptions.
+- FluentGUI backdrop blur comments now describe the actual Blade/WGSL
+  single-pass shared-backdrop implementation.
+- Card, SectionHeader, and Skeleton have builder-state tests.
+- Real GPUI `letter_spacing()` remains deferred as intended in section 3.3;
+  `Label::eyebrow()` remains the short-label workaround.
+- Automated verification passed. Manual paired-device viewer checks still need
+  to be run on a local device or emulator before declaring physical UX parity.
+
 ## Assumptions
 
 - Product target remains the current Linux desktop viewer first. macOS and

@@ -11,10 +11,10 @@ androidconnect-protocol = { path = "../../crates/protocol" }
 anyhow = "1.0.100"
 arboard = { version = "3.4", default-features = false, features = ["wayland-data-control"] }
 env_logger = "0.11"
-fluent-app = { path = "/home/sprooty/Working/Active/apps/FluentGUI/crates/fluent-app" }
-fluent-core = { path = "/home/sprooty/Working/Active/apps/FluentGUI/crates/fluent-core" }
-fluent-primitives = { path = "/home/sprooty/Working/Active/apps/FluentGUI/crates/fluent-primitives" }
-gpui = "0.2.3"
+fluent-app = "2.2.0"
+fluent-core = "2.3.0"
+fluent-primitives = "2.3.0"
+gpui = "0.2"
 log = "0.4"
 openh264 = { version = "0.9", features = ["source"] }
 qrcode = { version = "0.14", default-features = false }
@@ -25,4 +25,4 @@ serde_json = "1.0.145"
 [workspace]
 
 [patch.crates-io]
-gpui = { path = "/home/sprooty/Working/Active/apps/FluentGUI/crates/gpui" }
+gpui = { git = "https://github.com/AusAgentSmith-org/fluent-gpui", rev = "f2ac9130f6e90422304b951fd961806d3b40ec20" }
