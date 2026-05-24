@@ -77,7 +77,7 @@ fn main() -> Result<()> {
     let desktop_name = desktop_identity.desktop_name.clone();
 
     FluentApp::new("AndroidConnect")
-        .window_size(960.0, 720.0)
+        .window_size(1200.0, 800.0)
         .run(move |cx| {
             let model = cx.new(|cx| {
                 AppModel::new(
