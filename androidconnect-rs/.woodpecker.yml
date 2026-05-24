@@ -2,6 +2,18 @@ when:
   - branch: main
     event: [push, pull_request]
 
+clone:
+  git:
+    image: alpine/git
+    environment:
+      GIT_AUTH_TOKEN:
+        from_secret: git_auth_token
+    commands:
+      - git init
+      - git remote add origin "https://git:$GIT_AUTH_TOKEN@repo.indexarr.net/indexarr/androidconnect-rs.git"
+      - git fetch --no-tags --depth=1 origin "$CI_COMMIT_SHA"
+      - git checkout FETCH_HEAD
+
 steps:
   - name: rust-checks
     image: rust:1.88
