@@ -94,6 +94,10 @@ impl MessagesState {
 
     pub fn open_thread(&mut self, thread_id: String) -> Option<Payload> {
         self.active_thread = Some(thread_id.clone());
+        // Clear unread count locally so the badge disappears immediately on open.
+        if let Some(thread) = self.threads.iter_mut().find(|t| t.thread_id == thread_id) {
+            thread.unread_count = 0;
+        }
         if self.pending_thread_open.contains_key(&thread_id) {
             return None;
         }

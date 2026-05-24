@@ -96,6 +96,7 @@ pub struct AppModel {
     messages_state: MessagesState,
     activity: ActivityLog,
     logged_initial_pair: bool,
+    reconnecting: bool,
 
     // Per-panel text inputs (FluentGUI TextInputs are Entities and must be pre-created)
     sms_composer: Entity<TextInput>,
@@ -141,7 +142,7 @@ impl AppModel {
         let status = DesktopStatus::new(bind, pairing_code);
         let pair_addresses = advertised_pair_addresses(&status.bind);
         let mut files_state = FilesState::default();
-        files_state.current_path = "/".to_owned();
+        files_state.current_path = "/sdcard".to_owned();
         let sms_composer = cx.new(|_| TextInput::new().placeholder("Type a message…"));
         let quick_reply_input = cx.new(|_| TextInput::new().placeholder("Quick reply…"));
         let file_action_input = cx.new(|_| TextInput::new());
@@ -234,6 +235,7 @@ impl AppModel {
             messages_state: MessagesState::default(),
             activity: ActivityLog::default(),
             logged_initial_pair: false,
+            reconnecting: false,
             sms_composer,
             quick_reply: QuickReplyState::default(),
             quick_reply_input,
@@ -263,16 +265,19 @@ impl AppModel {
             self.pair_addresses = advertised_pair_addresses(&self.status.bind);
             self.qr_cache_key.clear();
         }
-        if !was_authenticated && self.status.input_authenticated && !self.logged_initial_pair {
-            let name = self
-                .status
-                .device_name
-                .clone()
-                .or_else(|| self.status.peer.clone())
-                .unwrap_or_else(|| "device".to_owned());
-            self.activity
-                .push(ActivityIcon::Pair, format!("Paired with {name}"));
-            self.logged_initial_pair = true;
+        if !was_authenticated && self.status.input_authenticated {
+            self.reconnecting = false;
+            if !self.logged_initial_pair {
+                let name = self
+                    .status
+                    .device_name
+                    .clone()
+                    .or_else(|| self.status.peer.clone())
+                    .unwrap_or_else(|| "device".to_owned());
+                self.activity
+                    .push(ActivityIcon::Pair, format!("Paired with {name}"));
+                self.logged_initial_pair = true;
+            }
         }
         cx.notify();
     }
@@ -302,10 +307,11 @@ impl AppModel {
                 }
             }
             network::DesktopEvent::SessionLost => {
+                self.reconnecting = true;
                 self.notifications.clear();
                 self.phone_state = PhoneState::default();
                 self.files_state = FilesState::default();
-                self.files_state.current_path = "/".to_owned();
+                self.files_state.current_path = "/sdcard".to_owned();
                 self.messages_state = MessagesState::default();
                 self.quick_reply = QuickReplyState::default();
                 self.file_action = FileActionDialog::default();
@@ -1671,15 +1677,21 @@ impl AppModel {
         let entity = cx.entity();
 
         if !self.connected() {
+            let (title, body) = if self.reconnecting {
+                (
+                    "Reconnecting…",
+                    "Your phone disconnected. Waiting to reconnect automatically.",
+                )
+            } else {
+                (
+                    "Quick settings & media",
+                    "Pair a device to control volume, Do Not Disturb, Bluetooth, and now-playing media from your desktop.",
+                )
+            };
             return div()
                 .size_full()
                 .bg(colors.surface)
-                .child(disconnected_placeholder(
-                    "phone",
-                    "Quick settings & media",
-                    "Pair a device to control volume, Do Not Disturb, Bluetooth, and now-playing media from your desktop.",
-                    cx,
-                ))
+                .child(disconnected_placeholder("phone", title, body, cx))
                 .into_any_element();
         }
 
@@ -1755,6 +1767,7 @@ impl AppModel {
                             div()
                                 .flex_1()
                                 .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(colors.on_neutral)
                                 .child("Media volume"),
                         )
                         .child(if vol_pending {
@@ -1841,6 +1854,7 @@ impl AppModel {
                             div()
                                 .flex_1()
                                 .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(colors.on_neutral)
                                 .child("Bluetooth"),
                         )
                         .child(if bt_pending {
@@ -1882,6 +1896,7 @@ impl AppModel {
                     div()
                         .flex_1()
                         .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(colors.on_neutral)
                         .child("Do Not Disturb"),
                 )
                 .child(if dnd_pending {
@@ -1943,6 +1958,7 @@ impl AppModel {
                     div()
                         .flex_1()
                         .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(colors.on_neutral)
                         .child("Battery"),
                 )
                 .child(
@@ -2009,6 +2025,7 @@ impl AppModel {
                         div()
                             .flex_1()
                             .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(colors.on_neutral)
                             .child("Wi-Fi"),
                     )
                     .child(div().text_color(colors.on_subtle).child(wifi_label)),
@@ -2024,6 +2041,7 @@ impl AppModel {
                         div()
                             .flex_1()
                             .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(colors.on_neutral)
                             .child("Bluetooth"),
                     )
                     .child(div().text_color(colors.on_subtle).child(bt_label)),
@@ -2062,15 +2080,21 @@ impl AppModel {
         let feature_status = self.status.feature(UtilityFeature::Notifications).cloned();
 
         if !self.connected() {
+            let (title, body) = if self.reconnecting {
+                (
+                    "Reconnecting…",
+                    "Your phone disconnected. Waiting to reconnect automatically.",
+                )
+            } else {
+                (
+                    "Your phone's notifications, here",
+                    "Once paired, alerts from your phone show up here so you can read and reply without picking it up.",
+                )
+            };
             return div()
                 .size_full()
                 .bg(colors.surface)
-                .child(disconnected_placeholder(
-                    "bell",
-                    "Your phone's notifications, here",
-                    "Once paired, alerts from your phone show up here so you can read and reply without picking it up.",
-                    cx,
-                ))
+                .child(disconnected_placeholder("bell", title, body, cx))
                 .into_any_element();
         }
 
@@ -2443,15 +2467,21 @@ impl AppModel {
         let entity = cx.entity();
 
         if !self.connected() {
+            let (title, body) = if self.reconnecting {
+                (
+                    "Reconnecting…",
+                    "Your phone disconnected. Waiting to reconnect automatically.",
+                )
+            } else {
+                (
+                    "Browse your phone's storage",
+                    "Drag and drop files between your phone and PC once paired.",
+                )
+            };
             return div()
                 .size_full()
                 .bg(colors.surface)
-                .child(disconnected_placeholder(
-                    "folder",
-                    "Browse your phone's storage",
-                    "Drag and drop files between your phone and PC once paired.",
-                    cx,
-                ))
+                .child(disconnected_placeholder("folder", title, body, cx))
                 .into_any_element();
         }
 
@@ -2966,19 +2996,46 @@ impl AppModel {
         let entity = cx.entity();
 
         if !self.connected() {
+            let (title, body) = if self.reconnecting {
+                (
+                    "Reconnecting…",
+                    "Your phone disconnected. Waiting to reconnect automatically.",
+                )
+            } else {
+                (
+                    "Your text threads, on your desktop",
+                    "Send and receive SMS / RCS messages through your paired phone.",
+                )
+            };
             return div()
                 .size_full()
                 .bg(colors.surface)
-                .child(disconnected_placeholder(
-                    "chat",
-                    "Your text threads, on your desktop",
-                    "Send and receive SMS / RCS messages through your paired phone.",
-                    cx,
-                ))
+                .child(disconnected_placeholder("chat", title, body, cx))
                 .into_any_element();
         }
 
-        let state = self.messages_state.clone();
+        // Clone only what we need from MessagesState to avoid copying all thread_messages.
+        let threads = self.messages_state.threads.clone();
+        let thread_status = self.messages_state.thread_status.clone();
+        let active_thread = self.messages_state.active_thread.clone();
+        let pending_thread_open = self.messages_state.pending_thread_open.clone();
+        let pending_send = self.messages_state.pending_send.clone();
+        let send_error = self.messages_state.send_error.clone();
+        let messages: Vec<_> = active_thread
+            .as_ref()
+            .and_then(|id| self.messages_state.thread_messages.get(id))
+            .cloned()
+            .unwrap_or_default();
+        let detail_status = active_thread
+            .as_ref()
+            .and_then(|id| self.messages_state.thread_detail_status.get(id))
+            .cloned();
+        let active_display_name = active_thread
+            .as_ref()
+            .and_then(|id| threads.iter().find(|t| &t.thread_id == id))
+            .map(|t| t.display_name.clone())
+            .unwrap_or_else(|| active_thread.clone().unwrap_or_default());
+
         let composer = self.sms_composer.clone();
         let submit_entity = entity.clone();
         self.sms_composer.update(cx, |input, _| {
@@ -3025,7 +3082,7 @@ impl AppModel {
             .p(px(6.0))
             .gap(px(spacing.xs));
 
-        if let Some(status) = &state.thread_status
+        if let Some(status) = &thread_status
             && let Some(banner) = permission_banner(
                 status,
                 "SMS access required — enable in onboarding.",
@@ -3036,11 +3093,20 @@ impl AppModel {
             list = list.child(banner);
         }
 
-        if state.threads.is_empty() && state.thread_status.is_none() {
+        if threads.is_empty() && thread_status.is_none() {
+            list = list.child(
+                div()
+                    .text_color(colors.on_subtle_disabled)
+                    .text_size(px(typography.caption.size))
+                    .italic()
+                    .px(px(spacing.lg))
+                    .py(px(spacing.sm))
+                    .child("Syncing messages from your phone…"),
+            );
             for idx in 0..6 {
                 list = list.child(SkeletonRow::new(format!("msg-thread-loading-{idx}")));
             }
-        } else if state.threads.is_empty() {
+        } else if threads.is_empty() {
             list = list.child(
                 div()
                     .text_color(colors.on_subtle_disabled)
@@ -3050,8 +3116,8 @@ impl AppModel {
                     .child("No threads yet."),
             );
         } else {
-            for thread in &state.threads {
-                let is_active = state.active_thread.as_deref() == Some(thread.thread_id.as_str());
+            for thread in &threads {
+                let is_active = active_thread.as_deref() == Some(thread.thread_id.as_str());
                 let thread_id = thread.thread_id.clone();
                 let e = entity.clone();
                 let snippet = thread
@@ -3149,25 +3215,13 @@ impl AppModel {
         thread_list = thread_list.child(list);
 
         // Right column: active conversation
-        let conversation: gpui::AnyElement = if let Some(active_id) = &state.active_thread {
-            let messages = state
-                .thread_messages
-                .get(active_id)
-                .cloned()
-                .unwrap_or_default();
-            let display_name = state
-                .threads
-                .iter()
-                .find(|t| &t.thread_id == active_id)
-                .map(|t| t.display_name.clone())
-                .unwrap_or_else(|| active_id.clone());
-            let detail_status = state.thread_detail_status.get(active_id).cloned();
-            let pending_load = state.pending_thread_open.contains_key(active_id);
+        let conversation: gpui::AnyElement = if let Some(active_id) = &active_thread {
+            let pending_load = pending_thread_open.contains_key(active_id.as_str());
             let e_send = entity.clone();
             let e_close = entity.clone();
             let composer_for_send = composer.clone();
-            let send_pending = state.pending_send.is_some();
-            let send_error = state.send_error.clone();
+            let send_pending = pending_send.is_some();
+            let display_name = active_display_name.clone();
 
             let mut conv = div().flex_1().h_full().flex().flex_col().bg(colors.surface);
 
