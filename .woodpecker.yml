@@ -2,6 +2,16 @@ when:
   - branch: main
     event: [push, pull_request]
 
+clone:
+  git:
+    image: alpine/git
+    environment:
+      GIT_AUTH_TOKEN:
+        from_secret: forgejo_token
+    commands:
+      - git clone https://sprooty:$GIT_AUTH_TOKEN@repo.indexarr.net/indexarr/androidconnect-rs.git .
+      - git checkout $CI_COMMIT_SHA
+
 steps:
   - name: rust-checks
     image: rust:1.88
