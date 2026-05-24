@@ -7,7 +7,7 @@ clone:
     image: alpine/git
     environment:
       GIT_AUTH_TOKEN:
-        from_secret: forgejo_token
+        from_secret: git_auth_token
     commands:
       - git init
       - git remote add origin "https://git:$GIT_AUTH_TOKEN@repo.indexarr.net/indexarr/androidconnect-rs.git"
@@ -33,7 +33,7 @@ steps:
     image: alpine:3.21
     environment:
       GIT_AUTH_TOKEN:
-        from_secret: forgejo_token
+        from_secret: git_auth_token
     commands:
       - apk add --no-cache bash curl >/dev/null
       - |
