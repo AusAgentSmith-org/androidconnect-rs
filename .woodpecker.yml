@@ -6,6 +6,7 @@ steps:
   - name: rust-checks
     image: rust:1.88
     commands:
+      - rustup component add rustfmt clippy
       - cargo fmt --all -- --check
       - cargo clippy --workspace -- -D warnings
       - cargo test --workspace
