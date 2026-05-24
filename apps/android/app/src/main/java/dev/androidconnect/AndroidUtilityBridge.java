@@ -588,10 +588,10 @@ public final class AndroidUtilityBridge {
                     return;
                 }
 
-                java.io.File filesDir = context.getFilesDir().getCanonicalFile();
+                java.io.File filesDir = NativeBridge.getFileBrowserRoot(context).getCanonicalFile();
                 java.io.File target = new java.io.File(filesDir, relativePath).getCanonicalFile();
 
-                // Prevent path traversal outside the app storage root.
+                // Prevent path traversal outside the storage root.
                 String rootPath = filesDir.getAbsolutePath();
                 if (!target.getAbsolutePath().startsWith(rootPath + java.io.File.separator)
                         && !target.getAbsolutePath().equals(rootPath)) {

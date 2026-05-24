@@ -1,7 +1,10 @@
 package dev.androidconnect;
 
+import android.Manifest;
 import android.content.Context;
+import android.content.pm.PackageManager;
 import android.os.Build;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 
@@ -66,13 +69,32 @@ public final class NativeBridge {
                 host,
                 port,
                 buildDeviceName(context),
-                context.getFilesDir().getAbsolutePath(),
+                getFileBrowserRoot(context).getAbsolutePath(),
                 pairingCode
         );
         if (!connected) {
             DeviceStateMonitor.stopForConnection();
         }
         return connected;
+    }
+
+    /**
+     * Returns the root directory used for the file browser.
+     * Uses external storage when MANAGE_EXTERNAL_STORAGE (API 30+) or
+     * READ_EXTERNAL_STORAGE (older) is granted; falls back to app-internal files dir.
+     */
+    public static java.io.File getFileBrowserRoot(Context context) {
+        if (Build.VERSION.SDK_INT >= 30) {
+            if (Environment.isExternalStorageManager()) {
+                return Environment.getExternalStorageDirectory();
+            }
+        } else {
+            if (context.checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE)
+                    == PackageManager.PERMISSION_GRANTED) {
+                return Environment.getExternalStorageDirectory();
+            }
+        }
+        return context.getFilesDir();
     }
 
     public static void disconnect() {
