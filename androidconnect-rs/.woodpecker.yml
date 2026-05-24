@@ -29,21 +29,36 @@ steps:
       - cd apps/android && ./gradlew assembleDebug
 
   - name: publish-apk
-    image: alpine/curl
+    image: alpine:3.21
     environment:
       GIT_AUTH_TOKEN:
         from_secret: git_auth_token
     commands:
+      - apk add --no-cache bash curl >/dev/null
       - |
-        set -e
+        set -euo pipefail
         APK=apps/android/app/build/outputs/apk/debug/app-debug.apk
-        HASH=$(echo $CI_COMMIT_SHA | cut -c1-7)
-        BASE="http://100.92.54.45:3002/api/packages/indexarr/generic/androidconnect-apk"
-        curl -sf -T "$APK" -H "Authorization: token $GIT_AUTH_TOKEN" \
-          "$BASE/latest/androidconnect-debug.apk"
-        curl -sf -T "$APK" -H "Authorization: token $GIT_AUTH_TOKEN" \
-          "$BASE/$HASH/androidconnect-debug.apk"
-        echo "APK published: $BASE/$HASH/androidconnect-debug.apk"
+        [ -f "$APK" ] || { echo "APK missing: $APK"; ls -la apps/android/app/build/outputs/apk/debug/ || true; exit 1; }
+        HASH=$(echo "$CI_COMMIT_SHA" | cut -c1-7)
+        PKG=/api/packages/indexarr/generic/androidconnect-apk
+
+        # Pull the shared Forgejo API wrapper from ops. Logs status + body on
+        # errors instead of swallowing them with curl -sf — see
+        # scripts/forgejo-api.sh in indexarr/ops for why this isn't inline curl.
+        curl -sSf -H "Authorization: token $GIT_AUTH_TOKEN" \
+          -o /usr/local/bin/forgejo-api \
+          https://repo.indexarr.net/indexarr/ops/raw/branch/main/scripts/forgejo-api.sh
+        chmod +x /usr/local/bin/forgejo-api
+        export FORGEJO_TOKEN="$GIT_AUTH_TOKEN"
+
+        # Forgejo generic packages are immutable: PUT to an existing slot
+        # returns 409 "package file already exists". For the 'latest' slot we
+        # delete-then-put so each build overwrites; the per-SHA slot should
+        # never collide so we let it fail loud if it does.
+        forgejo-api DELETE "$PKG/latest/androidconnect-debug.apk" --allow 404 >/dev/null
+        forgejo-api PUT    "$PKG/latest/androidconnect-debug.apk" --upload "$APK" >/dev/null
+        forgejo-api PUT    "$PKG/$HASH/androidconnect-debug.apk"  --upload "$APK" >/dev/null
+        echo "APK published: latest + $HASH"
     when:
       - status: [success]
 
