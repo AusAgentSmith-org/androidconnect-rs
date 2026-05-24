@@ -5,17 +5,17 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fluent_app::TitleBar;
-use fluent_core::{ThemeProvider as _, tint};
+use fluent_core::{ThemeProvider as _, gradient_from_hue, tint};
 use fluent_primitives::{
     AppDot, Avatar, Button, ButtonAppearance, ButtonShape, ButtonSize, Card, ConnectionBadge,
     ConnectionBadgeState, Divider, FluentTextExt as _, Icon, IconSize, Label, LabelSize,
-    SectionHeader, Switch, TextInput,
+    SectionHeader, Skeleton, SkeletonRow, Switch, TextInput,
 };
 use gpui::{
     Animation, AnimationExt, App, Bounds, ClickEvent, Context, Entity, FontWeight, IntoElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta,
     ScrollWheelEvent, SharedString, VideoTextureId, Window, backdrop_blur, canvas, div, hsla,
-    prelude::*, pulsating_between, px,
+    linear_color_stop, linear_gradient, prelude::*, pulsating_between, px,
 };
 use qrcode::{Color as QrColor, QrCode};
 
@@ -65,6 +65,7 @@ pub struct AppModel {
     // Mirror input forwarding
     mirror_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
     left_pressed: bool,
+    last_mirror_mouse_move: Option<Instant>,
 
     // Panel states
     notifications: NotificationsState,
@@ -136,6 +137,28 @@ impl AppModel {
         })
         .detach();
 
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+                if this
+                    .update(cx, |m, cx| {
+                        let should_tick = matches!(m.active_panel, Panel::Mirror)
+                            && m.last_mirror_mouse_move
+                                .is_some_and(|last| last.elapsed() < Duration::from_millis(3500));
+                        if should_tick {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+
         Self {
             command_tx,
             status,
@@ -157,6 +180,7 @@ impl AppModel {
             qr_cache_key: String::new(),
             mirror_bounds: Arc::new(Mutex::new(None)),
             left_pressed: false,
+            last_mirror_mouse_move: None,
             notifications: NotificationsState::default(),
             phone_state: PhoneState::default(),
             files_state,
@@ -248,6 +272,7 @@ impl AppModel {
                     *g = None;
                 }
                 self.left_pressed = false;
+                self.last_mirror_mouse_move = None;
                 self.logged_initial_pair = false;
             }
         }
@@ -930,6 +955,7 @@ impl AppModel {
         let typography = cx.theme().typography;
         let spacing = cx.theme().spacing;
         let radii = cx.theme().radii;
+        let entity = cx.entity();
         let video_id = self.video_texture;
         let frame_data = self.frame_data.clone();
         let mirror_bounds_shared = Arc::clone(&self.mirror_bounds);
@@ -937,15 +963,10 @@ impl AppModel {
         let mirror_bounds_canvas = Arc::clone(&self.mirror_bounds);
         let frame_w = self.frame_w;
         let frame_h = self.frame_h;
+        let chrome_opacity = mirror_chrome_opacity(self.last_mirror_mouse_move);
 
         if !self.connected() {
-            return disconnected_placeholder(
-                "mirror",
-                "Mirror your phone",
-                "Once paired, your phone's screen streams here with full pointer and keyboard control.",
-                cx,
-            )
-            .into_any_element();
+            return mirror_disconnected_panel(entity, cx).into_any_element();
         }
 
         if video_id.is_none() || frame_data.is_none() {
@@ -1033,7 +1054,9 @@ impl AppModel {
             )
             .on_mouse_move(cx.listener({
                 let mirror_bounds_m = Arc::clone(&self.mirror_bounds);
-                move |this, event: &MouseMoveEvent, _, _| {
+                move |this, event: &MouseMoveEvent, _, cx| {
+                    this.last_mirror_mouse_move = Some(Instant::now());
+                    cx.notify();
                     if !this.left_pressed {
                         return;
                     }
@@ -1117,6 +1140,7 @@ impl AppModel {
                     .absolute()
                     .top(px(20.0))
                     .right(px(20.0))
+                    .opacity(chrome_opacity)
                     .flex()
                     .flex_col()
                     .gap(px(spacing.md))
@@ -1137,6 +1161,7 @@ impl AppModel {
                     .absolute()
                     .bottom(px(20.0))
                     .left(px(20.0))
+                    .opacity(chrome_opacity)
                     .flex()
                     .flex_row()
                     .items_center()
@@ -1830,7 +1855,11 @@ impl AppModel {
             body = body.child(banner);
         }
 
-        if count == 0 {
+        if count == 0 && self.notifications.show_initial_skeleton() {
+            for idx in 0..5 {
+                body = body.child(SkeletonRow::new(format!("notif-loading-{idx}")));
+            }
+        } else if count == 0 {
             body = body.child(
                 div()
                     .flex()
@@ -2299,14 +2328,10 @@ impl AppModel {
             );
         }
 
-        if pending {
-            body = body.child(
-                div()
-                    .text_color(colors.on_subtle_disabled)
-                    .italic()
-                    .py(px(20.0))
-                    .child("Loading…"),
-            );
+        if pending && response.is_none() {
+            for idx in 0..8 {
+                body = body.child(file_skeleton_row(idx, cx));
+            }
         } else if let Some(resp) = response {
             if let Some(banner) = permission_banner(
                 &resp.status,
@@ -2550,7 +2575,11 @@ impl AppModel {
             list = list.child(banner);
         }
 
-        if state.threads.is_empty() {
+        if state.threads.is_empty() && state.thread_status.is_none() {
+            for idx in 0..6 {
+                list = list.child(SkeletonRow::new(format!("msg-thread-loading-{idx}")));
+            }
+        } else if state.threads.is_empty() {
             list = list.child(
                 div()
                     .text_color(colors.on_subtle_disabled)
@@ -2894,18 +2923,15 @@ impl Render for AppModel {
         let sidebar = self.render_sidebar(cx);
         let status_bar = self.render_status_bar(cx);
 
-        let content = if !connected {
-            self.render_pair_panel(cx).into_any_element()
-        } else {
-            match self.active_panel {
-                Panel::Overview => self.render_overview_panel(cx).into_any_element(),
-                Panel::Mirror => self.render_mirror_panel(cx).into_any_element(),
-                Panel::Notifications => self.render_notifications_panel(cx).into_any_element(),
-                Panel::Messages => self.render_messages_panel(cx).into_any_element(),
-                Panel::Files => self.render_files_panel(cx).into_any_element(),
-                Panel::Phone => self.render_phone_panel(cx).into_any_element(),
-                Panel::Settings => self.render_settings_panel(cx).into_any_element(),
-            }
+        let content = match self.active_panel {
+            Panel::Mirror => self.render_mirror_panel(cx).into_any_element(),
+            Panel::Settings => self.render_settings_panel(cx).into_any_element(),
+            _ if !connected => self.render_pair_panel(cx).into_any_element(),
+            Panel::Overview => self.render_overview_panel(cx).into_any_element(),
+            Panel::Notifications => self.render_notifications_panel(cx).into_any_element(),
+            Panel::Messages => self.render_messages_panel(cx).into_any_element(),
+            Panel::Files => self.render_files_panel(cx).into_any_element(),
+            Panel::Phone => self.render_phone_panel(cx).into_any_element(),
         };
 
         div()
@@ -2935,6 +2961,20 @@ fn local_pos(pos: Point<Pixels>, bounds: Bounds<Pixels>) -> (f64, f64) {
         f32::from(pos.x - bounds.origin.x) as f64,
         f32::from(pos.y - bounds.origin.y) as f64,
     )
+}
+
+fn mirror_chrome_opacity(last_move: Option<Instant>) -> f32 {
+    let Some(last_move) = last_move else {
+        return 1.0;
+    };
+    let elapsed = last_move.elapsed();
+    if elapsed < Duration::from_secs(3) {
+        1.0
+    } else if elapsed < Duration::from_millis(3200) {
+        1.0 - ((elapsed - Duration::from_secs(3)).as_secs_f32() / 0.2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 fn dnd_label(mode: DndMode) -> &'static str {
@@ -3160,6 +3200,19 @@ fn heartbeat_dot(cx: &Context<AppModel>) -> impl IntoElement {
         )
 }
 
+fn file_skeleton_row(idx: usize, cx: &Context<AppModel>) -> impl IntoElement {
+    let spacing = cx.theme().spacing;
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(10.0))
+        .px(px(spacing.lg))
+        .py(px(6.0))
+        .child(Skeleton::new(("file-loading-icon", idx)).w(16.0).h(16.0))
+        .child(Skeleton::new(("file-loading-line", idx)).w(220.0).h(10.0))
+}
+
 fn pending_dot(cx: &Context<AppModel>) -> impl IntoElement {
     let colors = cx.theme().colors.clone();
     let radii = cx.theme().radii;
@@ -3312,6 +3365,154 @@ fn disconnected_placeholder(
         )
 }
 
+fn mirror_disconnected_panel(
+    entity: Entity<AppModel>,
+    cx: &Context<AppModel>,
+) -> impl IntoElement + use<> {
+    let colors = cx.theme().colors.clone();
+    let typography = cx.theme().typography;
+    let spacing = cx.theme().spacing;
+    let pair_entity = entity.clone();
+
+    div()
+        .size_full()
+        .bg(colors.surface)
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(spacing.xxl))
+                .max_w(px(640.0))
+                .p(px(40.0))
+                .child(
+                    div()
+                        .size(px(96.0))
+                        .rounded(px(24.0))
+                        .bg(tint(colors.accent, 0.18))
+                        .border_1()
+                        .border_color(tint(colors.accent, 0.35))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(colors.on_neutral_accent)
+                        .child(Icon::new("mirror").size(IconSize::Lg)),
+                )
+                .child(Label::new("Mirror your phone").size(LabelSize::Display))
+                .child(
+                    div()
+                        .max_w(px(460.0))
+                        .text_center()
+                        .text_color(colors.on_subtle)
+                        .text_size(px(typography.body.size))
+                        .child("Once paired, your phone's screen streams here at up to 60 fps with full pointer and keyboard control."),
+                )
+                .child(
+                    Button::new("mirror-pair-device")
+                        .label("Pair a device")
+                        .appearance(ButtonAppearance::Accent)
+                        .on_click(move |_, _, app| {
+                            pair_entity.update(app, |m, cx| {
+                                m.active_panel = Panel::Overview;
+                                m.status.input_authenticated = false;
+                                cx.notify();
+                            });
+                        }),
+                )
+                .child(
+                    Card::new()
+                        .padding(20.0)
+                        .gap(spacing.lg)
+                        .child(Label::eyebrow("What you can do"))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .flex_wrap()
+                                .gap(px(spacing.lg))
+                                .child(mirror_capability_cell(
+                                    "mirror",
+                                    "Mirror & control",
+                                    "Stream the screen at up to 60 fps",
+                                    cx,
+                                ))
+                                .child(mirror_capability_cell(
+                                    "bell",
+                                    "See notifications",
+                                    "Reply without unlocking your phone",
+                                    cx,
+                                ))
+                                .child(mirror_capability_cell(
+                                    "chat",
+                                    "Send messages",
+                                    "SMS / RCS from your keyboard",
+                                    cx,
+                                ))
+                                .child(mirror_capability_cell(
+                                    "folder",
+                                    "Browse files",
+                                    "Drag and drop both ways",
+                                    cx,
+                                )),
+                        ),
+                ),
+        )
+}
+
+fn mirror_capability_cell(
+    icon: &'static str,
+    title: &'static str,
+    caption: &'static str,
+    cx: &Context<AppModel>,
+) -> impl IntoElement {
+    let colors = cx.theme().colors.clone();
+    let typography = cx.theme().typography;
+    let spacing = cx.theme().spacing;
+
+    div()
+        .w(px(284.0))
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap(px(spacing.md))
+        .child(
+            div()
+                .size(px(28.0))
+                .rounded(px(6.0))
+                .bg(colors.surface_dim)
+                .border_1()
+                .border_color(colors.stroke_neutral_subtle)
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(colors.on_neutral_accent)
+                .child(Icon::new(icon).size(IconSize::Sm)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .gap(px(spacing.xs))
+                .child(
+                    div()
+                        .text_color(colors.on_neutral)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_size(px(typography.body.size))
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .text_color(colors.on_subtle)
+                        .text_size(px(typography.caption.size))
+                        .child(caption),
+                ),
+        )
+}
+
 fn quick_action(
     id: &'static str,
     icon: &'static str,
@@ -3374,6 +3575,103 @@ fn quick_action(
         )
 }
 
+fn phone_illustration(cx: &Context<AppModel>) -> impl IntoElement {
+    let colors = cx.theme().colors.clone();
+    let spacing = cx.theme().spacing;
+    let radii = cx.theme().radii;
+    let typography = cx.theme().typography;
+    let phone_bg = linear_gradient(
+        145.0,
+        linear_color_stop(hsla(250.0 / 360.0, 0.38, 0.30, 1.0), 0.0),
+        linear_color_stop(hsla(250.0 / 360.0, 0.34, 0.16, 1.0), 1.0),
+    );
+    let screen_bg = linear_gradient(
+        145.0,
+        linear_color_stop(hsla(210.0 / 360.0, 0.48, 0.38, 1.0), 0.0),
+        linear_color_stop(hsla(255.0 / 360.0, 0.42, 0.22, 1.0), 1.0),
+    );
+
+    let mut tiles = div().flex().flex_row().flex_wrap().gap(px(spacing.sm));
+    for hue in [200.0, 50.0, 130.0, 280.0, 25.0, 350.0] {
+        tiles = tiles.child(
+            div()
+                .size(px(21.0))
+                .rounded(px(radii.md))
+                .bg(gradient_from_hue(hue)),
+        );
+    }
+
+    div()
+        .w(px(96.0))
+        .h(px(180.0))
+        .flex_none()
+        .rounded(px(16.0))
+        .p(px(spacing.md))
+        .bg(phone_bg)
+        .border_1()
+        .border_color(colors.stroke_neutral_subtle)
+        .child(
+            div()
+                .size_full()
+                .rounded(px(radii.lg))
+                .p(px(spacing.md))
+                .flex()
+                .flex_col()
+                .gap(px(spacing.md))
+                .bg(screen_bg)
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(px(typography.caption.size))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(gpui::white())
+                                .child("9:47"),
+                        )
+                        .child(
+                            div()
+                                .w(px(14.0))
+                                .h(px(7.0))
+                                .rounded(px(radii.sm))
+                                .border_1()
+                                .border_color(hsla(0.0, 0.0, 1.0, 0.7))
+                                .child(
+                                    div()
+                                        .w(px(9.0))
+                                        .h_full()
+                                        .rounded(px(1.0))
+                                        .bg(hsla(0.0, 0.0, 1.0, 0.72)),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(spacing.sm))
+                        .child(
+                            div()
+                                .w(px(44.0))
+                                .h(px(6.0))
+                                .rounded(px(radii.pill))
+                                .bg(hsla(0.0, 0.0, 1.0, 0.55)),
+                        )
+                        .child(
+                            div()
+                                .w(px(30.0))
+                                .h(px(6.0))
+                                .rounded(px(radii.pill))
+                                .bg(hsla(0.0, 0.0, 1.0, 0.34)),
+                        ),
+                )
+                .child(tiles),
+        )
+}
+
 fn device_summary_card(
     device_name: &str,
     state: ConnectionBadgeState,
@@ -3424,59 +3722,71 @@ fn device_summary_card(
         ))
         .child(stat_block("Charging", "—", cx));
 
-    Card::new()
-        .padding(20.0)
-        .gap(16.0)
-        .child(conn_row)
-        .child(
-            // Battery block
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(spacing.md))
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .child(
-                            div()
-                                .flex_1()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(6.0))
-                                .text_color(colors.on_subtle)
-                                .child(Icon::new("battery").size(IconSize::Sm))
-                                .child(Label::eyebrow("Battery")),
-                        )
-                        .child(
-                            div()
-                                .text_color(colors.on_neutral)
-                                .text_size(px(typography.display.size))
-                                .font_weight(FontWeight::BOLD)
-                                .tabular_nums()
-                                .child(battery_label),
-                        ),
-                )
-                .child(
-                    div()
-                        .w_full()
-                        .h(px(spacing.md))
-                        .rounded(px(6.0))
-                        .bg(colors.surface_dim)
-                        .border_1()
-                        .border_color(colors.stroke_neutral_subtle)
-                        .child(
-                            div()
-                                .w(px(battery_width))
-                                .h_full()
-                                .rounded(px(6.0))
-                                .bg(battery_bar_color),
-                        ),
-                ),
-        )
-        .child(stats_row)
+    Card::new().padding(20.0).child(
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(20.0))
+            .child(phone_illustration(cx))
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap(px(spacing.xl))
+                    .child(conn_row)
+                    .child(
+                        // Battery block
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(spacing.md))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap(px(6.0))
+                                            .text_color(colors.on_subtle)
+                                            .child(Icon::new("battery").size(IconSize::Sm))
+                                            .child(Label::eyebrow("Battery")),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_color(colors.on_neutral)
+                                            .text_size(px(typography.display.size))
+                                            .font_weight(FontWeight::BOLD)
+                                            .tabular_nums()
+                                            .child(battery_label),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .h(px(spacing.md))
+                                    .rounded(px(6.0))
+                                    .bg(colors.surface_dim)
+                                    .border_1()
+                                    .border_color(colors.stroke_neutral_subtle)
+                                    .child(
+                                        div()
+                                            .w(px(battery_width))
+                                            .h_full()
+                                            .rounded(px(6.0))
+                                            .bg(battery_bar_color),
+                                    ),
+                            ),
+                    )
+                    .child(stats_row),
+            ),
+    )
 }
 
 fn stat_block(label: &str, value: &str, cx: &Context<AppModel>) -> impl IntoElement {
@@ -3573,6 +3883,16 @@ fn recent_notifications(
         .map(|(_, n)| n.clone())
         .collect();
     if items.is_empty() {
+        if model.connected() && model.notifications.is_initial_loading() {
+            for idx in 0..limit {
+                out.push(
+                    SkeletonRow::new(format!("overview-notif-loading-{idx}"))
+                        .avatar_size(24.0)
+                        .into_any_element(),
+                );
+            }
+            return out;
+        }
         out.push(
             div()
                 .text_color(colors.on_subtle_disabled)
@@ -3649,6 +3969,16 @@ fn recent_messages(
         .cloned()
         .collect();
     if items.is_empty() {
+        if model.connected() && model.messages_state.thread_status.is_none() {
+            for idx in 0..limit {
+                out.push(
+                    SkeletonRow::new(format!("overview-msg-loading-{idx}"))
+                        .avatar_size(28.0)
+                        .into_any_element(),
+                );
+            }
+            return out;
+        }
         out.push(
             div()
                 .text_color(colors.on_subtle_disabled)
