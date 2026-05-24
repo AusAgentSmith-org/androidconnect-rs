@@ -8,8 +8,8 @@ Local-first Rust stack for mirroring a non-rooted Android device's screen to a L
 
 | | |
 |---|---|
-| Type | Rust workspace (`androidconnect-rs/`) + Android Gradle app + custom CI image |
-| Repo | `repo.indexarr.net/indexarr/AndroidConnect` |
+| Type | Rust workspace + Android Gradle app + custom CI image |
+| Repo | `repo.indexarr.net/indexarr/androidconnect-rs` (origin) + `github.com/AusAgentSmith-org/androidconnect-rs` (github mirror) |
 | CI pipeline | `.woodpecker.yml` — `rust-checks` (fmt/clippy/test) → `android-build` (native `.so` + `assembleDebug`) |
 | Deploys to | — (desktop binary + sideloaded APK; no Komodo stack) |
 | Image | — (the only image is `repo.indexarr.net/indexarr/androidconnect-rs-ci` — CI build env, not a runtime artefact) |
@@ -40,7 +40,6 @@ Frame path validated end-to-end on emulator. Physical-device input pass is defer
 ## 3. Build / test / run
 
 ```bash
-cd androidconnect-rs
 cargo test --workspace
 cargo run -p androidconnect-desktop-viewer -- 0.0.0.0:48172
 # optional deterministic pairing for tests:
@@ -64,7 +63,6 @@ No production deploy — this is a desktop + sideloaded mobile pair. CI artefact
 
 ## 5. Rules for AI agents
 
-- **Two roots to pay attention to.** Most code (and `Cargo.toml`) lives in `androidconnect-rs/`, not the project root. `cd androidconnect-rs` before `cargo` commands; the workspace root only holds `.woodpecker.yml` and `.gitignore`.
 - **Don't break the pairing protocol lightly.** `crates/protocol` defines wire format + identity-bound pairing. Schema changes need bumps on both `desktop-viewer` and `android-native` simultaneously — there is no version negotiation yet.
 - **Physical-device input is unverified.** Emulator-only validation is the current ground truth. Treat input-control changes as needing a real-device QA pass before merging anything load-bearing.
 - **TCP is interim.** Replace-with-QUIC is on the MVP1 list (`docs/MVP1.md`). Don't add new code that hard-assumes TCP semantics (e.g. backpressure model, ordered delivery) without flagging it.
@@ -72,8 +70,8 @@ No production deploy — this is a desktop + sideloaded mobile pair. CI artefact
 
 ## 6. Cross-refs
 
-- `androidconnect-rs/README.md` — user-facing build + run flow
-- `androidconnect-rs/docs/FEATURE_POSITIONING.md` — product thesis
-- `androidconnect-rs/docs/PROJECT_PLAN.md` — milestones, architecture, DoD
-- `androidconnect-rs/docs/MVP1.md`, `docs/MVP2.md` — backlogs
-- `androidconnect-rs/docs/INPUT_CONTROL.md` — input architecture + validation checklist
+- `README.md` — user-facing build + run flow
+- `docs/FEATURE_POSITIONING.md` — product thesis
+- `docs/PROJECT_PLAN.md` — milestones, architecture, DoD
+- `docs/MVP1.md`, `docs/MVP2.md` — backlogs
+- `docs/INPUT_CONTROL.md` — input architecture + validation checklist
