@@ -108,7 +108,6 @@ public final class PermissionStatusRepository {
         switch (id) {
             case SMS:
                 return new String[] {
-                        Manifest.permission.RECEIVE_SMS,
                         Manifest.permission.READ_SMS,
                         Manifest.permission.SEND_SMS,
                 };
@@ -173,16 +172,21 @@ public final class PermissionStatusRepository {
     }
 
     private PermissionState smsState() {
-        boolean granted = hasAll(
-                Manifest.permission.RECEIVE_SMS,
-                Manifest.permission.READ_SMS,
-                Manifest.permission.SEND_SMS);
-        return new PermissionState(
-                PermissionId.SMS,
-                "SMS",
-                "Optional. Enables reading and sending SMS from the desktop.",
-                granted ? State.GRANTED : State.NOT_GRANTED,
-                false);
+        boolean canRead = hasAll(Manifest.permission.READ_SMS);
+        boolean canSend = hasAll(Manifest.permission.SEND_SMS);
+        State state;
+        String description;
+        if (canRead && canSend) {
+            state = State.GRANTED;
+            description = "Optional. Enables reading and sending SMS from the desktop.";
+        } else if (canRead) {
+            state = State.GRANTED;
+            description = "Optional. Read-only — grant Send SMS to enable replies.";
+        } else {
+            state = State.NOT_GRANTED;
+            description = "Optional. Enables reading and sending SMS from the desktop.";
+        }
+        return new PermissionState(PermissionId.SMS, "SMS", description, state, false);
     }
 
     private PermissionState contactsState() {

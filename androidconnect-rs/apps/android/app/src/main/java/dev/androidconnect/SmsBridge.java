@@ -125,6 +125,11 @@ final class SmsBridge {
                     }
                 }
                 if (threadId != null) {
+                    if (!canReadSms(context)) {
+                        NativeBridge.pushMessageSendResponseJson(buildSendResponse(
+                                requestId, threadId, "PermissionDenied", "READ_SMS not granted."));
+                        return;
+                    }
                     String fromThread = lookupRecipientFromThread(context, threadId);
                     if (fromThread != null && !fromThread.trim().isEmpty()) {
                         recipients.clear();
