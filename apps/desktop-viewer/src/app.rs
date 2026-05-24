@@ -142,7 +142,7 @@ impl AppModel {
         let status = DesktopStatus::new(bind, pairing_code);
         let pair_addresses = advertised_pair_addresses(&status.bind);
         let mut files_state = FilesState::default();
-        files_state.current_path = "/sdcard".to_owned();
+        files_state.current_path = "/".to_owned();
         let sms_composer = cx.new(|_| TextInput::new().placeholder("Type a message…"));
         let quick_reply_input = cx.new(|_| TextInput::new().placeholder("Quick reply…"));
         let file_action_input = cx.new(|_| TextInput::new());
@@ -311,7 +311,7 @@ impl AppModel {
                 self.notifications.clear();
                 self.phone_state = PhoneState::default();
                 self.files_state = FilesState::default();
-                self.files_state.current_path = "/sdcard".to_owned();
+                self.files_state.current_path = "/".to_owned();
                 self.messages_state = MessagesState::default();
                 self.quick_reply = QuickReplyState::default();
                 self.file_action = FileActionDialog::default();
