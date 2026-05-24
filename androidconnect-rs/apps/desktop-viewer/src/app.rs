@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fluent_app::TitleBar;
 use fluent_core::{ThemeProvider as _, tint};
@@ -12,9 +12,10 @@ use fluent_primitives::{
     SectionHeader, Switch, TextInput,
 };
 use gpui::{
-    App, Bounds, ClickEvent, Context, Entity, FontWeight, IntoElement, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
-    SharedString, VideoTextureId, Window, backdrop_blur, canvas, div, hsla, prelude::*, px,
+    Animation, AnimationExt, App, Bounds, ClickEvent, Context, Entity, FontWeight, IntoElement,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta,
+    ScrollWheelEvent, SharedString, VideoTextureId, Window, backdrop_blur, canvas, div, hsla,
+    prelude::*, pulsating_between, px,
 };
 use qrcode::{Color as QrColor, QrCode};
 
@@ -122,6 +123,19 @@ impl AppModel {
         let quick_reply_input = cx.new(|_| TextInput::new().placeholder("Quick reply…"));
         let file_action_input = cx.new(|_| TextInput::new());
         let title_bar = cx.new(|cx| TitleBar::new(cx, "AndroidConnect").icon("icons/logo.svg"));
+
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(30))
+                    .await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+
         Self {
             command_tx,
             status,
@@ -252,6 +266,10 @@ impl AppModel {
             .try_send(network::DesktopCommand::Utility(payload));
     }
 
+    fn send_refresh_ping(&self) {
+        let _ = self.command_tx.try_send(network::DesktopCommand::PingNow);
+    }
+
     fn refresh_pair_qr(&mut self, window: &mut Window) {
         if self.pair_addresses.is_empty() {
             return;
@@ -315,6 +333,11 @@ impl AppModel {
     fn render_top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let colors = cx.theme().colors.clone();
         let typography = cx.theme().typography;
+        let spacing = cx.theme().spacing;
+        let radii = cx.theme().radii;
+        let entity = cx.entity();
+        let refresh_entity = entity.clone();
+        let settings_entity = entity.clone();
 
         let subject = self
             .status
@@ -326,11 +349,11 @@ impl AppModel {
 
         div()
             .h(px(TOPBAR_HEIGHT))
-            .px(px(16.0))
+            .px(px(spacing.xl))
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(12.0))
+            .gap(px(spacing.lg))
             .bg(colors.surface)
             .border_b_1()
             .border_color(colors.stroke_neutral_subtle)
@@ -340,11 +363,11 @@ impl AppModel {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(8.0))
+                    .gap(px(spacing.md))
                     .pr(px(10.0))
-                    .pl(px(4.0))
-                    .py(px(4.0))
-                    .rounded(px(9999.0))
+                    .pl(px(spacing.sm))
+                    .py(px(spacing.sm))
+                    .rounded(px(radii.pill))
                     .border_1()
                     .border_color(colors.stroke_neutral)
                     .bg(colors.neutral)
@@ -382,19 +405,31 @@ impl AppModel {
                 "topbar-refresh",
                 "refresh",
                 cx,
-                |_, _, _| {},
+                move |_, _, app| {
+                    refresh_entity.update(app, |m, cx| {
+                        m.send_refresh_ping();
+                        cx.notify();
+                    });
+                },
             ))
             .child(action_icon_button(
                 "topbar-settings",
                 "settings",
                 cx,
-                |_, _, _| {},
+                move |_, _, app| {
+                    settings_entity.update(app, |m, cx| {
+                        m.active_panel = Panel::Settings;
+                        cx.notify();
+                    });
+                },
             ))
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let colors = cx.theme().colors.clone();
         let typography = cx.theme().typography;
+        let spacing = cx.theme().spacing;
+        let radii = cx.theme().radii;
         let entity = cx.entity();
 
         let mut rail = div()
@@ -487,11 +522,11 @@ impl AppModel {
             if unread > 0 {
                 item = item.child(
                     div()
-                        .mr(px(12.0))
+                        .mr(px(spacing.lg))
                         .min_w(px(18.0))
                         .h(px(18.0))
                         .px(px(6.0))
-                        .rounded(px(9999.0))
+                        .rounded(px(radii.pill))
                         .bg(colors.status_error)
                         .flex()
                         .items_center()
@@ -510,7 +545,7 @@ impl AppModel {
             div()
                 .id("nav-pair")
                 .h(px(36.0))
-                .px(px(16.0))
+                .px(px(spacing.xl))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -534,11 +569,11 @@ impl AppModel {
 
         rail = rail.child(div().flex_1()).child(
             div()
-                .px(px(16.0))
+                .px(px(spacing.xl))
                 .py(px(10.0))
                 .flex()
                 .flex_col()
-                .gap(px(2.0))
+                .gap(px(spacing.xs))
                 .border_t_1()
                 .border_color(colors.stroke_neutral_subtle)
                 .child(
@@ -561,14 +596,15 @@ impl AppModel {
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let colors = cx.theme().colors.clone();
         let typography = cx.theme().typography;
+        let spacing = cx.theme().spacing;
 
         let mut bar = div()
             .h(px(STATUSBAR_HEIGHT))
-            .px(px(12.0))
+            .px(px(spacing.lg))
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(16.0))
+            .gap(px(spacing.xl))
             .bg(colors.surface_dim)
             .border_t_1()
             .border_color(colors.stroke_neutral_subtle)
@@ -610,11 +646,6 @@ impl AppModel {
             .volume_percent
             .map(|p| format!("{p}%"))
             .unwrap_or_else(|| "—".to_owned());
-        let heartbeat = self
-            .status
-            .last_pong_nonce
-            .map(|n| format!("#{n}"))
-            .unwrap_or_else(|| "—".to_owned());
 
         bar = bar
             .child(stat_chip("battery", &battery, cx))
@@ -623,7 +654,7 @@ impl AppModel {
             .child(stat_chip("moon", dnd, cx))
             .child(stat_chip("vol", &vol, cx))
             .child(div().flex_1())
-            .child(stat_chip("pin", &heartbeat, cx));
+            .child(heartbeat_dot(cx));
         bar
     }
 
@@ -632,6 +663,7 @@ impl AppModel {
     fn render_overview_panel(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let colors = cx.theme().colors.clone();
         let typography = cx.theme().typography;
+        let spacing = cx.theme().spacing;
         let entity = cx.entity();
 
         if !self.connected() {
@@ -651,7 +683,7 @@ impl AppModel {
                             div()
                                 .flex()
                                 .flex_row()
-                                .gap(px(24.0))
+                                .gap(px(spacing.xxl))
                                 .items_center()
                                 .child(
                                     div()
@@ -669,7 +701,7 @@ impl AppModel {
                                         .flex_1()
                                         .flex()
                                         .flex_col()
-                                        .gap(px(8.0))
+                                        .gap(px(spacing.md))
                                         .child(Label::new("Connect your Android phone").size(LabelSize::Title))
                                         .child(
                                             div()
@@ -679,10 +711,10 @@ impl AppModel {
                                         )
                                         .child(
                                             div()
-                                                .mt(px(8.0))
+                                                .mt(px(spacing.md))
                                                 .flex()
                                                 .flex_row()
-                                                .gap(px(8.0))
+                                                .gap(px(spacing.md))
                                                 .child(
                                                     Button::new("overview-pair")
                                                         .label("Pair a device")
@@ -718,10 +750,10 @@ impl AppModel {
             .size_full()
             .overflow_y_scroll()
             .bg(colors.surface)
-            .p(px(24.0))
+            .p(px(spacing.xxl))
             .flex()
             .flex_col()
-            .gap(px(16.0));
+            .gap(px(spacing.xl));
 
         // Row 1: Greeting
         root = root.child(
@@ -734,7 +766,7 @@ impl AppModel {
                         .flex_1()
                         .flex()
                         .flex_col()
-                        .gap(px(2.0))
+                        .gap(px(spacing.xs))
                         .child(Label::new(greeting).size(LabelSize::Display))
                         .child(
                             div()
@@ -752,7 +784,7 @@ impl AppModel {
         );
 
         // Row 2: Device hero card
-        let mut hero_row = div().flex().flex_row().gap(px(16.0));
+        let mut hero_row = div().flex().flex_row().gap(px(spacing.xl));
         hero_row = hero_row.child(div().flex_1().child(device_summary_card(
             &device_name,
             self.badge_state(),
@@ -771,7 +803,7 @@ impl AppModel {
             div()
                 .flex()
                 .flex_row()
-                .gap(px(12.0))
+                .gap(px(spacing.lg))
                 .child(quick_action(
                     "qa-mirror",
                     "mirror",
@@ -837,7 +869,7 @@ impl AppModel {
             div()
                 .flex()
                 .flex_row()
-                .gap(px(16.0))
+                .gap(px(spacing.xl))
                 .child(
                     div().flex_1().child(
                         Card::new()
@@ -896,6 +928,8 @@ impl AppModel {
     fn render_mirror_panel(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let colors = cx.theme().colors.clone();
         let typography = cx.theme().typography;
+        let spacing = cx.theme().spacing;
+        let radii = cx.theme().radii;
         let video_id = self.video_texture;
         let frame_data = self.frame_data.clone();
         let mirror_bounds_shared = Arc::clone(&self.mirror_bounds);
@@ -921,7 +955,7 @@ impl AppModel {
                 .flex_col()
                 .items_center()
                 .justify_center()
-                .gap(px(12.0))
+                .gap(px(spacing.lg))
                 .bg(gpui::black())
                 .child(
                     div()
@@ -1085,8 +1119,8 @@ impl AppModel {
                     .right(px(20.0))
                     .flex()
                     .flex_col()
-                    .gap(px(8.0))
-                    .p(px(4.0))
+                    .gap(px(spacing.md))
+                    .p(px(spacing.sm))
                     .rounded(px(10.0))
                     // Backdrop blur background — samples the video frame
                     // beneath, blurs it 16px, tints it ~10% black.
@@ -1107,9 +1141,9 @@ impl AppModel {
                     .flex_row()
                     .items_center()
                     .gap(px(6.0))
-                    .px(px(12.0))
+                    .px(px(spacing.lg))
                     .py(px(6.0))
-                    .rounded(px(9999.0))
+                    .rounded(px(radii.pill))
                     .bg(backdrop_blur(16.0, hsla(0.0, 0.0, 0.0, 0.25)))
                     .border_1()
                     .border_color(hsla(0.0, 0.0, 1.0, 0.08))
@@ -1118,7 +1152,7 @@ impl AppModel {
                     .child(
                         div()
                             .size(px(6.0))
-                            .rounded(px(9999.0))
+                            .rounded(px(radii.pill))
                             .bg(colors.status_success),
                     )
                     .child(
@@ -1130,9 +1164,36 @@ impl AppModel {
             .into_any_element()
     }
 
+    fn render_settings_panel(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let colors = cx.theme().colors.clone();
+        let typography = cx.theme().typography;
+        let spacing = cx.theme().spacing;
+
+        div()
+            .id("settings-panel")
+            .size_full()
+            .bg(colors.surface)
+            .p(px(spacing.xxl))
+            .child(
+                Card::new()
+                    .padding(20.0)
+                    .gap(spacing.md)
+                    .child(Label::new("Settings").size(LabelSize::Display))
+                    .child(
+                        div()
+                            .text_color(colors.on_subtle)
+                            .text_size(px(typography.body.size))
+                            .child("Settings are coming soon."),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_pair_panel(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let colors = cx.theme().colors.clone();
         let typography = cx.theme().typography;
+        let spacing = cx.theme().spacing;
+        let radii = cx.theme().radii;
         let pairing_code_fmt = format_pairing_code(&self.status.pairing_code);
         let addresses = self.pair_addresses.clone();
         let bind = self.status.bind.clone();
@@ -1165,7 +1226,7 @@ impl AppModel {
         }
 
         left = left
-            .child(div().h(px(8.0)))
+            .child(div().h(px(spacing.md)))
             .child(Divider::horizontal())
             .child(
                 div()
@@ -1184,9 +1245,9 @@ impl AppModel {
         for a in addrs_for_display {
             addr_row = addr_row.child(
                 div()
-                    .px(px(8.0))
-                    .py(px(2.0))
-                    .rounded(px(4.0))
+                    .px(px(spacing.md))
+                    .py(px(spacing.xs))
+                    .rounded(px(radii.md))
                     .bg(colors.neutral)
                     .border_1()
                     .border_color(colors.stroke_neutral_subtle)
@@ -1204,9 +1265,9 @@ impl AppModel {
                 .w(qr_side)
                 .h(qr_side)
                 .flex_none()
-                .p(px(12.0))
+                .p(px(spacing.lg))
                 .bg(gpui::white())
-                .rounded(px(4.0))
+                .rounded(px(radii.md))
                 .child(if qr_data.is_some() && qr_id.is_some() {
                     canvas(
                         move |_, _, _| (qr_data, qr_id, qr_native),
@@ -1239,7 +1300,7 @@ impl AppModel {
             .bg(colors.neutral)
             .border_1()
             .border_color(colors.stroke_neutral_subtle)
-            .rounded(px(4.0))
+            .rounded(px(radii.md))
             .text_color(colors.on_neutral)
             .text_size(px(28.0))
             .font_family("monospace")
@@ -1251,7 +1312,7 @@ impl AppModel {
             .w(px(280.0))
             .flex()
             .flex_col()
-            .gap(px(16.0))
+            .gap(px(spacing.xl))
             .items_center()
             .child(qr_card)
             .child(
@@ -1263,9 +1324,9 @@ impl AppModel {
             .child(code_chip)
             .child(if let Some(err) = last_error {
                 div()
-                    .px(px(12.0))
-                    .py(px(8.0))
-                    .rounded(px(4.0))
+                    .px(px(spacing.lg))
+                    .py(px(spacing.md))
+                    .rounded(px(radii.md))
                     .bg(colors.status_error_bg)
                     .border_1()
                     .border_color(colors.status_error_border)
@@ -1285,7 +1346,7 @@ impl AppModel {
             .p(px(40.0))
             .flex()
             .flex_row()
-            .gap(px(32.0))
+            .gap(px(2.0 * spacing.xl))
             .items_start()
             .child(left)
             .child(right)
@@ -1293,6 +1354,7 @@ impl AppModel {
 
     fn render_phone_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let colors = cx.theme().colors.clone();
+        let spacing = cx.theme().spacing;
         let entity = cx.entity();
 
         if !self.connected() {
@@ -1310,16 +1372,20 @@ impl AppModel {
 
         let device_status_feature = self.status.feature(UtilityFeature::DeviceStatus).cloned();
         if let Some(status) = device_status_feature.as_ref()
-            && let Some(banner) =
-                permission_banner(status, "Device status mirroring is unavailable.", cx)
+            && let Some(banner) = permission_banner(
+                status,
+                "Device status mirroring is unavailable.",
+                onboarding_action(),
+                cx,
+            )
         {
             return div()
                 .size_full()
                 .bg(colors.surface)
-                .p(px(24.0))
+                .p(px(spacing.xxl))
                 .flex()
                 .flex_col()
-                .gap(px(16.0))
+                .gap(px(spacing.xl))
                 .child(Label::new("Phone").size(LabelSize::Title))
                 .child(banner)
                 .into_any_element();
@@ -1355,13 +1421,13 @@ impl AppModel {
         ];
         let entity_bt = entity.clone();
 
-        let mut grid = div().flex().flex_col().gap(px(16.0));
+        let mut grid = div().flex().flex_col().gap(px(spacing.xl));
 
         if let Some(media) = media_info {
             grid = grid.child(now_playing_card(&media, cx));
         }
 
-        let mut row1 = div().flex().flex_row().gap(px(16.0));
+        let mut row1 = div().flex().flex_row().gap(px(spacing.xl));
         row1 = row1
             .child(div().flex_1().child({
                 // Volume card
@@ -1370,7 +1436,7 @@ impl AppModel {
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap(px(8.0))
+                        .gap(px(spacing.md))
                         .child(Icon::new("vol").size(IconSize::Md))
                         .child(
                             div()
@@ -1394,7 +1460,7 @@ impl AppModel {
                     div()
                         .flex()
                         .flex_row()
-                        .gap(px(8.0))
+                        .gap(px(spacing.md))
                         .child(
                             Button::new("vol-down")
                                 .label("−10")
@@ -1456,7 +1522,7 @@ impl AppModel {
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap(px(8.0))
+                        .gap(px(spacing.md))
                         .child(Icon::new("bluetooth").size(IconSize::Md))
                         .child(
                             div()
@@ -1497,7 +1563,7 @@ impl AppModel {
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(8.0))
+                .gap(px(spacing.md))
                 .child(Icon::new("moon").size(IconSize::Md))
                 .child(
                     div()
@@ -1511,7 +1577,7 @@ impl AppModel {
                     div().into_any_element()
                 }),
         );
-        let mut dnd_row = div().flex().flex_row().gap(px(4.0));
+        let mut dnd_row = div().flex().flex_row().gap(px(spacing.sm));
         for (i, mode) in [
             DndMode::Off,
             DndMode::Priority,
@@ -1558,7 +1624,7 @@ impl AppModel {
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(8.0))
+                .gap(px(spacing.md))
                 .child(Icon::new("battery").size(IconSize::Md))
                 .child(
                     div()
@@ -1583,7 +1649,7 @@ impl AppModel {
             battery_card.child(
                 div()
                     .w_full()
-                    .h(px(8.0))
+                    .h(px(spacing.md))
                     .rounded(px(6.0))
                     .bg(colors.surface_dim)
                     .border_1()
@@ -1624,7 +1690,7 @@ impl AppModel {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(8.0))
+                    .gap(px(spacing.md))
                     .child(Icon::new("wifi").size(IconSize::Md))
                     .child(
                         div()
@@ -1639,7 +1705,7 @@ impl AppModel {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(8.0))
+                    .gap(px(spacing.md))
                     .child(Icon::new("bluetooth").size(IconSize::Md))
                     .child(
                         div()
@@ -1654,7 +1720,7 @@ impl AppModel {
             div()
                 .flex()
                 .flex_row()
-                .gap(px(16.0))
+                .gap(px(spacing.xl))
                 .child(div().flex_1().child(battery_with_bar))
                 .child(div().flex_1().child(conn_card)),
         );
@@ -1668,7 +1734,7 @@ impl AppModel {
             .size_full()
             .overflow_y_scroll()
             .bg(colors.surface)
-            .p(px(24.0))
+            .p(px(spacing.xxl))
             .child(grid)
             .into_any_element()
     }
@@ -1676,6 +1742,8 @@ impl AppModel {
     fn render_notifications_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let colors = cx.theme().colors.clone();
         let typography = cx.theme().typography;
+        let spacing = cx.theme().spacing;
+        let radii = cx.theme().radii;
         let entity = cx.entity();
         let count = self.notifications.item_count();
         let feature_status = self.status.feature(UtilityFeature::Notifications).cloned();
@@ -1698,9 +1766,9 @@ impl AppModel {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(12.0))
+            .gap(px(spacing.lg))
             .px(px(20.0))
-            .py(px(12.0))
+            .py(px(spacing.lg))
             .border_b_1()
             .border_color(colors.stroke_neutral_subtle)
             .child(Label::new("Notifications").size(LabelSize::Subtitle))
@@ -1709,7 +1777,7 @@ impl AppModel {
                     .min_w(px(20.0))
                     .px(px(6.0))
                     .py(px(1.0))
-                    .rounded(px(9999.0))
+                    .rounded(px(radii.pill))
                     .bg(colors.neutral)
                     .border_1()
                     .border_color(colors.stroke_neutral_subtle)
@@ -1749,12 +1817,13 @@ impl AppModel {
             .p(px(20.0))
             .flex()
             .flex_col()
-            .gap(px(8.0));
+            .gap(px(spacing.md));
 
         if let Some(status) = feature_status.as_ref()
             && let Some(banner) = permission_banner(
                 status,
                 "Enable Notification access on the phone to see alerts here.",
+                onboarding_action(),
                 cx,
             )
         {
@@ -1769,7 +1838,7 @@ impl AppModel {
                     .justify_center()
                     .py(px(60.0))
                     .flex_col()
-                    .gap(px(8.0))
+                    .gap(px(spacing.md))
                     .text_color(colors.on_subtle_disabled)
                     .child(Icon::new("check").size(IconSize::Lg))
                     .child(div().italic().child("You're all caught up.")),
@@ -1806,7 +1875,7 @@ impl AppModel {
                         div()
                             .px(px(6.0))
                             .py(px(1.0))
-                            .rounded(px(9999.0))
+                            .rounded(px(radii.pill))
                             .bg(colors.status_warning_bg)
                             .text_color(colors.status_warning)
                             .text_size(px(10.0))
@@ -1818,7 +1887,7 @@ impl AppModel {
                         div()
                             .px(px(6.0))
                             .py(px(1.0))
-                            .rounded(px(9999.0))
+                            .rounded(px(radii.pill))
                             .bg(colors.neutral)
                             .text_color(colors.on_subtle_disabled)
                             .text_size(px(10.0))
@@ -1856,7 +1925,11 @@ impl AppModel {
 
                 // Action buttons
                 if !notif.actions.is_empty() && !hide {
-                    let mut actions_row = div().mt(px(4.0)).flex().flex_row().gap(px(4.0));
+                    let mut actions_row = div()
+                        .mt(px(spacing.sm))
+                        .flex()
+                        .flex_row()
+                        .gap(px(spacing.sm));
                     for action in &notif.actions {
                         let nid = notif_id.clone();
                         let aid = action.action_id.clone();
@@ -1907,10 +1980,10 @@ impl AppModel {
                         let e_send = entity.clone();
                         body_col = body_col.child(
                             div()
-                                .mt(px(4.0))
+                                .mt(px(spacing.sm))
                                 .flex()
                                 .flex_row()
-                                .gap(px(4.0))
+                                .gap(px(spacing.sm))
                                 .items_center()
                                 .child(div().flex_1().child(self.quick_reply_input.clone()))
                                 .child(
@@ -1954,7 +2027,7 @@ impl AppModel {
                 let actions_col = div()
                     .flex()
                     .flex_col()
-                    .gap(px(4.0))
+                    .gap(px(spacing.sm))
                     .child(
                         Button::new(SharedString::from(format!("notif-mute-{}", id)))
                             .label(if suppressed { "Unmute" } else { "Mute" })
@@ -1993,12 +2066,17 @@ impl AppModel {
                             }),
                     );
 
-                let card = Card::new().padding(12.0).child(
+                let hover_bg = colors.neutral_hover;
+                let card = Card::new().padding(0.0).child(
                     div()
+                        .id(SharedString::from(format!("notif-card-{id}")))
                         .flex()
                         .flex_row()
-                        .gap(px(12.0))
+                        .gap(px(spacing.lg))
                         .items_start()
+                        .p(px(spacing.lg))
+                        .rounded(px(radii.md))
+                        .hover(move |s| s.bg(hover_bg))
                         .child(AppDot::new(notif.app_name.clone()).size(28.0))
                         .child(body_col)
                         .child(actions_col),
@@ -2021,6 +2099,8 @@ impl AppModel {
     fn render_files_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let colors = cx.theme().colors.clone();
         let typography = cx.theme().typography;
+        let spacing = cx.theme().spacing;
+        let radii = cx.theme().radii;
         let entity = cx.entity();
 
         if !self.connected() {
@@ -2057,7 +2137,7 @@ impl AppModel {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(8.0))
+            .gap(px(spacing.md))
             .px(px(20.0))
             .py(px(10.0))
             .border_b_1()
@@ -2126,10 +2206,10 @@ impl AppModel {
             .id("files-scroll")
             .flex_1()
             .overflow_y_scroll()
-            .p(px(12.0))
+            .p(px(spacing.lg))
             .flex()
             .flex_col()
-            .gap(px(2.0));
+            .gap(px(spacing.xs));
 
         // Inline action dialog
         if let Some(kind) = self.file_action.kind {
@@ -2228,8 +2308,12 @@ impl AppModel {
                     .child("Loading…"),
             );
         } else if let Some(resp) = response {
-            if let Some(banner) = permission_banner(&resp.status, "Cannot browse this folder.", cx)
-            {
+            if let Some(banner) = permission_banner(
+                &resp.status,
+                "Cannot browse this folder.",
+                onboarding_action(),
+                cx,
+            ) {
                 body = body.child(banner);
             }
 
@@ -2265,9 +2349,9 @@ impl AppModel {
                     .flex_row()
                     .items_center()
                     .gap(px(10.0))
-                    .px(px(12.0))
+                    .px(px(spacing.lg))
                     .py(px(6.0))
-                    .rounded(px(4.0))
+                    .rounded(px(radii.md))
                     .cursor_pointer()
                     .hover(move |s| s.bg(colors.subtle_hover))
                     .on_click(move |_, _, app| {
@@ -2406,6 +2490,8 @@ impl AppModel {
     fn render_messages_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let colors = cx.theme().colors.clone();
         let typography = cx.theme().typography;
+        let spacing = cx.theme().spacing;
+        let radii = cx.theme().radii;
         let entity = cx.entity();
 
         if !self.connected() {
@@ -2437,8 +2523,8 @@ impl AppModel {
 
         thread_list = thread_list.child(
             div()
-                .px(px(12.0))
-                .py(px(12.0))
+                .px(px(spacing.lg))
+                .py(px(spacing.lg))
                 .border_b_1()
                 .border_color(colors.stroke_neutral_subtle)
                 .child(Label::new("Messages").size(LabelSize::Subtitle)),
@@ -2451,11 +2537,15 @@ impl AppModel {
             .flex()
             .flex_col()
             .p(px(6.0))
-            .gap(px(2.0));
+            .gap(px(spacing.xs));
 
         if let Some(status) = &state.thread_status
-            && let Some(banner) =
-                permission_banner(status, "SMS access required — enable in onboarding.", cx)
+            && let Some(banner) = permission_banner(
+                status,
+                "SMS access required — enable in onboarding.",
+                onboarding_action(),
+                cx,
+            )
         {
             list = list.child(banner);
         }
@@ -2466,7 +2556,7 @@ impl AppModel {
                     .text_color(colors.on_subtle_disabled)
                     .italic()
                     .py(px(20.0))
-                    .px(px(12.0))
+                    .px(px(spacing.lg))
                     .child("No threads yet."),
             );
         } else {
@@ -2483,7 +2573,7 @@ impl AppModel {
                         .min_w(px(20.0))
                         .px(px(6.0))
                         .py(px(1.0))
-                        .rounded(px(9999.0))
+                        .rounded(px(radii.pill))
                         .bg(colors.accent)
                         .text_color(colors.on_accent)
                         .text_size(px(10.0))
@@ -2502,9 +2592,9 @@ impl AppModel {
                         .flex()
                         .flex_row()
                         .gap(px(10.0))
-                        .px(px(12.0))
+                        .px(px(spacing.lg))
                         .py(px(10.0))
-                        .rounded(px(4.0))
+                        .rounded(px(radii.md))
                         .bg(if is_active {
                             colors.neutral_selected
                         } else {
@@ -2533,7 +2623,7 @@ impl AppModel {
                                 .flex_1()
                                 .flex()
                                 .flex_col()
-                                .gap(px(2.0))
+                                .gap(px(spacing.xs))
                                 .child(
                                     div()
                                         .flex()
@@ -2598,7 +2688,7 @@ impl AppModel {
                     .items_center()
                     .gap(px(10.0))
                     .px(px(20.0))
-                    .py(px(12.0))
+                    .py(px(spacing.lg))
                     .border_b_1()
                     .border_color(colors.stroke_neutral_subtle)
                     .child(Avatar::initials(device_initials(&display_name)).size(32.0))
@@ -2642,10 +2732,11 @@ impl AppModel {
                 .flex_col()
                 .gap(px(6.0))
                 .px(px(20.0))
-                .py(px(16.0));
+                .py(px(spacing.xl));
 
             if let Some(status) = detail_status
-                && let Some(banner) = permission_banner(&status, "Cannot read this thread.", cx)
+                && let Some(banner) =
+                    permission_banner(&status, "Cannot read this thread.", onboarding_action(), cx)
             {
                 history = history.child(banner);
             }
@@ -2669,8 +2760,8 @@ impl AppModel {
                     let outbound = matches!(entry.direction, MessageDirection::Outbound);
                     let bubble = div()
                         .max_w(px(420.0))
-                        .px(px(12.0))
-                        .py(px(8.0))
+                        .px(px(spacing.lg))
+                        .py(px(spacing.md))
                         .rounded(px(14.0))
                         .bg(if outbound {
                             colors.accent
@@ -2684,7 +2775,7 @@ impl AppModel {
                         })
                         .text_size(px(typography.body.size))
                         .child(entry.body.clone());
-                    let mut row = div().flex().flex_row().gap(px(4.0));
+                    let mut row = div().flex().flex_row().gap(px(spacing.sm));
                     if outbound {
                         row = row.child(div().flex_1()).child(bubble);
                     } else {
@@ -2700,10 +2791,10 @@ impl AppModel {
             let composer_row = div()
                 .flex()
                 .flex_row()
-                .gap(px(8.0))
+                .gap(px(spacing.md))
                 .items_center()
                 .px(px(20.0))
-                .py(px(12.0))
+                .py(px(spacing.lg))
                 .border_t_1()
                 .border_color(colors.stroke_neutral_subtle)
                 .child(div().flex_1().child(composer_for_send))
@@ -2813,6 +2904,7 @@ impl Render for AppModel {
                 Panel::Messages => self.render_messages_panel(cx).into_any_element(),
                 Panel::Files => self.render_files_panel(cx).into_any_element(),
                 Panel::Phone => self.render_phone_panel(cx).into_any_element(),
+                Panel::Settings => self.render_settings_panel(cx).into_any_element(),
             }
         };
 
@@ -2984,10 +3076,11 @@ fn format_socket_addr(ip: IpAddr, port: u16) -> String {
 
 // ── Render helpers ────────────────────────────────────────────────────────
 
-fn section_header(title: &'static str, _cx: &Context<AppModel>) -> impl IntoElement {
+fn section_header(title: &'static str, cx: &Context<AppModel>) -> impl IntoElement {
+    let spacing = cx.theme().spacing;
     div()
-        .px(px(16.0))
-        .pt(px(12.0))
+        .px(px(spacing.xl))
+        .pt(px(spacing.lg))
         .pb(px(6.0))
         .child(Label::eyebrow(title))
 }
@@ -2999,13 +3092,14 @@ fn action_icon_button(
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let colors = cx.theme().colors.clone();
+    let radii = cx.theme().radii;
     div()
         .id(id)
         .size(px(28.0))
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(4.0))
+        .rounded(px(radii.md))
         .text_color(colors.on_subtle)
         .cursor_pointer()
         .hover(move |s| s.bg(colors.subtle_hover))
@@ -3033,28 +3127,57 @@ fn mirror_chip_icon(
 
 fn stat_chip(icon_name: &'static str, value: &str, cx: &Context<AppModel>) -> impl IntoElement {
     let colors = cx.theme().colors.clone();
+    let spacing = cx.theme().spacing;
     div()
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(4.0))
+        .gap(px(spacing.sm))
         .text_color(colors.on_subtle)
         .child(Icon::new(icon_name).size(IconSize::Sm))
         .child(div().tabular_nums().child(value.to_owned()))
 }
 
+fn heartbeat_dot(cx: &Context<AppModel>) -> impl IntoElement {
+    let colors = cx.theme().colors.clone();
+    let radii = cx.theme().radii;
+    let dot_color = colors.status_success;
+
+    div()
+        .size(px(6.0))
+        .rounded(px(radii.pill))
+        .bg(dot_color)
+        .with_animation(
+            "status-heartbeat-dot",
+            Animation::new(Duration::from_millis(1400))
+                .repeat()
+                .with_easing(pulsating_between(0.35, 1.0)),
+            move |this, delta| {
+                let mut color = dot_color;
+                color.a = delta;
+                this.bg(color)
+            },
+        )
+}
+
 fn pending_dot(cx: &Context<AppModel>) -> impl IntoElement {
     let colors = cx.theme().colors.clone();
-    div().size(px(10.0)).rounded(px(9999.0)).bg(colors.accent)
+    let radii = cx.theme().radii;
+    div()
+        .size(px(10.0))
+        .rounded(px(radii.pill))
+        .bg(colors.accent)
 }
 
 fn error_banner(msg: &str, cx: &Context<AppModel>) -> impl IntoElement {
     let colors = cx.theme().colors.clone();
     let typography = cx.theme().typography;
+    let spacing = cx.theme().spacing;
+    let radii = cx.theme().radii;
     div()
-        .px(px(12.0))
-        .py(px(8.0))
-        .rounded(px(4.0))
+        .px(px(spacing.lg))
+        .py(px(spacing.md))
+        .rounded(px(radii.md))
         .bg(colors.status_error_bg)
         .border_1()
         .border_color(colors.status_error_border)
@@ -3063,9 +3186,19 @@ fn error_banner(msg: &str, cx: &Context<AppModel>) -> impl IntoElement {
         .child(msg.to_owned())
 }
 
+type BannerAction = (
+    SharedString,
+    Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>,
+);
+
+fn onboarding_action() -> Option<BannerAction> {
+    Some(("Open onboarding".into(), Box::new(|_, _, _| {})))
+}
+
 fn permission_banner(
     status: &FeatureStatus,
     fallback: &str,
+    action: Option<BannerAction>,
     cx: &Context<AppModel>,
 ) -> Option<gpui::AnyElement> {
     if matches!(status.state, FeatureState::Available) {
@@ -3073,6 +3206,7 @@ fn permission_banner(
     }
     let colors = cx.theme().colors.clone();
     let typography = cx.theme().typography;
+    let spacing = cx.theme().spacing;
     let heading = match status.state {
         FeatureState::Available => return None,
         FeatureState::PermissionRequired => "Permission required",
@@ -3085,40 +3219,54 @@ fn permission_banner(
     } else {
         status.message.clone()
     };
-    Some(
-        div()
-            .flex()
-            .flex_row()
-            .gap(px(10.0))
-            .items_start()
-            .p(px(12.0))
-            .rounded(px(4.0))
-            .bg(colors.status_info_bg)
-            .border_l_2()
-            .border_color(colors.status_info)
-            .child(Icon::new("bell").size(IconSize::Sm))
-            .child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .child(
-                        div()
-                            .text_color(colors.on_neutral)
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_size(px(typography.body.size))
-                            .child(heading),
-                    )
-                    .child(
-                        div()
-                            .text_color(colors.on_subtle)
-                            .text_size(px(typography.caption.size))
-                            .child(message),
-                    ),
-            )
-            .into_any_element(),
-    )
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .gap(px(spacing.lg))
+        .items_start()
+        .p(px(spacing.lg))
+        .border_l_2()
+        .border_color(colors.status_info)
+        .child(Icon::new("bell").size(IconSize::Sm))
+        .child(
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .gap(px(spacing.xs))
+                .child(
+                    div()
+                        .text_color(colors.on_neutral)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_size(px(typography.body.size))
+                        .child(heading),
+                )
+                .child(
+                    div()
+                        .text_color(colors.on_subtle)
+                        .text_size(px(typography.caption.size))
+                        .child(message),
+                ),
+        );
+
+    if matches!(status.state, FeatureState::PermissionRequired)
+        && let Some((label, on_click)) = action
+    {
+        row = row.child(
+            Button::new(SharedString::from(format!(
+                "permission-action-{}",
+                heading.to_ascii_lowercase().replace(' ', "-")
+            )))
+            .label(label)
+            .appearance(ButtonAppearance::Subtle)
+            .size(ButtonSize::Compact)
+            .on_click(move |event, window, app| {
+                on_click(event, window, app);
+            }),
+        );
+    }
+
+    Some(Card::new().padding(0.0).child(row).into_any_element())
 }
 
 fn disconnected_placeholder(
@@ -3129,6 +3277,7 @@ fn disconnected_placeholder(
 ) -> impl IntoElement {
     let colors = cx.theme().colors.clone();
     let typography = cx.theme().typography;
+    let spacing = cx.theme().spacing;
     div()
         .size_full()
         .flex()
@@ -3139,7 +3288,7 @@ fn disconnected_placeholder(
                 .flex()
                 .flex_col()
                 .items_center()
-                .gap(px(12.0))
+                .gap(px(spacing.lg))
                 .max_w(px(380.0))
                 .text_color(colors.on_subtle)
                 .child(
@@ -3173,11 +3322,13 @@ fn quick_action(
 ) -> impl IntoElement {
     let colors = cx.theme().colors.clone();
     let typography = cx.theme().typography;
+    let spacing = cx.theme().spacing;
+    let radii = cx.theme().radii;
     div()
         .id(id)
         .flex_1()
         .p(px(14.0))
-        .rounded(px(4.0))
+        .rounded(px(radii.md))
         .bg(colors.neutral)
         .border_1()
         .border_color(colors.stroke_neutral_subtle)
@@ -3190,11 +3341,11 @@ fn quick_action(
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(12.0))
+        .gap(px(spacing.lg))
         .child(
             div()
                 .size(px(36.0))
-                .rounded(px(8.0))
+                .rounded(px(radii.lg))
                 .bg(tint(colors.accent, 0.18))
                 .flex()
                 .items_center()
@@ -3206,7 +3357,7 @@ fn quick_action(
             div()
                 .flex()
                 .flex_col()
-                .gap(px(2.0))
+                .gap(px(spacing.xs))
                 .child(
                     div()
                         .text_color(colors.on_neutral)
@@ -3233,6 +3384,7 @@ fn device_summary_card(
 ) -> impl IntoElement {
     let colors = cx.theme().colors.clone();
     let typography = cx.theme().typography;
+    let spacing = cx.theme().spacing;
     let battery_label = battery_pct
         .map(|p| format!("{p}%"))
         .unwrap_or_else(|| "—".to_owned());
@@ -3243,18 +3395,23 @@ fn device_summary_card(
     };
     let battery_width = battery_pct.unwrap_or(0).min(100) as f32 / 100.0 * 320.0;
 
-    let mut conn_row = div().flex().flex_row().items_center().gap(px(8.0)).child(
-        div()
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_size(px(typography.subtitle.size))
-            .child(device_name.to_owned()),
-    );
+    let mut conn_row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(spacing.md))
+        .child(
+            div()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_size(px(typography.subtitle.size))
+                .child(device_name.to_owned()),
+        );
     conn_row = conn_row.child(ConnectionBadge::new("hero-conn", state));
 
     let stats_row = div()
         .flex()
         .flex_row()
-        .gap(px(24.0))
+        .gap(px(spacing.xxl))
         .child(stat_block("Wi-Fi", wifi.unwrap_or("—"), cx))
         .child(stat_block(
             "Bluetooth",
@@ -3276,7 +3433,7 @@ fn device_summary_card(
             div()
                 .flex()
                 .flex_col()
-                .gap(px(8.0))
+                .gap(px(spacing.md))
                 .child(
                     div()
                         .flex()
@@ -3305,7 +3462,7 @@ fn device_summary_card(
                 .child(
                     div()
                         .w_full()
-                        .h(px(8.0))
+                        .h(px(spacing.md))
                         .rounded(px(6.0))
                         .bg(colors.surface_dim)
                         .border_1()
@@ -3325,10 +3482,11 @@ fn device_summary_card(
 fn stat_block(label: &str, value: &str, cx: &Context<AppModel>) -> impl IntoElement {
     let colors = cx.theme().colors.clone();
     let typography = cx.theme().typography;
+    let spacing = cx.theme().spacing;
     div()
         .flex()
         .flex_col()
-        .gap(px(2.0))
+        .gap(px(spacing.xs))
         .child(Label::eyebrow(label.to_owned()))
         .child(
             div()
@@ -3342,6 +3500,8 @@ fn stat_block(label: &str, value: &str, cx: &Context<AppModel>) -> impl IntoElem
 fn now_playing_card(media: &crate::status::MediaInfo, cx: &Context<AppModel>) -> impl IntoElement {
     let colors = cx.theme().colors.clone();
     let typography = cx.theme().typography;
+    let spacing = cx.theme().spacing;
+    let radii = cx.theme().radii;
     let title = media.title.clone().unwrap_or_else(|| "Unknown".to_owned());
     let artist = media.artist.clone().unwrap_or_default();
     let app_name = media.app_name.clone().unwrap_or_default();
@@ -3355,11 +3515,11 @@ fn now_playing_card(media: &crate::status::MediaInfo, cx: &Context<AppModel>) ->
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(12.0))
+            .gap(px(spacing.lg))
             .child(
                 div()
                     .size(px(80.0))
-                    .rounded(px(8.0))
+                    .rounded(px(radii.lg))
                     .bg(colors.surface_dim)
                     .flex()
                     .items_center()
@@ -3372,7 +3532,7 @@ fn now_playing_card(media: &crate::status::MediaInfo, cx: &Context<AppModel>) ->
                     .flex_1()
                     .flex()
                     .flex_col()
-                    .gap(px(2.0))
+                    .gap(px(spacing.xs))
                     .child(Label::eyebrow(format!("Now playing · {app_name}")))
                     .child(
                         div()
@@ -3555,6 +3715,8 @@ fn recent_messages(
 fn activity_rows(model: &AppModel, limit: usize, cx: &Context<AppModel>) -> Vec<gpui::AnyElement> {
     let colors = cx.theme().colors.clone();
     let typography = cx.theme().typography;
+    let spacing = cx.theme().spacing;
+    let radii = cx.theme().radii;
     let mut out = Vec::new();
     if model.activity.is_empty() {
         out.push(
@@ -3567,7 +3729,8 @@ fn activity_rows(model: &AppModel, limit: usize, cx: &Context<AppModel>) -> Vec<
         );
         return out;
     }
-    for ev in model.activity.iter().take(limit) {
+    for (idx, ev) in model.activity.iter().take(limit).enumerate() {
+        let activity_hover = colors.neutral_hover;
         let when = ev
             .timestamp
             .duration_since(UNIX_EPOCH)
@@ -3575,15 +3738,19 @@ fn activity_rows(model: &AppModel, limit: usize, cx: &Context<AppModel>) -> Vec<
             .unwrap_or_default();
         out.push(
             div()
+                .id(SharedString::from(format!("activity-row-{idx}")))
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap(px(10.0))
+                .px(px(spacing.sm))
                 .py(px(6.0))
+                .rounded(px(radii.md))
+                .hover(move |s| s.bg(activity_hover))
                 .child(
                     div()
                         .size(px(28.0))
-                        .rounded(px(9999.0))
+                        .rounded(px(radii.pill))
                         .bg(colors.surface_dim)
                         .border_1()
                         .border_color(colors.stroke_neutral_subtle)
@@ -3615,6 +3782,8 @@ fn activity_rows(model: &AppModel, limit: usize, cx: &Context<AppModel>) -> Vec<
 fn numbered_step(n: usize, title: &str, body: &str, cx: &Context<AppModel>) -> impl IntoElement {
     let colors = cx.theme().colors.clone();
     let typography = cx.theme().typography;
+    let spacing = cx.theme().spacing;
+    let radii = cx.theme().radii;
     div()
         .flex()
         .flex_row()
@@ -3623,7 +3792,7 @@ fn numbered_step(n: usize, title: &str, body: &str, cx: &Context<AppModel>) -> i
         .child(
             div()
                 .size(px(26.0))
-                .rounded(px(9999.0))
+                .rounded(px(radii.pill))
                 .bg(tint(colors.accent, 0.18))
                 .border_1()
                 .border_color(tint(colors.accent, 0.4))
@@ -3639,7 +3808,7 @@ fn numbered_step(n: usize, title: &str, body: &str, cx: &Context<AppModel>) -> i
             div()
                 .flex()
                 .flex_col()
-                .gap(px(2.0))
+                .gap(px(spacing.xs))
                 .child(
                     div()
                         .text_color(colors.on_neutral)

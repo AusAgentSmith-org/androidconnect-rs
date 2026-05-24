@@ -18,6 +18,7 @@ pub enum Panel {
     Messages,
     Files,
     Phone,
+    Settings,
 }
 
 impl Panel {
@@ -29,6 +30,7 @@ impl Panel {
             Panel::Messages => "Messages",
             Panel::Files => "Files",
             Panel::Phone => "Phone",
+            Panel::Settings => "Settings",
         }
     }
 
@@ -41,15 +43,17 @@ impl Panel {
             Panel::Messages => "chat",
             Panel::Files => "folder",
             Panel::Phone => "phone",
+            Panel::Settings => "settings",
         }
     }
 
-    pub const ALL: [Panel; 6] = [
+    pub const ALL: [Panel; 7] = [
         Panel::Overview,
         Panel::Mirror,
         Panel::Notifications,
         Panel::Messages,
         Panel::Files,
         Panel::Phone,
+        Panel::Settings,
     ];
 }

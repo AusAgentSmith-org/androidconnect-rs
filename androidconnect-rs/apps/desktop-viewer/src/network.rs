@@ -128,6 +128,7 @@ pub enum NetworkStatus {
 pub enum DesktopCommand {
     Input(InputEvent),
     Utility(Payload),
+    PingNow,
 }
 
 /// Structured copies of inbound protocol payloads that the UI panels consume.
@@ -335,6 +336,7 @@ fn write_desktop_command(
 ) -> Result<()> {
     match command {
         DesktopCommand::Input(event) => write_payload(stream, sequence, Payload::Input(event)),
+        DesktopCommand::PingNow => write_ping(stream, sequence),
         DesktopCommand::Utility(payload) => {
             if !is_desktop_utility_payload(&payload) {
                 bail!("payload is not a desktop utility command");
