@@ -16,7 +16,7 @@ use gpui::{
     Animation, AnimationExt, App, Bounds, ClickEvent, Context, Entity, FontWeight, IntoElement,
     Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
     ScrollDelta, ScrollWheelEvent, SharedString, VideoTextureId, Window, backdrop_blur, canvas, div,
-    hsla,
+    hsla, relative,
     linear_color_stop, linear_gradient, prelude::*, pulsating_between, px,
 };
 use qrcode::{Color as QrColor, QrCode};
@@ -24,7 +24,7 @@ use qrcode::{Color as QrColor, QrCode};
 use androidconnect_protocol::{
     AudioControl, AudioControlCommand, DndMode, FeatureState, FeatureStatus, FileEntry,
     FileEntryType, InputEvent, MediaPlaybackState, MessageDirection, MessageSendResult, Payload,
-    PointerButton, PointerEvent, PointerPhase, UtilityFeature,
+    PointerButton, PointerEvent, PointerPhase, StorageBreakdown, UtilityFeature,
     qr::{QrPairingPayload, encode_qr_payload},
 };
 
@@ -985,13 +985,15 @@ impl AppModel {
                 ),
         );
 
-        // Row 5: Activity card (storage stub omitted in v1)
+        // Row 5: Activity card
         root = root.child(
             Card::new()
                 .padding(16.0)
                 .child(SectionHeader::new("Recent activity"))
                 .children(activity_rows(self, 8, cx)),
         );
+
+        root = root.child(storage_card(self, cx));
 
         root.into_any_element()
     }
@@ -4053,6 +4055,226 @@ fn quick_action(
                         .child(sub),
                 ),
         )
+}
+
+fn storage_card(model: &AppModel, cx: &Context<AppModel>) -> impl IntoElement {
+    let colors = cx.theme().colors.clone();
+    let typography = cx.theme().typography;
+    let spacing = cx.theme().spacing;
+    let radii = cx.theme().radii;
+
+    let mut card = Card::new()
+        .padding(spacing.xl)
+        .gap(spacing.md)
+        .child(SectionHeader::new("Storage"));
+
+    if let Some(status) = model.status.storage_status.as_ref()
+        && !matches!(status.state, FeatureState::Available)
+    {
+        if let Some(banner) = permission_banner(
+            status,
+            "Enable storage access on the phone.",
+            onboarding_action(),
+            cx,
+        ) {
+            card = card.child(banner);
+        }
+        return card;
+    }
+
+    let Some(storage) = model.status.storage.as_ref() else {
+        return card
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_end()
+                    .gap(px(spacing.sm))
+                    .child(Skeleton::new("storage-used-skel").w(96.0).h(34.0))
+                    .child(Skeleton::new("storage-total-skel").w(140.0).h(12.0)),
+            )
+            .child(Skeleton::new("storage-bar-skel").h(10.0).rounded(radii.pill))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap(px(spacing.md))
+                    .child(Skeleton::new("storage-legend-0").w(220.0).h(14.0))
+                    .child(Skeleton::new("storage-legend-1").w(220.0).h(14.0))
+                    .child(Skeleton::new("storage-legend-2").w(220.0).h(14.0))
+                    .child(Skeleton::new("storage-legend-3").w(220.0).h(14.0)),
+            );
+    };
+
+    card = card
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_end()
+                .gap(px(spacing.sm))
+                .child(
+                    div()
+                        .text_color(colors.on_neutral)
+                        .text_size(px(typography.display.size))
+                        .line_height(px(typography.display.line_height))
+                        .font_weight(FontWeight(typography.display.weight as f32))
+                        .tabular_nums()
+                        .child(storage_gb_value(storage.used)),
+                )
+                .child(
+                    div()
+                        .pb(px(5.0))
+                        .text_color(colors.on_subtle)
+                        .text_size(px(typography.caption.size))
+                        .tabular_nums()
+                        .child(format!("GB used of {}", storage_gb_label(storage.total))),
+                ),
+        )
+        .child(storage_segmented_bar(storage, cx))
+        .child(storage_legend(storage, cx));
+
+    card
+}
+
+fn storage_segmented_bar(storage: &StorageBreakdown, cx: &Context<AppModel>) -> impl IntoElement {
+    let colors = cx.theme().colors.clone();
+    let radii = cx.theme().radii;
+    let total = storage.total.max(1);
+    let categories = storage_categories(storage, &colors);
+
+    let mut bar = div()
+        .h(px(10.0))
+        .w_full()
+        .flex()
+        .flex_row()
+        .overflow_hidden()
+        .rounded(px(radii.pill))
+        .border_1()
+        .border_color(colors.stroke_neutral_subtle)
+        .bg(colors.surface_dim);
+
+    for category in categories {
+        let share = (category.bytes as f32 / total as f32).max(0.0);
+        if share <= 0.0 {
+            continue;
+        }
+        bar = bar.child(
+            div()
+                .h_full()
+                .flex_basis(relative(share))
+                .bg(category.background),
+        );
+    }
+
+    bar
+}
+
+fn storage_legend(storage: &StorageBreakdown, cx: &Context<AppModel>) -> impl IntoElement {
+    let colors = cx.theme().colors.clone();
+    let spacing = cx.theme().spacing;
+    let radii = cx.theme().radii;
+    let typography = cx.theme().typography;
+    let total = storage.total.max(1);
+    let mut legend = div()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .gap(px(spacing.md))
+        .pt(px(spacing.xs));
+
+    for category in storage_categories(storage, &colors) {
+        legend = legend.child(
+            div()
+                .w(px(260.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(spacing.sm))
+                .text_size(px(typography.caption.size))
+                .child(
+                    div()
+                        .size(px(10.0))
+                        .rounded(px(radii.sm))
+                        .bg(category.background),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .text_color(colors.on_subtle)
+                        .child(category.label),
+                )
+                .child(
+                    div()
+                        .w(px(44.0))
+                        .text_color(colors.on_neutral)
+                        .text_align(gpui::TextAlign::Right)
+                        .tabular_nums()
+                        .child(storage_percent(category.bytes, total)),
+                ),
+        );
+    }
+
+    legend
+}
+
+#[derive(Clone, Copy)]
+struct StorageCategory {
+    label: &'static str,
+    bytes: u64,
+    background: gpui::Background,
+}
+
+fn storage_categories(
+    storage: &StorageBreakdown,
+    colors: &fluent_core::ColorScheme,
+) -> [StorageCategory; 5] {
+    [
+        StorageCategory {
+            label: "Photos & Video",
+            bytes: storage.photos.saturating_add(storage.videos),
+            background: gradient_from_hue(220.0),
+        },
+        StorageCategory {
+            label: "Apps",
+            bytes: storage.apps,
+            background: gradient_from_hue(280.0),
+        },
+        StorageCategory {
+            label: "Music",
+            bytes: storage.music,
+            background: gradient_from_hue(145.0),
+        },
+        StorageCategory {
+            label: "System",
+            bytes: storage.system.saturating_add(storage.other),
+            background: colors.stroke_neutral.into(),
+        },
+        StorageCategory {
+            label: "Free",
+            bytes: storage.free,
+            background: colors.stroke_neutral_subtle.into(),
+        },
+    ]
+}
+
+fn storage_percent(bytes: u64, total: u64) -> String {
+    let pct = bytes as f64 / total.max(1) as f64 * 100.0;
+    format!("{pct:.0}%")
+}
+
+fn storage_gb_value(bytes: u64) -> String {
+    format!("{:.1}", bytes as f64 / 1_000_000_000.0)
+}
+
+fn storage_gb_label(bytes: u64) -> String {
+    let value = bytes as f64 / 1_000_000_000.0;
+    if value >= 10.0 {
+        format!("{value:.0} GB")
+    } else {
+        format!("{value:.1} GB")
+    }
 }
 
 fn phone_illustration(cx: &Context<AppModel>) -> impl IntoElement {

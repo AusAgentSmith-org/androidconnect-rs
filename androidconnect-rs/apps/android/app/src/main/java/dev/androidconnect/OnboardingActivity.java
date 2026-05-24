@@ -6,6 +6,8 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
+import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.provider.Settings;
 import android.view.Gravity;
@@ -209,15 +211,24 @@ public final class OnboardingActivity extends Activity {
             case DND_POLICY:
                 safelyStart(new Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS));
                 return;
-            default:
-                String[] permissions = PermissionStatusRepository.runtimePermissionsFor(id);
-                if (permissions.length == 0) {
-                    Toast.makeText(this, "No permission to request on this Android version",
-                            Toast.LENGTH_SHORT).show();
+            case STORAGE:
+                if (Build.VERSION.SDK_INT >= 30) {
+                    Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
+                    intent.setData(Uri.parse("package:" + getPackageName()));
+                    safelyStart(intent);
                     return;
                 }
-                requestPermissions(permissions, REQUEST_RUNTIME_PERMISSION);
+                break;
+            default:
+                break;
         }
+        String[] permissions = PermissionStatusRepository.runtimePermissionsFor(id);
+        if (permissions.length == 0) {
+            Toast.makeText(this, "No permission to request on this Android version",
+                    Toast.LENGTH_SHORT).show();
+            return;
+        }
+        requestPermissions(permissions, REQUEST_RUNTIME_PERMISSION);
     }
 
     private void safelyStart(Intent intent) {
@@ -256,6 +267,8 @@ public final class OnboardingActivity extends Activity {
                 return "Open accessibility settings";
             case DND_POLICY:
                 return "Open Do Not Disturb access";
+            case STORAGE:
+                return "Open storage settings";
             default:
                 return "Grant permission";
         }

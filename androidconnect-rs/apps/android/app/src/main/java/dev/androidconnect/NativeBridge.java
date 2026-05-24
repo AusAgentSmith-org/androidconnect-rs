@@ -134,6 +134,10 @@ public final class NativeBridge {
         return AVAILABLE && nativePushMediaStatus(json);
     }
 
+    public static boolean pushStorageStatusJson(String json) {
+        return AVAILABLE && nativePushStorageStatus(json);
+    }
+
     public static boolean pushNotificationPostedJson(String json) {
         return AVAILABLE && nativePushNotificationPosted(json);
     }
@@ -365,6 +369,7 @@ public final class NativeBridge {
     );
     private static native boolean nativePushDeviceStatus(String statusJson);
     private static native boolean nativePushMediaStatus(String statusJson);
+    private static native boolean nativePushStorageStatus(String statusJson);
     private static native boolean nativePushNotificationPosted(String notificationJson);
     private static native boolean nativePushNotificationRemoved(String notificationId);
     private static native boolean nativePushClipboardText(String text);

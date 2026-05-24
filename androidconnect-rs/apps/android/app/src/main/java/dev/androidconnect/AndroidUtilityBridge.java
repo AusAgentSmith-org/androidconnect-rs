@@ -3,6 +3,8 @@ package dev.androidconnect;
 import android.Manifest;
 import android.app.Activity;
 import android.app.NotificationManager;
+import android.app.usage.StorageStats;
+import android.app.usage.StorageStatsManager;
 import android.app.role.RoleManager;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothManager;
@@ -13,6 +15,7 @@ import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.media.AudioManager;
@@ -24,7 +27,10 @@ import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
 import android.os.BatteryManager;
 import android.os.Build;
+import android.os.Environment;
 import android.os.PowerManager;
+import android.os.StatFs;
+import android.os.storage.StorageManager;
 
 import androidx.core.content.ContextCompat;
 import android.provider.MediaStore;
@@ -43,8 +49,10 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Set;
 
 public final class AndroidUtilityBridge {
     private static final String TAG = "AndroidUtilityBridge";
@@ -61,6 +69,7 @@ public final class AndroidUtilityBridge {
         }
         pushDeviceStatus(context);
         pushPhotosPermissionStatus();
+        pushStorageStatus(context);
         pushMessagesPermissionStatus();
         pushCallState(context);
         pushRelayDisabledStatus();
@@ -519,6 +528,25 @@ public final class AndroidUtilityBridge {
         }
     }
 
+    public static void pushStorageStatus(Context context) {
+        if (context == null) {
+            return;
+        }
+        JSONObject json = new JSONObject();
+        try {
+            boolean granted = canReadStorageBreakdown(context);
+            json.put("primary", granted
+                    ? readStorageBreakdown(context)
+                    : emptyStorageBreakdown());
+            json.put("status", featureStatus(
+                    "Storage",
+                    granted ? "Available" : "PermissionRequired",
+                    granted ? "" : "All files access is required for storage breakdowns"));
+            NativeBridge.pushStorageStatusJson(json.toString());
+        } catch (JSONException ignored) {
+        }
+    }
+
     public static void pushMessagesPermissionStatus() {
         Context context = context();
         if (context != null) {
@@ -688,6 +716,9 @@ public final class AndroidUtilityBridge {
         }
         features.put(featureStatus("Calls", canUseCallSurfaces(context) ? "Available" : "PermissionRequired",
                 canUseCallSurfaces(context) ? "" : "Phone permissions and roles are required"));
+        features.put(featureStatus("Storage",
+                canReadStorageBreakdown(context) ? "Available" : "PermissionRequired",
+                canReadStorageBreakdown(context) ? "" : "All files access is required for storage breakdowns"));
         features.put(featureStatus("Photos",
                 canReadPhotos(context) ? "Available" : "PermissionRequired",
                 canReadPhotos(context) ? "" : "Photo and video media permission is required"));
@@ -933,6 +964,133 @@ public final class AndroidUtilityBridge {
         }
         return context.checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE)
                 == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private static boolean canReadStorageBreakdown(Context context) {
+        if (Build.VERSION.SDK_INT >= 30) {
+            return Environment.isExternalStorageManager();
+        }
+        return context.checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE)
+                == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private static JSONObject readStorageBreakdown(Context context) throws JSONException {
+        StatFs stat = new StatFs(Environment.getExternalStorageDirectory().getAbsolutePath());
+        long total = Math.max(0L, stat.getTotalBytes());
+        long free = Math.max(0L, stat.getAvailableBytes());
+        long used = Math.max(0L, total - free);
+        long remaining = used;
+        long photos = boundedBytes(
+                queryMediaBytes(context, MediaStore.Images.Media.EXTERNAL_CONTENT_URI),
+                remaining);
+        remaining -= photos;
+        long videos = boundedBytes(
+                queryMediaBytes(context, MediaStore.Video.Media.EXTERNAL_CONTENT_URI),
+                remaining);
+        remaining -= videos;
+        long music = boundedBytes(
+                queryMediaBytes(context, MediaStore.Audio.Media.EXTERNAL_CONTENT_URI),
+                remaining);
+        remaining -= music;
+        long apps = boundedBytes(queryInstalledAppBytes(context), remaining);
+        remaining -= apps;
+        long system = Math.max(0L, remaining);
+
+        JSONObject json = new JSONObject();
+        json.put("total", total);
+        json.put("used", used);
+        json.put("free", free);
+        json.put("photos", photos);
+        json.put("videos", videos);
+        json.put("apps", apps);
+        json.put("music", music);
+        json.put("system", system);
+        json.put("other", 0L);
+        return json;
+    }
+
+    private static JSONObject emptyStorageBreakdown() throws JSONException {
+        JSONObject json = new JSONObject();
+        json.put("total", 0L);
+        json.put("used", 0L);
+        json.put("free", 0L);
+        json.put("photos", 0L);
+        json.put("videos", 0L);
+        json.put("apps", 0L);
+        json.put("music", 0L);
+        json.put("system", 0L);
+        json.put("other", 0L);
+        return json;
+    }
+
+    private static long queryMediaBytes(Context context, Uri uri) {
+        long total = 0L;
+        try (Cursor cursor = context.getContentResolver().query(
+                uri,
+                new String[] { MediaStore.MediaColumns.SIZE },
+                null,
+                null,
+                null)) {
+            if (cursor == null) {
+                return 0L;
+            }
+            int sizeColumn = cursor.getColumnIndex(MediaStore.MediaColumns.SIZE);
+            if (sizeColumn < 0) {
+                return 0L;
+            }
+            while (cursor.moveToNext()) {
+                total = safeAdd(total, Math.max(0L, cursor.getLong(sizeColumn)));
+            }
+        } catch (RuntimeException ignored) {
+            return 0L;
+        }
+        return total;
+    }
+
+    private static long queryInstalledAppBytes(Context context) {
+        if (Build.VERSION.SDK_INT < 26) {
+            return 0L;
+        }
+        StorageStatsManager statsManager = context.getSystemService(StorageStatsManager.class);
+        if (statsManager == null) {
+            return 0L;
+        }
+        long total = 0L;
+        Set<Integer> seenUids = new HashSet<>();
+        try {
+            for (ApplicationInfo app : context.getPackageManager().getInstalledApplications(0)) {
+                if (!seenUids.add(app.uid)) {
+                    continue;
+                }
+                try {
+                    StorageStats stats = statsManager.queryStatsForUid(
+                            StorageManager.UUID_DEFAULT,
+                            app.uid);
+                    total = safeAdd(total, stats.getAppBytes());
+                    total = safeAdd(total, stats.getDataBytes());
+                    total = safeAdd(total, stats.getCacheBytes());
+                } catch (RuntimeException ignored) {
+                } catch (IOException ignored) {
+                }
+            }
+        } catch (RuntimeException ignored) {
+            return 0L;
+        }
+        return total;
+    }
+
+    private static long safeAdd(long a, long b) {
+        if (Long.MAX_VALUE - a < b) {
+            return Long.MAX_VALUE;
+        }
+        return a + b;
+    }
+
+    private static long boundedBytes(long value, long remaining) {
+        if (value <= 0L || remaining <= 0L) {
+            return 0L;
+        }
+        return Math.min(value, remaining);
     }
 
     private static boolean canUseCallSurfaces(Context context) {

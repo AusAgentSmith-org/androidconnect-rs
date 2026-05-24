@@ -14,7 +14,7 @@ use androidconnect_protocol::{
     MessageEvent, MessageSendResponse, MessageThreadDetail, MessageThreadList, NotificationPosted,
     NotificationRemoved, PAIRED_SECRET_BYTES, PROTOCOL_VERSION, Payload, TransferDirection,
     TransferStatus, WireError, bytes_to_hex, derive_session_key, paired_secret_from_pairing_code,
-    pairing_auth_response, read_length_prefixed, session_key_fingerprint,
+    pairing_auth_response, read_length_prefixed, session_key_fingerprint, StorageBreakdown,
     trusted_session_auth_response, write_length_prefixed,
 };
 use anyhow::{Result, bail};
@@ -68,6 +68,10 @@ pub enum NetworkStatus {
         bluetooth_enabled: Option<bool>,
         dnd_mode: Option<DndMode>,
         volume_percent: Option<u8>,
+    },
+    Storage {
+        primary: StorageBreakdown,
+        status: FeatureStatus,
     },
     MediaStatus {
         active: bool,
@@ -648,6 +652,22 @@ fn read_client_loop(
                         bluetooth_enabled: bt_enabled,
                         dnd_mode,
                         volume_percent,
+                    },
+                );
+            }
+            Payload::StorageStatus(storage) => {
+                info!(
+                    "storage_status: total={} used={} free={} state={:?}",
+                    storage.primary.total,
+                    storage.primary.used,
+                    storage.primary.free,
+                    storage.status.state
+                );
+                send_status(
+                    &status_tx,
+                    NetworkStatus::Storage {
+                        primary: storage.primary,
+                        status: storage.status,
                     },
                 );
             }

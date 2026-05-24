@@ -1,6 +1,6 @@
 use androidconnect_protocol::{
-    DndMode, FeatureStatus, MediaControlAction, MediaPlaybackState, UtilityFeature,
-    normalize_pairing_code,
+    DndMode, FeatureStatus, MediaControlAction, MediaPlaybackState, StorageBreakdown,
+    UtilityFeature, normalize_pairing_code,
 };
 
 use crate::network;
@@ -35,6 +35,8 @@ pub struct DesktopStatus {
     pub battery_status: Option<String>,
     pub feature_summary: Option<String>,
     pub features: Vec<FeatureStatus>,
+    pub storage: Option<StorageBreakdown>,
+    pub storage_status: Option<FeatureStatus>,
     pub media_summary: Option<String>,
     pub media_info: Option<MediaInfo>,
     pub notification_summary: Option<String>,
@@ -67,6 +69,8 @@ impl DesktopStatus {
             battery_status: None,
             feature_summary: None,
             features: Vec::new(),
+            storage: None,
+            storage_status: None,
             media_summary: None,
             media_info: None,
             notification_summary: None,
@@ -208,6 +212,11 @@ impl DesktopStatus {
                     None
                 };
             }
+            network::NetworkStatus::Storage { primary, status } => {
+                self.storage = Some(primary);
+                self.storage_status = Some(status);
+                self.connection = ConnectionState::Connected;
+            }
             network::NetworkStatus::ClipboardText { source, characters } => {
                 self.clipboard_summary = Some(format!("{source:?} clipboard {characters} chars"));
             }
@@ -294,6 +303,8 @@ impl DesktopStatus {
         self.battery_status = None;
         self.feature_summary = None;
         self.features.clear();
+        self.storage = None;
+        self.storage_status = None;
         self.media_summary = None;
         self.media_info = None;
         self.notification_summary = None;

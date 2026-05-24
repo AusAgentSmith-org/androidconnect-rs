@@ -6,7 +6,7 @@ use thiserror::Error;
 
 pub mod qr;
 
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 pub const DEFAULT_CONTROL_PORT: u16 = 48172;
 pub const DEFAULT_VIDEO_PORT: u16 = 48173;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 256 * 1024;
@@ -48,6 +48,7 @@ pub enum Payload {
     VideoFrame(VideoFrame),
     Input(InputEvent),
     DeviceStatus(DeviceStatus),
+    StorageStatus(StorageStatus),
     MediaStatus(MediaStatus),
     MediaControl(MediaControl),
     ClipboardText(ClipboardText),
@@ -244,6 +245,7 @@ pub enum UtilityFeature {
     AppWindows,
     Messages,
     Calls,
+    Storage,
     Photos,
     Relay,
     MultiClient,
@@ -263,6 +265,7 @@ impl UtilityFeature {
             Self::AppWindows,
             Self::Messages,
             Self::Calls,
+            Self::Storage,
             Self::Photos,
             Self::Relay,
             Self::MultiClient,
@@ -339,6 +342,29 @@ pub struct DeviceStatus {
     pub dnd_state: Option<DndState>,
     #[serde(default)]
     pub volume: Option<VolumeState>,
+}
+
+/// Storage breakdown for the device's primary external storage volume.
+/// All values are bytes. Photos + videos + apps + music + system + other
+/// should sum to `used`; `free` plus `used` should equal `total`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageBreakdown {
+    pub total: u64,
+    pub used: u64,
+    pub free: u64,
+    pub photos: u64,
+    pub videos: u64,
+    pub apps: u64,
+    pub music: u64,
+    pub system: u64,
+    pub other: u64,
+}
+
+/// Push-style update for primary device storage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageStatus {
+    pub primary: StorageBreakdown,
+    pub status: FeatureStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1227,6 +1253,35 @@ mod tests {
 
         assert_eq!(decoded.version, PROTOCOL_VERSION);
         assert_eq!(decoded.sequence, 8);
+        assert_eq!(decoded.payload, envelope.payload);
+        assert!(UtilityFeature::mvp2_all().contains(&UtilityFeature::Storage));
+    }
+
+    #[test]
+    fn storage_status_round_trips() {
+        let envelope = Envelope::new(
+            9,
+            Payload::StorageStatus(StorageStatus {
+                primary: StorageBreakdown {
+                    total: 128_000_000_000,
+                    used: 96_000_000_000,
+                    free: 32_000_000_000,
+                    photos: 28_000_000_000,
+                    videos: 18_000_000_000,
+                    apps: 24_000_000_000,
+                    music: 8_000_000_000,
+                    system: 18_000_000_000,
+                    other: 0,
+                },
+                status: FeatureStatus::available(UtilityFeature::Storage),
+            }),
+        );
+
+        let bytes = encode_envelope(&envelope).expect("encode");
+        let decoded = decode_envelope(&bytes).expect("decode");
+
+        assert_eq!(decoded.version, PROTOCOL_VERSION);
+        assert_eq!(decoded.sequence, 9);
         assert_eq!(decoded.payload, envelope.payload);
     }
 

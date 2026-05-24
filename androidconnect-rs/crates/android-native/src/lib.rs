@@ -512,6 +512,20 @@ pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativePushMediaStatu
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativePushStorageStatus(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    status_json: JString<'_>,
+) -> jboolean {
+    push_json_payload::<androidconnect_protocol::StorageStatus>(
+        &mut env,
+        status_json,
+        "storage status",
+        Payload::StorageStatus,
+    )
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativePushNotificationPosted(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,

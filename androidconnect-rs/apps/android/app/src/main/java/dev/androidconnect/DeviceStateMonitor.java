@@ -11,6 +11,8 @@ import android.media.AudioManager;
 import android.net.ConnectivityManager;
 import android.net.Network;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 
 /**
  * Bridges OS state changes (WiFi connectivity, audio volume, Bluetooth, DND)
@@ -23,13 +25,23 @@ final class DeviceStateMonitor {
     private static DeviceStateMonitor INSTANCE;
     private static boolean connectionActive;
     private static boolean sessionActive;
+    private static final long STORAGE_REFRESH_MS = 5L * 60L * 1000L;
 
     private final Context appContext;
+    private final Handler handler = new Handler(Looper.getMainLooper());
     private BroadcastReceiver volumeReceiver;
     private BroadcastReceiver bluetoothReceiver;
     private BroadcastReceiver dndReceiver;
+    private BroadcastReceiver storageReceiver;
     private ConnectivityManager connectivityManager;
     private ConnectivityManager.NetworkCallback networkCallback;
+    private final Runnable storageRefresh = new Runnable() {
+        @Override
+        public void run() {
+            AndroidUtilityBridge.pushStorageStatus(appContext);
+            handler.postDelayed(this, STORAGE_REFRESH_MS);
+        }
+    };
 
     private DeviceStateMonitor(Context context) {
         this.appContext = context.getApplicationContext();
@@ -87,10 +99,13 @@ final class DeviceStateMonitor {
         registerVolumeReceiver();
         registerBluetoothReceiver();
         registerDndReceiver();
+        registerStorageReceiver();
         registerNetworkCallback();
+        handler.postDelayed(storageRefresh, STORAGE_REFRESH_MS);
     }
 
     private void unregister() {
+        handler.removeCallbacks(storageRefresh);
         if (volumeReceiver != null) {
             safeUnregister(volumeReceiver);
             volumeReceiver = null;
@@ -102,6 +117,10 @@ final class DeviceStateMonitor {
         if (dndReceiver != null) {
             safeUnregister(dndReceiver);
             dndReceiver = null;
+        }
+        if (storageReceiver != null) {
+            safeUnregister(storageReceiver);
+            storageReceiver = null;
         }
         if (connectivityManager != null && networkCallback != null) {
             try {
@@ -155,6 +174,20 @@ final class DeviceStateMonitor {
         IntentFilter filter = new IntentFilter(
                 NotificationManager.ACTION_INTERRUPTION_FILTER_CHANGED);
         registerCompat(dndReceiver, filter);
+    }
+
+    private void registerStorageReceiver() {
+        storageReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                AndroidUtilityBridge.pushStorageStatus(appContext);
+            }
+        };
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(Intent.ACTION_MEDIA_MOUNTED);
+        filter.addAction(Intent.ACTION_MEDIA_UNMOUNTED);
+        filter.addDataScheme("file");
+        registerCompat(storageReceiver, filter);
     }
 
     private void registerNetworkCallback() {

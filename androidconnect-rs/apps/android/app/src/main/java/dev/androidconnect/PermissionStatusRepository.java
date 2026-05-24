@@ -6,6 +6,7 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.pm.PackageManager;
 import android.os.Build;
+import android.os.Environment;
 import android.provider.Settings;
 import android.text.TextUtils;
 
@@ -201,19 +202,22 @@ public final class PermissionStatusRepository {
 
     private PermissionState storageState() {
         boolean granted;
-        if (Build.VERSION.SDK_INT >= 33) {
-            granted = appContext.checkSelfPermission(Manifest.permission.READ_MEDIA_IMAGES)
-                    == PackageManager.PERMISSION_GRANTED
-                    || appContext.checkSelfPermission(Manifest.permission.READ_MEDIA_VIDEO)
-                    == PackageManager.PERMISSION_GRANTED;
+        State state;
+        String description;
+        if (Build.VERSION.SDK_INT >= 30) {
+            granted = Environment.isExternalStorageManager();
+            state = granted ? State.GRANTED : State.NEEDS_SETTINGS_PAGE;
+            description = "Optional. Enables full storage breakdowns and broad file browsing.";
         } else {
             granted = hasAll(Manifest.permission.READ_EXTERNAL_STORAGE);
+            state = granted ? State.GRANTED : State.NOT_GRANTED;
+            description = "Optional. Lets the desktop browse and summarize phone storage.";
         }
         return new PermissionState(
                 PermissionId.STORAGE,
-                "Photos and media",
-                "Optional. Lets the desktop browse and share photos and videos.",
-                granted ? State.GRANTED : State.NOT_GRANTED,
+                "Storage",
+                description,
+                state,
                 false);
     }
 
