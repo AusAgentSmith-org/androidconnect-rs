@@ -1,24 +1,7 @@
-# Rust build artifacts
-androidconnect-rs/target/
-
-# Reference repos (separate git trees, not part of this project)
-kdeconnect-android/
-kdeconnect-kde/
-
-# Android build outputs
-androidconnect-rs/apps/android/.gradle/
-androidconnect-rs/apps/android/app/build/
-androidconnect-rs/apps/android/build/
-*.apk
-*.aab
-
-# JNI libs produced by build-android-native.sh (reproducible)
-androidconnect-rs/apps/android/app/src/main/jniLibs/
-
-# IDE
-.idea/
-*.iml
-.vscode/
-
-# OS
-.DS_Store
+/target/
+/apps/desktop-viewer/target/
+/apps/gpui-spike/target/
+/apps/android/.gradle/
+/apps/android/build/
+/apps/android/app/build/
+/apps/android/app/src/main/jniLibs/**/*.so
