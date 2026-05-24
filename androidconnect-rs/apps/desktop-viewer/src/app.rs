@@ -4,12 +4,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use fluent_app::{TitleBar, title_bar as new_title_bar};
-use fluent_core::ThemeProvider as _;
+use fluent_app::TitleBar;
+use fluent_core::{ThemeProvider as _, tint};
 use fluent_primitives::{
     AppDot, Avatar, Button, ButtonAppearance, ButtonShape, ButtonSize, Card, ConnectionBadge,
-    ConnectionBadgeState, Divider, Icon, IconSize, Label, LabelSize, SectionHeader, Switch,
-    TextInput,
+    ConnectionBadgeState, Divider, FluentTextExt as _, Icon, IconSize, Label, LabelSize,
+    SectionHeader, Switch, TextInput,
 };
 use gpui::{
     App, Bounds, ClickEvent, Context, Entity, FontWeight, IntoElement, MouseButton, MouseDownEvent,
@@ -121,7 +121,7 @@ impl AppModel {
         let sms_composer = cx.new(|_| TextInput::new().placeholder("Type a message…"));
         let quick_reply_input = cx.new(|_| TextInput::new().placeholder("Quick reply…"));
         let file_action_input = cx.new(|_| TextInput::new());
-        let title_bar = new_title_bar("AndroidConnect", cx);
+        let title_bar = cx.new(|cx| TitleBar::new(cx, "AndroidConnect").icon("icons/logo.svg"));
         Self {
             command_tx,
             status,
@@ -1121,7 +1121,11 @@ impl AppModel {
                             .rounded(px(9999.0))
                             .bg(colors.status_success),
                     )
-                    .child(div().child(format!("{}×{}", frame_w, frame_h))),
+                    .child(
+                        div()
+                            .tabular_nums()
+                            .child(format!("{}×{}", frame_w, frame_h)),
+                    ),
             )
             .into_any_element()
     }
@@ -1240,6 +1244,7 @@ impl AppModel {
             .text_size(px(28.0))
             .font_family("monospace")
             .font_weight(FontWeight::SEMIBOLD)
+            .tabular_nums()
             .child(pairing_code_fmt);
 
         let right = div()
@@ -1381,6 +1386,7 @@ impl AppModel {
                         .child(
                             div()
                                 .text_color(colors.on_subtle)
+                                .tabular_nums()
                                 .child(format!("{volume}%")),
                         ),
                 );
@@ -2978,17 +2984,12 @@ fn format_socket_addr(ip: IpAddr, port: u16) -> String {
 
 // ── Render helpers ────────────────────────────────────────────────────────
 
-fn section_header(title: &'static str, cx: &Context<AppModel>) -> impl IntoElement {
-    let colors = cx.theme().colors.clone();
-    let typography = cx.theme().typography;
+fn section_header(title: &'static str, _cx: &Context<AppModel>) -> impl IntoElement {
     div()
         .px(px(16.0))
         .pt(px(12.0))
         .pb(px(6.0))
-        .text_color(colors.on_subtle)
-        .text_size(px(typography.caption.size))
-        .font_weight(FontWeight::SEMIBOLD)
-        .child(title.to_uppercase())
+        .child(Label::eyebrow(title))
 }
 
 fn action_icon_button(
@@ -3039,7 +3040,7 @@ fn stat_chip(icon_name: &'static str, value: &str, cx: &Context<AppModel>) -> im
         .gap(px(4.0))
         .text_color(colors.on_subtle)
         .child(Icon::new(icon_name).size(IconSize::Sm))
-        .child(div().child(value.to_owned()))
+        .child(div().tabular_nums().child(value.to_owned()))
 }
 
 fn pending_dot(cx: &Context<AppModel>) -> impl IntoElement {
@@ -3194,7 +3195,7 @@ fn quick_action(
             div()
                 .size(px(36.0))
                 .rounded(px(8.0))
-                .bg(colors.surface_dim)
+                .bg(tint(colors.accent, 0.18))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -3290,17 +3291,14 @@ fn device_summary_card(
                                 .gap(px(6.0))
                                 .text_color(colors.on_subtle)
                                 .child(Icon::new("battery").size(IconSize::Sm))
-                                .child(
-                                    div()
-                                        .text_size(px(typography.caption.size))
-                                        .child("BATTERY"),
-                                ),
+                                .child(Label::eyebrow("Battery")),
                         )
                         .child(
                             div()
                                 .text_color(colors.on_neutral)
                                 .text_size(px(typography.display.size))
                                 .font_weight(FontWeight::BOLD)
+                                .tabular_nums()
                                 .child(battery_label),
                         ),
                 )
@@ -3331,12 +3329,7 @@ fn stat_block(label: &str, value: &str, cx: &Context<AppModel>) -> impl IntoElem
         .flex()
         .flex_col()
         .gap(px(2.0))
-        .child(
-            div()
-                .text_color(colors.on_subtle)
-                .text_size(px(typography.caption.size))
-                .child(label.to_uppercase()),
-        )
+        .child(Label::eyebrow(label.to_owned()))
         .child(
             div()
                 .text_color(colors.on_neutral)
@@ -3380,12 +3373,7 @@ fn now_playing_card(media: &crate::status::MediaInfo, cx: &Context<AppModel>) ->
                     .flex()
                     .flex_col()
                     .gap(px(2.0))
-                    .child(
-                        div()
-                            .text_color(colors.on_subtle)
-                            .text_size(px(typography.caption.size))
-                            .child(format!("NOW PLAYING · {app_name}")),
-                    )
+                    .child(Label::eyebrow(format!("Now playing · {app_name}")))
                     .child(
                         div()
                             .text_color(colors.on_neutral)
@@ -3636,9 +3624,9 @@ fn numbered_step(n: usize, title: &str, body: &str, cx: &Context<AppModel>) -> i
             div()
                 .size(px(26.0))
                 .rounded(px(9999.0))
-                .bg(colors.neutral)
+                .bg(tint(colors.accent, 0.18))
                 .border_1()
-                .border_color(colors.stroke_neutral)
+                .border_color(tint(colors.accent, 0.4))
                 .text_color(colors.on_neutral_accent)
                 .flex()
                 .items_center()
