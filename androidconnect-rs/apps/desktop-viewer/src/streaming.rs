@@ -1,7 +1,39 @@
+use gpui::{Bounds, Pixels, point, px};
+
 pub struct RgbaFrame {
     pub width: u32,
     pub height: u32,
     pub data: Vec<u8>,
+}
+
+/// Compute the sub-rectangle of `bounds` into which a `(frame_w, frame_h)`
+/// frame should be painted while preserving aspect ratio. Returns the centred
+/// letterboxed bounds — pass directly to `Window::paint_video_frame`.
+///
+/// If either dimension is zero, returns the input `bounds` unchanged.
+pub fn letterbox_bounds(bounds: Bounds<Pixels>, frame_w: u32, frame_h: u32) -> Bounds<Pixels> {
+    if frame_w == 0 || frame_h == 0 {
+        return bounds;
+    }
+    let bw: f32 = bounds.size.width.into();
+    let bh: f32 = bounds.size.height.into();
+    let bx: f32 = bounds.origin.x.into();
+    let by: f32 = bounds.origin.y.into();
+    let frame_aspect = frame_w as f32 / frame_h as f32;
+    let canvas_aspect = if bh > 0.0 { bw / bh } else { 1.0 };
+    let (w, h) = if canvas_aspect > frame_aspect {
+        let h = bh;
+        (h * frame_aspect, h)
+    } else {
+        let w = bw;
+        (w, w / frame_aspect)
+    };
+    let ox = bx + (bw - w) / 2.0;
+    let oy = by + (bh - h) / 2.0;
+    Bounds {
+        origin: point(px(ox), px(oy)),
+        size: gpui::size(px(w), px(h)),
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

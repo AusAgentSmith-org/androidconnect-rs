@@ -4,27 +4,38 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fluent_app::{TitleBar, title_bar as new_title_bar};
 use fluent_core::ThemeProvider as _;
-use fluent_primitives::{Button, ButtonAppearance, Divider, Label, LabelSize, Switch, TextInput};
+use fluent_primitives::{
+    AppDot, Avatar, Button, ButtonAppearance, ButtonShape, ButtonSize, Card, ConnectionBadge,
+    ConnectionBadgeState, Divider, Icon, IconSize, Label, LabelSize, SectionHeader, Switch,
+    TextInput,
+};
 use gpui::{
     App, Bounds, ClickEvent, Context, Entity, FontWeight, IntoElement, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
-    SharedString, VideoTextureId, Window, canvas, div, prelude::*, px,
+    SharedString, VideoTextureId, Window, backdrop_blur, canvas, div, hsla, prelude::*, px,
 };
 use qrcode::{Color as QrColor, QrCode};
 
 use androidconnect_protocol::{
-    AudioControl, AudioControlCommand, DndMode, InputEvent, MediaControl, MediaControlAction,
-    MediaPlaybackState, MessageDirection, Payload, PointerButton, PointerEvent, PointerPhase,
+    AudioControl, AudioControlCommand, DndMode, FeatureState, FeatureStatus, InputEvent,
+    MediaPlaybackState, MessageDirection, MessageSendResult, Payload, PointerButton, PointerEvent,
+    PointerPhase, UtilityFeature,
     qr::{QrPairingPayload, encode_qr_payload},
 };
 
 use crate::network;
 use crate::panels::{
-    MessagesState, Panel, files::FilesState, notifications::NotificationsState, phone::PhoneState,
+    ActivityIcon, ActivityLog, MessagesState, Panel, files::FilesState,
+    notifications::NotificationsState, phone::PhoneState,
 };
 use crate::status::{ConnectionState, DesktopStatus, format_pairing_code};
-use crate::streaming::{RgbaFrame, map_window_to_frame};
+use crate::streaming::{RgbaFrame, letterbox_bounds, map_window_to_frame};
+
+const SIDEBAR_WIDTH: f32 = 220.0;
+const TOPBAR_HEIGHT: f32 = 48.0;
+const STATUSBAR_HEIGHT: f32 = 28.0;
 
 pub struct AppModel {
     command_tx: mpsc::SyncSender<network::DesktopCommand>,
@@ -33,6 +44,7 @@ pub struct AppModel {
     desktop_id: String,
     desktop_name: String,
     active_panel: Panel,
+    title_bar: Entity<TitleBar>,
 
     // Video mirror
     video_texture: Option<VideoTextureId>,
@@ -58,6 +70,8 @@ pub struct AppModel {
     phone_state: PhoneState,
     files_state: FilesState,
     messages_state: MessagesState,
+    activity: ActivityLog,
+    logged_initial_pair: bool,
 
     // Per-panel text inputs (FluentGUI TextInputs are Entities and must be pre-created)
     sms_composer: Entity<TextInput>,
@@ -107,13 +121,15 @@ impl AppModel {
         let sms_composer = cx.new(|_| TextInput::new().placeholder("Type a message…"));
         let quick_reply_input = cx.new(|_| TextInput::new().placeholder("Quick reply…"));
         let file_action_input = cx.new(|_| TextInput::new());
+        let title_bar = new_title_bar("AndroidConnect", cx);
         Self {
             command_tx,
             status,
             pair_addresses,
             desktop_id,
             desktop_name,
-            active_panel: Panel::Mirror,
+            active_panel: Panel::Overview,
+            title_bar,
             video_texture: None,
             video_alloc_w: 0,
             video_alloc_h: 0,
@@ -131,6 +147,8 @@ impl AppModel {
             phone_state: PhoneState::default(),
             files_state,
             messages_state: MessagesState::default(),
+            activity: ActivityLog::default(),
+            logged_initial_pair: false,
             sms_composer,
             quick_reply: QuickReplyState::default(),
             quick_reply_input,
@@ -154,10 +172,22 @@ impl AppModel {
 
     pub fn push_status(&mut self, status: network::NetworkStatus, cx: &mut Context<Self>) {
         let prev_bind = self.status.bind.clone();
+        let was_authenticated = self.status.input_authenticated;
         self.status.apply(status);
         if self.status.bind != prev_bind {
             self.pair_addresses = advertised_pair_addresses(&self.status.bind);
             self.qr_cache_key.clear();
+        }
+        if !was_authenticated && self.status.input_authenticated && !self.logged_initial_pair {
+            let name = self
+                .status
+                .device_name
+                .clone()
+                .or_else(|| self.status.peer.clone())
+                .unwrap_or_else(|| "device".to_owned());
+            self.activity
+                .push(ActivityIcon::Pair, format!("Paired with {name}"));
+            self.logged_initial_pair = true;
         }
         cx.notify();
     }
@@ -177,7 +207,14 @@ impl AppModel {
                 self.messages_state.apply_thread_detail(detail);
             }
             network::DesktopEvent::MessageSendResponse(resp) => {
+                let succeeded = matches!(
+                    resp.result,
+                    MessageSendResult::Queued | MessageSendResult::Sent
+                );
                 self.messages_state.apply_send_response(resp);
+                if succeeded {
+                    self.activity.push(ActivityIcon::Send, "Sent reply via SMS");
+                }
             }
             network::DesktopEvent::SessionLost => {
                 self.notifications.clear();
@@ -197,6 +234,7 @@ impl AppModel {
                     *g = None;
                 }
                 self.left_pressed = false;
+                self.logged_initial_pair = false;
             }
         }
         cx.notify();
@@ -261,99 +299,290 @@ impl AppModel {
             && self.status.input_authenticated
     }
 
-    // ── Panel renderers ────────────────────────────────────────────────────
+    fn badge_state(&self) -> ConnectionBadgeState {
+        match self.status.connection {
+            ConnectionState::Listening => ConnectionBadgeState::Disconnected,
+            ConnectionState::Connected if self.status.input_authenticated => {
+                ConnectionBadgeState::Paired
+            }
+            ConnectionState::Connected => ConnectionBadgeState::Pairing,
+            ConnectionState::Error => ConnectionBadgeState::Error,
+        }
+    }
+
+    // ── Chrome ────────────────────────────────────────────────────────────
 
     fn render_top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let colors = cx.theme().colors.clone();
+        let typography = cx.theme().typography;
+
         let subject = self
             .status
             .device_name
             .clone()
             .or_else(|| self.status.peer.clone())
-            .unwrap_or_else(|| "no device".to_owned());
-        let (state_color, state_label) = match self.status.connection {
-            ConnectionState::Listening => (gpui::rgb(0x888888u32), "listening"),
-            ConnectionState::Connected if self.status.input_authenticated => {
-                (gpui::rgb(0x50c878u32), "paired")
-            }
-            ConnectionState::Connected => (gpui::rgb(0xffdd57u32), "pairing"),
-            ConnectionState::Error => (gpui::rgb(0xff4444u32), "error"),
-        };
+            .unwrap_or_else(|| "No device".to_owned());
+        let initials = device_initials(&subject);
+
         div()
-            .h(px(48.0))
-            .px(px(12.0))
+            .h(px(TOPBAR_HEIGHT))
+            .px(px(16.0))
             .flex()
+            .flex_row()
             .items_center()
-            .gap(px(8.0))
-            .bg(colors.neutral)
+            .gap(px(12.0))
+            .bg(colors.surface)
+            .border_b_1()
+            .border_color(colors.stroke_neutral_subtle)
             .child(
+                // Device chip (pill)
                 div()
-                    .text_color(colors.on_neutral)
-                    .text_size(px(16.0))
-                    .child("AndroidConnect"),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .pr(px(10.0))
+                    .pl(px(4.0))
+                    .py(px(4.0))
+                    .rounded(px(9999.0))
+                    .border_1()
+                    .border_color(colors.stroke_neutral)
+                    .bg(colors.neutral)
+                    .child(Avatar::initials(initials).size(24.0))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_size(px(typography.body.size))
+                                    .text_color(colors.on_neutral)
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(subject.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(colors.on_subtle)
+                                    .child(self.status.bind.clone()),
+                            ),
+                    ),
             )
-            .child(
-                div()
-                    .w(px(1.0))
-                    .h(px(24.0))
-                    .bg(colors.stroke_neutral_subtle),
-            )
-            .child(div().text_color(colors.on_subtle).child(subject))
+            .child(ConnectionBadge::new("topbar-conn", self.badge_state()))
             .child(div().flex_1())
-            .child(div().w(px(10.0)).h(px(10.0)).rounded_full().bg(state_color))
-            .child(
-                div()
-                    .text_color(colors.on_subtle)
-                    .text_size(px(12.0))
-                    .child(state_label),
-            )
+            .child(action_icon_button(
+                "topbar-theme",
+                "moon",
+                cx,
+                |_, _, app| {
+                    fluent_core::Theme::toggle(app);
+                },
+            ))
+            .child(action_icon_button(
+                "topbar-refresh",
+                "refresh",
+                cx,
+                |_, _, _| {},
+            ))
+            .child(action_icon_button(
+                "topbar-settings",
+                "settings",
+                cx,
+                |_, _, _| {},
+            ))
     }
 
-    fn render_nav_rail(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let colors = cx.theme().colors.clone();
+        let typography = cx.theme().typography;
         let entity = cx.entity();
+
         let mut rail = div()
-            .w(px(160.0))
+            .w(px(SIDEBAR_WIDTH))
             .h_full()
-            .bg(colors.surface)
+            .bg(colors.panel_bg)
+            .border_r_1()
+            .border_color(colors.stroke_neutral_subtle)
             .flex()
-            .flex_col()
-            .gap(px(2.0))
-            .p(px(8.0));
+            .flex_col();
+
+        rail = rail.child(section_header("Workspace", cx));
+
         for panel in Panel::ALL {
             let is_active = panel == self.active_panel;
             let entity2 = entity.clone();
-            rail = rail.child(
+            let unread = if matches!(panel, Panel::Messages) {
+                self.messages_state
+                    .threads
+                    .iter()
+                    .map(|t| t.unread_count)
+                    .sum::<u32>()
+            } else {
+                0
+            };
+
+            let label_color = if is_active {
+                colors.on_neutral
+            } else {
+                colors.on_subtle
+            };
+
+            let mut item = div()
+                .id(("nav-", panel as usize))
+                .h(px(36.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .cursor_pointer()
+                .bg(if is_active {
+                    colors.neutral_selected
+                } else {
+                    gpui::transparent_black()
+                })
+                .hover(move |s| {
+                    if is_active {
+                        s
+                    } else {
+                        s.bg(colors.subtle_hover)
+                    }
+                })
+                .on_click(move |_: &ClickEvent, _win, app: &mut App| {
+                    entity2.update(app, |m, cx| {
+                        m.active_panel = panel;
+                        cx.notify();
+                    });
+                });
+
+            // 3px accent indicator bar on the left
+            item = item.child(div().w(px(3.0)).h(px(20.0)).ml(px(0.0)).bg(if is_active {
+                colors.accent
+            } else {
+                gpui::transparent_black()
+            }));
+
+            // Icon
+            item = item.child(
                 div()
-                    .id(("nav-", panel as usize))
-                    .px(px(12.0))
-                    .py(px(8.0))
-                    .rounded(px(4.0))
-                    .bg(if is_active {
-                        colors.subtle_selected
+                    .pl(px(13.0))
+                    .pr(px(10.0))
+                    .text_color(label_color)
+                    .child(Icon::new(panel.icon()).size(IconSize::Sm)),
+            );
+
+            // Label
+            item = item.child(
+                div()
+                    .flex_1()
+                    .text_size(px(typography.body.size))
+                    .text_color(label_color)
+                    .font_weight(if is_active {
+                        FontWeight::SEMIBOLD
                     } else {
-                        colors.surface
-                    })
-                    .text_color(if is_active {
-                        colors.accent
-                    } else {
-                        colors.on_neutral
-                    })
-                    .cursor_pointer()
-                    .on_click(move |_: &ClickEvent, _win, app: &mut App| {
-                        entity2.update(app, |m, cx| {
-                            m.active_panel = panel;
-                            cx.notify();
-                        });
+                        FontWeight::NORMAL
                     })
                     .child(panel.label()),
             );
+
+            // Unread badge
+            if unread > 0 {
+                item = item.child(
+                    div()
+                        .mr(px(12.0))
+                        .min_w(px(18.0))
+                        .h(px(18.0))
+                        .px(px(6.0))
+                        .rounded(px(9999.0))
+                        .bg(colors.status_error)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(10.0))
+                        .text_color(gpui::white())
+                        .font_weight(FontWeight::BOLD)
+                        .child(format!("{unread}")),
+                );
+            }
+
+            rail = rail.child(item);
         }
+
+        rail = rail.child(section_header("Device", cx)).child(
+            div()
+                .id("nav-pair")
+                .h(px(36.0))
+                .px(px(16.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.0))
+                .cursor_pointer()
+                .hover(move |s| s.bg(colors.subtle_hover))
+                .on_click({
+                    let e = entity.clone();
+                    move |_: &ClickEvent, _, app: &mut App| {
+                        e.update(app, |m, cx| {
+                            m.status.input_authenticated = false;
+                            cx.notify();
+                        });
+                    }
+                })
+                .text_color(colors.on_subtle)
+                .text_size(px(typography.body.size))
+                .child(Icon::new("qr").size(IconSize::Sm))
+                .child("Pair new device"),
+        );
+
+        rail = rail.child(div().flex_1()).child(
+            div()
+                .px(px(16.0))
+                .py(px(10.0))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .border_t_1()
+                .border_color(colors.stroke_neutral_subtle)
+                .child(
+                    div()
+                        .text_size(px(typography.caption.size))
+                        .text_color(colors.on_subtle_disabled)
+                        .child("AndroidConnect 0.4.2-beta"),
+                )
+                .child(
+                    div()
+                        .text_size(px(typography.caption.size))
+                        .text_color(colors.on_subtle_disabled)
+                        .child("Built on FluentGUI"),
+                ),
+        );
+
         rail
     }
 
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let colors = cx.theme().colors.clone();
+        let typography = cx.theme().typography;
+
+        let mut bar = div()
+            .h(px(STATUSBAR_HEIGHT))
+            .px(px(12.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(16.0))
+            .bg(colors.surface_dim)
+            .border_t_1()
+            .border_color(colors.stroke_neutral_subtle)
+            .text_size(px(typography.caption.size))
+            .text_color(colors.on_subtle);
+
+        if !self.connected() {
+            bar = bar
+                .child(div().child("Waiting for device…"))
+                .child(div().flex_1())
+                .child(div().child(format!("listening on {}", self.status.bind)));
+            return bar;
+        }
+
         let battery = self
             .status
             .battery_status
@@ -371,7 +600,7 @@ impl AppModel {
             None => "—",
         };
         let dnd = match self.status.dnd_mode {
-            None | Some(DndMode::Off) => "—",
+            None | Some(DndMode::Off) => "off",
             Some(DndMode::Priority) => "priority",
             Some(DndMode::Alarms) => "alarms",
             Some(DndMode::TotalSilence) => "silence",
@@ -387,25 +616,286 @@ impl AppModel {
             .map(|n| format!("#{n}"))
             .unwrap_or_else(|| "—".to_owned());
 
-        div()
-            .h(px(28.0))
-            .px(px(12.0))
+        bar = bar
+            .child(stat_chip("battery", &battery, cx))
+            .child(stat_chip("wifi", &wifi, cx))
+            .child(stat_chip("bluetooth", bt, cx))
+            .child(stat_chip("moon", dnd, cx))
+            .child(stat_chip("vol", &vol, cx))
+            .child(div().flex_1())
+            .child(stat_chip("pin", &heartbeat, cx));
+        bar
+    }
+
+    // ── Panels ────────────────────────────────────────────────────────────
+
+    fn render_overview_panel(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let colors = cx.theme().colors.clone();
+        let typography = cx.theme().typography;
+        let entity = cx.entity();
+
+        if !self.connected() {
+            // Disconnected hero
+            let e_pair = entity.clone();
+            return div()
+                .id("overview-disc")
+                .size_full()
+                .overflow_y_scroll()
+                .p(px(40.0))
+                .bg(colors.surface)
+                .child(
+                    Card::new()
+                        .padding(24.0)
+                        .gap(16.0)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap(px(24.0))
+                                .items_center()
+                                .child(
+                                    div()
+                                        .size(px(96.0))
+                                        .rounded(px(20.0))
+                                        .bg(colors.surface_dim)
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_color(colors.on_neutral_accent)
+                                        .child(Icon::new("qr").size(IconSize::Lg)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(8.0))
+                                        .child(Label::new("Connect your Android phone").size(LabelSize::Title))
+                                        .child(
+                                            div()
+                                                .text_color(colors.on_subtle)
+                                                .text_size(px(typography.body.size))
+                                                .child("Pair AndroidConnect on your phone to mirror its screen, see notifications, and exchange messages here.")
+                                        )
+                                        .child(
+                                            div()
+                                                .mt(px(8.0))
+                                                .flex()
+                                                .flex_row()
+                                                .gap(px(8.0))
+                                                .child(
+                                                    Button::new("overview-pair")
+                                                        .label("Pair a device")
+                                                        .appearance(ButtonAppearance::Accent)
+                                                        .on_click(move |_, _, app| {
+                                                            e_pair.update(app, |m, cx| {
+                                                                m.status.input_authenticated = false;
+                                                                cx.notify();
+                                                            });
+                                                        }),
+                                                )
+                                        ),
+                                ),
+                        )
+                )
+                .into_any_element();
+        }
+
+        // Connected — full overview
+        let device_name = self
+            .status
+            .device_name
+            .clone()
+            .unwrap_or_else(|| "Phone".to_owned());
+        let greeting = local_greeting();
+        let today = today_string();
+        let battery_pct = parse_battery_percent(self.status.battery_status.as_deref());
+
+        let entity_quick = entity.clone();
+
+        let mut root = div()
+            .id("overview-scroll")
+            .size_full()
+            .overflow_y_scroll()
+            .bg(colors.surface)
+            .p(px(24.0))
             .flex()
-            .items_center()
-            .gap(px(12.0))
-            .bg(colors.surface_dim)
-            .text_color(colors.on_subtle)
-            .text_size(px(11.0))
-            .child(format!("🔋 {battery}"))
-            .child(format!("📶 {wifi}"))
-            .child(format!("BT {bt}"))
-            .child(format!("DND {dnd}"))
-            .child(format!("🔊 {vol}"))
-            .child(format!("♥ {heartbeat}"))
+            .flex_col()
+            .gap(px(16.0));
+
+        // Row 1: Greeting
+        root = root.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_end()
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(Label::new(greeting).size(LabelSize::Display))
+                        .child(
+                            div()
+                                .text_color(colors.on_subtle)
+                                .text_size(px(typography.body.size))
+                                .child(format!("Connected to {device_name} · last sync just now")),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_color(colors.on_subtle)
+                        .text_size(px(typography.body.size))
+                        .child(today),
+                ),
+        );
+
+        // Row 2: Device hero card
+        let mut hero_row = div().flex().flex_row().gap(px(16.0));
+        hero_row = hero_row.child(div().flex_1().child(device_summary_card(
+            &device_name,
+            self.badge_state(),
+            battery_pct,
+            self.status.wifi_summary.as_deref(),
+            self.status.bluetooth_enabled,
+            cx,
+        )));
+        if let Some(media) = self.status.media_info.clone() {
+            hero_row = hero_row.child(div().w(px(360.0)).child(now_playing_card(&media, cx)));
+        }
+        root = root.child(hero_row);
+
+        // Row 3: Quick actions
+        root = root.child(
+            div()
+                .flex()
+                .flex_row()
+                .gap(px(12.0))
+                .child(quick_action(
+                    "qa-mirror",
+                    "mirror",
+                    "Open mirror",
+                    "Stream the screen",
+                    {
+                        let e = entity_quick.clone();
+                        move |_, _, app| {
+                            e.update(app, |m, cx| {
+                                m.active_panel = Panel::Mirror;
+                                cx.notify();
+                            });
+                        }
+                    },
+                    cx,
+                ))
+                .child(quick_action(
+                    "qa-msg",
+                    "chat",
+                    "New message",
+                    "Send an SMS",
+                    {
+                        let e = entity_quick.clone();
+                        move |_, _, app| {
+                            e.update(app, |m, cx| {
+                                m.active_panel = Panel::Messages;
+                                cx.notify();
+                            });
+                        }
+                    },
+                    cx,
+                ))
+                .child(quick_action(
+                    "qa-files",
+                    "upload",
+                    "Send to phone",
+                    "Push a file",
+                    {
+                        let e = entity_quick.clone();
+                        move |_, _, app| {
+                            e.update(app, |m, cx| {
+                                m.active_panel = Panel::Files;
+                                cx.notify();
+                            });
+                        }
+                    },
+                    cx,
+                ))
+                .child(quick_action(
+                    "qa-find",
+                    "phone",
+                    "Find my phone",
+                    "Ring at full volume",
+                    move |_, _, _| {},
+                    cx,
+                )),
+        );
+
+        // Row 4: Recent grids
+        let e_notifs = entity.clone();
+        let e_msgs = entity.clone();
+        root = root.child(
+            div()
+                .flex()
+                .flex_row()
+                .gap(px(16.0))
+                .child(
+                    div().flex_1().child(
+                        Card::new()
+                            .padding(16.0)
+                            .child(
+                                SectionHeader::new("Recent notifications").action(
+                                    Button::new("ov-see-notifs")
+                                        .label("See all")
+                                        .appearance(ButtonAppearance::Subtle)
+                                        .size(ButtonSize::Compact)
+                                        .on_click(move |_, _, app| {
+                                            e_notifs.update(app, |m, cx| {
+                                                m.active_panel = Panel::Notifications;
+                                                cx.notify();
+                                            });
+                                        }),
+                                ),
+                            )
+                            .children(recent_notifications(self, 4, cx)),
+                    ),
+                )
+                .child(
+                    div().flex_1().child(
+                        Card::new()
+                            .padding(16.0)
+                            .child(
+                                SectionHeader::new("Recent messages").action(
+                                    Button::new("ov-see-msgs")
+                                        .label("Open inbox")
+                                        .appearance(ButtonAppearance::Subtle)
+                                        .size(ButtonSize::Compact)
+                                        .on_click(move |_, _, app| {
+                                            e_msgs.update(app, |m, cx| {
+                                                m.active_panel = Panel::Messages;
+                                                cx.notify();
+                                            });
+                                        }),
+                                ),
+                            )
+                            .children(recent_messages(self, 4, cx)),
+                    ),
+                ),
+        );
+
+        // Row 5: Activity card (storage stub omitted in v1)
+        root = root.child(
+            Card::new()
+                .padding(16.0)
+                .child(SectionHeader::new("Recent activity"))
+                .children(activity_rows(self, 8, cx)),
+        );
+
+        root.into_any_element()
     }
 
     fn render_mirror_panel(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let colors = cx.theme().colors.clone();
+        let typography = cx.theme().typography;
         let video_id = self.video_texture;
         let frame_data = self.frame_data.clone();
         let mirror_bounds_shared = Arc::clone(&self.mirror_bounds);
@@ -414,6 +904,16 @@ impl AppModel {
         let frame_w = self.frame_w;
         let frame_h = self.frame_h;
 
+        if !self.connected() {
+            return disconnected_placeholder(
+                "mirror",
+                "Mirror your phone",
+                "Once paired, your phone's screen streams here with full pointer and keyboard control.",
+                cx,
+            )
+            .into_any_element();
+        }
+
         if video_id.is_none() || frame_data.is_none() {
             return div()
                 .size_full()
@@ -421,25 +921,31 @@ impl AppModel {
                 .flex_col()
                 .items_center()
                 .justify_center()
-                .gap(px(8.0))
+                .gap(px(12.0))
                 .bg(gpui::black())
                 .child(
                     div()
+                        .size(px(64.0))
+                        .rounded(px(16.0))
+                        .bg(colors.neutral)
+                        .flex()
+                        .items_center()
+                        .justify_center()
                         .text_color(colors.on_subtle)
-                        .text_size(px(20.0))
-                        .child("No video yet"),
+                        .child(Icon::new("mirror").size(IconSize::Lg)),
                 )
                 .child(
                     div()
-                        .text_color(colors.on_subtle_disabled)
-                        .text_size(px(13.0))
-                        .child("Mirror starts as soon as your phone shares its screen."),
+                        .text_color(colors.on_subtle)
+                        .text_size(px(typography.body.size))
+                        .child("Waiting for first frame…"),
                 )
                 .into_any_element();
         }
 
         div()
             .size_full()
+            .relative()
             .bg(gpui::black())
             .on_mouse_down(
                 MouseButton::Left,
@@ -558,155 +1064,262 @@ impl AppModel {
                         if let Ok(mut g) = mirror_bounds_canvas.lock() {
                             *g = Some(bounds);
                         }
-                        (frame_data, video_id)
+                        (frame_data, video_id, frame_w, frame_h)
                     },
                     |bounds, state, window, _cx| {
-                        let (Some(data), Some(id)) = state else {
+                        let (Some(data), Some(id), fw, fh) = state else {
                             return;
                         };
-                        let _ = window.paint_video_frame(id, bounds, &data);
+                        let video_bounds = letterbox_bounds(bounds, fw, fh);
+                        let _ = window.paint_video_frame(id, video_bounds, &data);
                     },
                 )
                 .size_full(),
+            )
+            // Floating control rail — top-right, three icon buttons backed by
+            // backdrop-blurred glass.
+            .child(
+                div()
+                    .absolute()
+                    .top(px(20.0))
+                    .right(px(20.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .p(px(4.0))
+                    .rounded(px(10.0))
+                    // Backdrop blur background — samples the video frame
+                    // beneath, blurs it 16px, tints it ~10% black.
+                    .bg(backdrop_blur(16.0, hsla(0.0, 0.0, 0.0, 0.25)))
+                    .border_1()
+                    .border_color(hsla(0.0, 0.0, 1.0, 0.08))
+                    .child(mirror_chip_icon("mirror-settings", "settings", cx))
+                    .child(mirror_chip_icon("mirror-snapshot", "image", cx))
+                    .child(mirror_chip_icon("mirror-refresh", "refresh", cx)),
+            )
+            // Stream-info pill — bottom-left.
+            .child(
+                div()
+                    .absolute()
+                    .bottom(px(20.0))
+                    .left(px(20.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .px(px(12.0))
+                    .py(px(6.0))
+                    .rounded(px(9999.0))
+                    .bg(backdrop_blur(16.0, hsla(0.0, 0.0, 0.0, 0.25)))
+                    .border_1()
+                    .border_color(hsla(0.0, 0.0, 1.0, 0.08))
+                    .text_color(gpui::white())
+                    .text_size(px(typography.caption.size))
+                    .child(
+                        div()
+                            .size(px(6.0))
+                            .rounded(px(9999.0))
+                            .bg(colors.status_success),
+                    )
+                    .child(div().child(format!("{}×{}", frame_w, frame_h))),
             )
             .into_any_element()
     }
 
     fn render_pair_panel(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let colors = cx.theme().colors.clone();
+        let typography = cx.theme().typography;
         let pairing_code_fmt = format_pairing_code(&self.status.pairing_code);
         let addresses = self.pair_addresses.clone();
         let bind = self.status.bind.clone();
-        let connection = self.status.connection;
         let last_error = self.status.last_error.clone();
         let qr_data = self.qr_data.clone();
         let qr_id = self.qr_texture;
-        let qr_size_px = px(self.qr_size.max(256) as f32);
+        let qr_side = px(208.0);
+        let qr_native = self.qr_size;
+
+        // Left column: instructions
+        let mut left = div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .gap(px(14.0))
+            .child(Label::new("Pair a new device").size(LabelSize::Display))
+            .child(
+                div()
+                    .text_color(colors.on_subtle)
+                    .text_size(px(typography.body.size))
+                    .child("Install AndroidConnect on your phone, then scan the QR or enter the pairing code below."),
+            );
+
+        for (idx, (title, body)) in [
+            ("Install on phone", "Search 'AndroidConnect' in Play Store, or scan the QR with your camera."),
+            ("Open the app", "Tap 'Connect to PC' and grant the requested permissions."),
+            ("Scan the QR", "Or enter the pairing code shown here. Both devices must be on the same Wi-Fi network."),
+        ].iter().enumerate() {
+            left = left.child(numbered_step(idx + 1, title, body, cx));
+        }
+
+        left = left
+            .child(div().h(px(8.0)))
+            .child(Divider::horizontal())
+            .child(
+                div()
+                    .text_color(colors.on_neutral)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_size(px(typography.body.size))
+                    .child("Listening on"),
+            );
+
+        let addrs_for_display = if addresses.is_empty() {
+            vec![bind.clone()]
+        } else {
+            addresses.clone()
+        };
+        let mut addr_row = div().flex().flex_row().flex_wrap().gap(px(6.0));
+        for a in addrs_for_display {
+            addr_row = addr_row.child(
+                div()
+                    .px(px(8.0))
+                    .py(px(2.0))
+                    .rounded(px(4.0))
+                    .bg(colors.neutral)
+                    .border_1()
+                    .border_color(colors.stroke_neutral_subtle)
+                    .text_color(colors.on_subtle)
+                    .text_size(px(typography.caption.size))
+                    .font_family("monospace")
+                    .child(a),
+            );
+        }
+        left = left.child(addr_row);
+
+        // Right column: QR + code
+        let qr_card = Card::new().padding(20.0).gap(12.0).child(
+            div()
+                .w(qr_side)
+                .h(qr_side)
+                .flex_none()
+                .p(px(12.0))
+                .bg(gpui::white())
+                .rounded(px(4.0))
+                .child(if qr_data.is_some() && qr_id.is_some() {
+                    canvas(
+                        move |_, _, _| (qr_data, qr_id, qr_native),
+                        |bounds, state, window, _| {
+                            let (Some(data), Some(id), native) = state else {
+                                return;
+                            };
+                            let painted = letterbox_bounds(bounds, native, native);
+                            let _ = window.paint_video_frame(id, painted, &data);
+                        },
+                    )
+                    .size_full()
+                    .into_any_element()
+                } else {
+                    div()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(colors.on_subtle_disabled)
+                        .text_size(px(typography.caption.size))
+                        .child("QR unavailable")
+                        .into_any_element()
+                }),
+        );
+
+        let code_chip = div()
+            .px(px(18.0))
+            .py(px(10.0))
+            .bg(colors.neutral)
+            .border_1()
+            .border_color(colors.stroke_neutral_subtle)
+            .rounded(px(4.0))
+            .text_color(colors.on_neutral)
+            .text_size(px(28.0))
+            .font_family("monospace")
+            .font_weight(FontWeight::SEMIBOLD)
+            .child(pairing_code_fmt);
+
+        let right = div()
+            .w(px(280.0))
+            .flex()
+            .flex_col()
+            .gap(px(16.0))
+            .items_center()
+            .child(qr_card)
+            .child(
+                div()
+                    .text_color(colors.on_subtle)
+                    .text_size(px(typography.caption.size))
+                    .child("or enter the code manually"),
+            )
+            .child(code_chip)
+            .child(if let Some(err) = last_error {
+                div()
+                    .px(px(12.0))
+                    .py(px(8.0))
+                    .rounded(px(4.0))
+                    .bg(colors.status_error_bg)
+                    .border_1()
+                    .border_color(colors.status_error_border)
+                    .text_color(colors.status_error)
+                    .text_size(px(typography.caption.size))
+                    .child(err)
+                    .into_any_element()
+            } else {
+                div().into_any_element()
+            });
 
         div()
             .id("pair-scroll")
             .size_full()
             .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap(px(16.0))
-            .p(px(40.0))
             .bg(colors.surface)
-            .child(
-                div()
-                    .text_color(colors.on_neutral)
-                    .text_size(px(28.0))
-                    .child("Pair a device"),
-            )
-            .child(
-                div()
-                    .text_color(colors.on_subtle)
-                    .text_size(px(14.0))
-                    .child("Open AndroidConnect on your phone and scan the QR, or enter the code manually."),
-            )
-            .child(
-                div()
-                    .w(qr_size_px)
-                    .h(qr_size_px)
-                    .bg(gpui::white())
-                    .rounded(px(4.0))
-                    .child(if qr_data.is_some() && qr_id.is_some() {
-                        canvas(
-                            move |_bounds, _window, _cx| (qr_data, qr_id),
-                            |bounds, state, window, _cx| {
-                                let (Some(data), Some(id)) = state else {
-                                    return;
-                                };
-                                let _ = window.paint_video_frame(id, bounds, &data);
-                            },
-                        )
-                        .size_full()
-                        .into_any_element()
-                    } else {
-                        div()
-                            .size_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_color(colors.on_subtle_disabled)
-                            .text_size(px(13.0))
-                            .child("QR unavailable")
-                            .into_any_element()
-                    }),
-            )
-            .child(
-                div()
-                    .text_color(colors.on_neutral)
-                    .text_size(px(16.0))
-                    .child("Manual pairing"),
-            )
-            .child(
-                div()
-                    .text_color(colors.on_subtle)
-                    .text_size(px(13.0))
-                    .child(if addresses.is_empty() {
-                        format!("Listening on: {bind}")
-                    } else {
-                        format!("Address: {}", addresses.join(", "))
-                    }),
-            )
-            .child(
-                div()
-                    .text_color(colors.on_neutral)
-                    .child(format!("Pairing code: {pairing_code_fmt}")),
-            )
-            .child(if !matches!(connection, ConnectionState::Listening) {
-                div()
-                    .text_color(colors.on_subtle_disabled)
-                    .text_size(px(13.0))
-                    .italic()
-                    .child("Waiting for handshake…")
-                    .into_any_element()
-            } else {
-                div().into_any_element()
-            })
-            .child(if let Some(err) = last_error {
-                div()
-                    .text_color(gpui::rgb(0xff4444u32))
-                    .text_size(px(13.0))
-                    .child(err)
-                    .into_any_element()
-            } else {
-                div().into_any_element()
-            })
+            .p(px(40.0))
+            .flex()
+            .flex_row()
+            .gap(px(32.0))
+            .items_start()
+            .child(left)
+            .child(right)
     }
 
     fn render_phone_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let colors = cx.theme().colors.clone();
         let entity = cx.entity();
 
-        // If DeviceStatus mirroring is unavailable, surface a single full-panel placeholder
-        // instead of the quick-settings UI.
-        let device_status_feature = self
-            .status
-            .feature(androidconnect_protocol::UtilityFeature::DeviceStatus)
-            .cloned();
-        if let Some(status) = device_status_feature
-            && let Some(placeholder) = feature_placeholder(
-                cx,
-                &status,
-                "Device status mirroring is unavailable.",
-                "phone-feature",
-            )
+        if !self.connected() {
+            return div()
+                .size_full()
+                .bg(colors.surface)
+                .child(disconnected_placeholder(
+                    "phone",
+                    "Quick settings & media",
+                    "Pair a device to control volume, Do Not Disturb, Bluetooth, and now-playing media from your desktop.",
+                    cx,
+                ))
+                .into_any_element();
+        }
+
+        let device_status_feature = self.status.feature(UtilityFeature::DeviceStatus).cloned();
+        if let Some(status) = device_status_feature.as_ref()
+            && let Some(banner) =
+                permission_banner(status, "Device status mirroring is unavailable.", cx)
         {
             return div()
                 .size_full()
+                .bg(colors.surface)
+                .p(px(24.0))
                 .flex()
                 .flex_col()
-                .p(px(16.0))
-                .bg(colors.surface)
-                .child(Label::new("Phone").size(LabelSize::Subtitle))
-                .child(Divider::horizontal())
-                .child(placeholder);
+                .gap(px(16.0))
+                .child(Label::new("Phone").size(LabelSize::Title))
+                .child(banner)
+                .into_any_element();
         }
 
-        // Reconcile pending values
         self.phone_state.reconcile(&self.status);
         self.phone_state.expire_pending();
 
@@ -725,8 +1338,8 @@ impl AppModel {
         let bt_pending = self.phone_state.pending_bluetooth.is_some();
         let error_msg = self.phone_state.error.clone();
         let media_info = self.status.media_info.clone();
+        let battery_pct = parse_battery_percent(self.status.battery_status.as_deref());
 
-        // Volume row
         let entity_vol_down = entity.clone();
         let entity_vol_up = entity.clone();
         let entity_dnd = [
@@ -736,460 +1349,508 @@ impl AppModel {
             entity.clone(),
         ];
         let entity_bt = entity.clone();
-        let entity_media_prev = entity.clone();
-        let entity_media_play = entity.clone();
-        let entity_media_next = entity.clone();
 
-        div()
-            .size_full()
-            .p(px(20.0))
-            .flex()
-            .flex_col()
-            .gap(px(12.0))
-            .bg(colors.surface)
-            .child(if let Some(info) = media_info {
-                let has_prev = info
-                    .supported_actions
-                    .contains(&MediaControlAction::Previous);
-                let has_next = info.supported_actions.contains(&MediaControlAction::Next);
-                let has_play_pause = info
-                    .supported_actions
-                    .contains(&MediaControlAction::PlayPause);
-                let has_play = info.supported_actions.contains(&MediaControlAction::Play);
-                let has_pause = info.supported_actions.contains(&MediaControlAction::Pause);
+        let mut grid = div().flex().flex_col().gap(px(16.0));
 
-                let play_action = if has_play_pause {
-                    Some(MediaControlAction::PlayPause)
-                } else if matches!(
-                    info.playback_state,
-                    MediaPlaybackState::Playing | MediaPlaybackState::Buffering
-                ) && has_pause
-                {
-                    Some(MediaControlAction::Pause)
-                } else if has_play {
-                    Some(MediaControlAction::Play)
+        if let Some(media) = media_info {
+            grid = grid.child(now_playing_card(&media, cx));
+        }
+
+        let mut row1 = div().flex().flex_row().gap(px(16.0));
+        row1 = row1
+            .child(div().flex_1().child({
+                // Volume card
+                let mut c = Card::new().padding(12.0).gap(10.0).child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(Icon::new("vol").size(IconSize::Md))
+                        .child(
+                            div()
+                                .flex_1()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("Media volume"),
+                        )
+                        .child(if vol_pending {
+                            pending_dot(cx).into_any_element()
+                        } else {
+                            div().into_any_element()
+                        })
+                        .child(
+                            div()
+                                .text_color(colors.on_subtle)
+                                .child(format!("{volume}%")),
+                        ),
+                );
+                c = c.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(8.0))
+                        .child(
+                            Button::new("vol-down")
+                                .label("−10")
+                                .appearance(ButtonAppearance::Subtle)
+                                .size(ButtonSize::Compact)
+                                .on_click(move |_: &ClickEvent, _, app: &mut App| {
+                                    entity_vol_down.update(app, |m, cx| {
+                                        let new_vol = m
+                                            .phone_state
+                                            .pending_volume
+                                            .or(m.status.volume_percent)
+                                            .unwrap_or(0)
+                                            .saturating_sub(10);
+                                        m.phone_state.pending_volume = Some(new_vol);
+                                        m.phone_state.pending_volume_since = Some(Instant::now());
+                                        m.phone_state.error = None;
+                                        m.send_utility(Payload::AudioControl(AudioControl {
+                                            command: AudioControlCommand::SetVolume {
+                                                percent: new_vol,
+                                            },
+                                        }));
+                                        cx.notify();
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new("vol-up")
+                                .label("+10")
+                                .appearance(ButtonAppearance::Subtle)
+                                .size(ButtonSize::Compact)
+                                .on_click(move |_: &ClickEvent, _, app: &mut App| {
+                                    entity_vol_up.update(app, |m, cx| {
+                                        let new_vol = m
+                                            .phone_state
+                                            .pending_volume
+                                            .or(m.status.volume_percent)
+                                            .unwrap_or(0)
+                                            .saturating_add(10)
+                                            .min(100);
+                                        m.phone_state.pending_volume = Some(new_vol);
+                                        m.phone_state.pending_volume_since = Some(Instant::now());
+                                        m.phone_state.error = None;
+                                        m.send_utility(Payload::AudioControl(AudioControl {
+                                            command: AudioControlCommand::SetVolume {
+                                                percent: new_vol,
+                                            },
+                                        }));
+                                        cx.notify();
+                                    });
+                                }),
+                        ),
+                );
+                c
+            }))
+            .child(div().flex_1().child({
+                // Bluetooth card
+                Card::new().padding(12.0).gap(10.0).child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(Icon::new("bluetooth").size(IconSize::Md))
+                        .child(
+                            div()
+                                .flex_1()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("Bluetooth"),
+                        )
+                        .child(if bt_pending {
+                            pending_dot(cx).into_any_element()
+                        } else {
+                            div().into_any_element()
+                        })
+                        .child(
+                            Switch::new("bt-toggle")
+                                .on(bt_enabled.unwrap_or(false))
+                                .on_click(move |new_val, _: &ClickEvent, _, app: &mut App| {
+                                    entity_bt.update(app, |m, cx| {
+                                        m.phone_state.pending_bluetooth = Some(new_val);
+                                        m.phone_state.pending_bluetooth_since =
+                                            Some(Instant::now());
+                                        m.phone_state.error = None;
+                                        m.send_utility(Payload::AudioControl(AudioControl {
+                                            command: AudioControlCommand::SetBluetooth {
+                                                enabled: new_val,
+                                            },
+                                        }));
+                                        cx.notify();
+                                    });
+                                }),
+                        ),
+                )
+            }));
+        grid = grid.child(row1);
+
+        // DND card (full width)
+        let mut dnd_card = Card::new().padding(12.0).gap(10.0).child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(Icon::new("moon").size(IconSize::Md))
+                .child(
+                    div()
+                        .flex_1()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Do Not Disturb"),
+                )
+                .child(if dnd_pending {
+                    pending_dot(cx).into_any_element()
                 } else {
-                    None
-                };
-
-                let play_label = if matches!(
-                    info.playback_state,
-                    MediaPlaybackState::Playing | MediaPlaybackState::Buffering
-                ) {
-                    "⏸"
-                } else {
-                    "▶"
-                };
-
-                let title_str = info.title.clone().unwrap_or_else(|| "Unknown".to_owned());
-                let artist_str = info.artist.clone().unwrap_or_default();
-                let app_str = info.app_name.clone().unwrap_or_default();
-
-                let mut controls = div().flex().flex_row().gap(px(4.0));
-                if has_prev {
-                    let ep = entity_media_prev.clone();
-                    controls = controls.child(Button::new("media-prev").label("⏮").on_click(
-                        move |_: &ClickEvent, _, app: &mut App| {
-                            ep.update(app, |m, cx| {
-                                m.send_utility(Payload::MediaControl(MediaControl {
-                                    action: MediaControlAction::Previous,
-                                }));
-                                cx.notify();
-                            });
-                        },
-                    ));
-                }
-                if let Some(action) = play_action {
-                    let ep = entity_media_play.clone();
-                    controls =
-                        controls.child(Button::new("media-play").label(play_label).on_click(
-                            move |_: &ClickEvent, _, app: &mut App| {
-                                ep.update(app, |m, cx| {
-                                    m.send_utility(Payload::MediaControl(MediaControl { action }));
-                                    cx.notify();
-                                });
-                            },
-                        ));
-                }
-                if has_next {
-                    let en = entity_media_next.clone();
-                    controls = controls.child(Button::new("media-next").label("⏭").on_click(
-                        move |_: &ClickEvent, _, app: &mut App| {
-                            en.update(app, |m, cx| {
-                                m.send_utility(Payload::MediaControl(MediaControl {
-                                    action: MediaControlAction::Next,
-                                }));
-                                cx.notify();
-                            });
-                        },
-                    ));
-                }
-
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.0))
-                    .child(Label::new("Now Playing").size(LabelSize::Subtitle))
-                    .child(Divider::horizontal())
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .child(div().font_weight(FontWeight::BOLD).child(title_str))
-                            .child(div().text_color(colors.on_subtle).child(artist_str))
-                            .child(
-                                div()
-                                    .text_color(colors.on_subtle_disabled)
-                                    .text_size(px(11.0))
-                                    .child(app_str),
-                            ),
-                    )
-                    .child(controls)
-                    .into_any_element()
-            } else {
-                div().into_any_element()
-            })
-            .child(Label::new("Quick settings").size(LabelSize::Subtitle))
-            .child(Divider::horizontal())
-            // Volume
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(div().text_color(colors.on_neutral).child("Media volume"))
-                    .child(if vol_pending {
-                        div()
-                            .w(px(12.0))
-                            .h(px(12.0))
-                            .rounded_full()
-                            .bg(colors.accent)
-                            .into_any_element()
+                    div().into_any_element()
+                }),
+        );
+        let mut dnd_row = div().flex().flex_row().gap(px(4.0));
+        for (i, mode) in [
+            DndMode::Off,
+            DndMode::Priority,
+            DndMode::Alarms,
+            DndMode::TotalSilence,
+        ]
+        .iter()
+        .enumerate()
+        {
+            let is_sel = dnd_current == Some(*mode);
+            let e = entity_dnd[i].clone();
+            let m = *mode;
+            dnd_row = dnd_row.child(
+                Button::new(("dnd-", i))
+                    .label(dnd_label(m))
+                    .appearance(if is_sel {
+                        ButtonAppearance::Accent
                     } else {
-                        div().into_any_element()
+                        ButtonAppearance::Subtle
                     })
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .text_color(colors.on_subtle)
-                            .child(format!("{volume}%")),
-                    )
-                    .child(Button::new("vol-down").label("−10").on_click(
-                        move |_: &ClickEvent, _, app: &mut App| {
-                            entity_vol_down.update(app, |m, cx| {
-                                let new_vol = m
-                                    .phone_state
-                                    .pending_volume
-                                    .or(m.status.volume_percent)
-                                    .unwrap_or(0)
-                                    .saturating_sub(10);
-                                m.phone_state.pending_volume = Some(new_vol);
-                                m.phone_state.pending_volume_since = Some(Instant::now());
-                                m.phone_state.error = None;
-                                m.send_utility(Payload::AudioControl(AudioControl {
-                                    command: AudioControlCommand::SetVolume { percent: new_vol },
-                                }));
-                                cx.notify();
-                            });
-                        },
-                    ))
-                    .child(Button::new("vol-up").label("+10").on_click(
-                        move |_: &ClickEvent, _, app: &mut App| {
-                            entity_vol_up.update(app, |m, cx| {
-                                let new_vol = m
-                                    .phone_state
-                                    .pending_volume
-                                    .or(m.status.volume_percent)
-                                    .unwrap_or(0)
-                                    .saturating_add(10)
-                                    .min(100);
-                                m.phone_state.pending_volume = Some(new_vol);
-                                m.phone_state.pending_volume_since = Some(Instant::now());
-                                m.phone_state.error = None;
-                                m.send_utility(Payload::AudioControl(AudioControl {
-                                    command: AudioControlCommand::SetVolume { percent: new_vol },
-                                }));
-                                cx.notify();
-                            });
-                        },
-                    )),
-            )
-            // DND
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(div().text_color(colors.on_neutral).child("Do not disturb"))
-                    .child(if dnd_pending {
-                        div()
-                            .w(px(12.0))
-                            .h(px(12.0))
-                            .rounded_full()
-                            .bg(colors.accent)
-                            .into_any_element()
-                    } else {
-                        div().into_any_element()
+                    .size(ButtonSize::Compact)
+                    .on_click(move |_: &ClickEvent, _, app: &mut App| {
+                        if is_sel {
+                            return;
+                        }
+                        e.update(app, |model, cx| {
+                            model.phone_state.pending_dnd = Some(m);
+                            model.phone_state.pending_dnd_since = Some(Instant::now());
+                            model.phone_state.error = None;
+                            model.send_utility(Payload::AudioControl(AudioControl {
+                                command: AudioControlCommand::SetDnd { mode: m },
+                            }));
+                            cx.notify();
+                        });
                     }),
-            )
-            .child({
-                let mut row = div().flex().flex_row().gap(px(4.0));
-                for (i, mode) in [
-                    DndMode::Off,
-                    DndMode::Priority,
-                    DndMode::Alarms,
-                    DndMode::TotalSilence,
-                ]
-                .iter()
-                .enumerate()
-                {
-                    let is_sel = dnd_current == Some(*mode);
-                    let e = entity_dnd[i].clone();
-                    let m = *mode;
-                    row = row.child(
-                        Button::new(("dnd-", i))
-                            .label(dnd_label(m))
-                            .appearance(if is_sel {
-                                ButtonAppearance::Accent
-                            } else {
-                                ButtonAppearance::default()
-                            })
-                            .on_click(move |_: &ClickEvent, _, app: &mut App| {
-                                if is_sel {
-                                    return;
-                                }
-                                e.update(app, |model, cx| {
-                                    model.phone_state.pending_dnd = Some(m);
-                                    model.phone_state.pending_dnd_since = Some(Instant::now());
-                                    model.phone_state.error = None;
-                                    model.send_utility(Payload::AudioControl(AudioControl {
-                                        command: AudioControlCommand::SetDnd { mode: m },
-                                    }));
-                                    cx.notify();
-                                });
-                            }),
-                    );
-                }
-                row
-            })
-            // Bluetooth
-            .child(
+            );
+        }
+        dnd_card = dnd_card.child(dnd_row);
+        grid = grid.child(dnd_card);
+
+        // Battery + Connectivity row
+        let battery_card = Card::new().padding(12.0).gap(10.0).child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(Icon::new("battery").size(IconSize::Md))
+                .child(
+                    div()
+                        .flex_1()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Battery"),
+                )
+                .child(
+                    div()
+                        .text_size(px(28.0))
+                        .font_weight(FontWeight::BOLD)
+                        .child(
+                            self.status
+                                .battery_status
+                                .clone()
+                                .unwrap_or_else(|| "—".to_owned()),
+                        ),
+                ),
+        );
+
+        let battery_with_bar = if let Some(p) = battery_pct {
+            battery_card.child(
                 div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(div().text_color(colors.on_neutral).child("Bluetooth"))
-                    .child(if bt_pending {
-                        div()
-                            .w(px(12.0))
-                            .h(px(12.0))
-                            .rounded_full()
-                            .bg(colors.accent)
-                            .into_any_element()
-                    } else {
-                        div().into_any_element()
-                    })
-                    .child(div().flex_1())
+                    .w_full()
+                    .h(px(8.0))
+                    .rounded(px(6.0))
+                    .bg(colors.surface_dim)
+                    .border_1()
+                    .border_color(colors.stroke_neutral_subtle)
                     .child(
-                        Switch::new("bt-toggle")
-                            .on(bt_enabled.unwrap_or(false))
-                            .on_click(move |new_val, _: &ClickEvent, _, app: &mut App| {
-                                entity_bt.update(app, |m, cx| {
-                                    m.phone_state.pending_bluetooth = Some(new_val);
-                                    m.phone_state.pending_bluetooth_since = Some(Instant::now());
-                                    m.phone_state.error = None;
-                                    m.send_utility(Payload::AudioControl(AudioControl {
-                                        command: AudioControlCommand::SetBluetooth {
-                                            enabled: new_val,
-                                        },
-                                    }));
-                                    cx.notify();
-                                });
+                        div()
+                            .w(px(208.0 * (p as f32) / 100.0))
+                            .h_full()
+                            .rounded(px(6.0))
+                            .bg(if p > 20 {
+                                colors.status_success
+                            } else {
+                                colors.status_warning
                             }),
                     ),
             )
-            .child(if let Some(err) = error_msg {
-                div()
-                    .text_color(gpui::rgb(0xff4444u32))
-                    .text_size(px(13.0))
-                    .child(err)
-                    .into_any_element()
-            } else {
-                div().into_any_element()
-            })
-            .child(Divider::horizontal())
+        } else {
+            battery_card
+        };
+
+        let conn_card = Card::new()
+            .padding(12.0)
+            .gap(8.0)
+            .child(SectionHeader::new("Connectivity"));
+        let wifi_label = self
+            .status
+            .wifi_summary
+            .clone()
+            .unwrap_or_else(|| "—".to_owned());
+        let bt_label = match self.status.bluetooth_enabled {
+            Some(true) => "On".to_owned(),
+            Some(false) => "Off".to_owned(),
+            None => "—".to_owned(),
+        };
+        let conn_card = conn_card
             .child(
                 div()
-                    .text_color(colors.on_subtle_disabled)
-                    .text_size(px(11.0))
-                    .italic()
-                    .child("Quick settings reflect the latest DeviceStatus from the phone."),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(Icon::new("wifi").size(IconSize::Md))
+                    .child(
+                        div()
+                            .flex_1()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Wi-Fi"),
+                    )
+                    .child(div().text_color(colors.on_subtle).child(wifi_label)),
             )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(Icon::new("bluetooth").size(IconSize::Md))
+                    .child(
+                        div()
+                            .flex_1()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Bluetooth"),
+                    )
+                    .child(div().text_color(colors.on_subtle).child(bt_label)),
+            );
+
+        grid = grid.child(
+            div()
+                .flex()
+                .flex_row()
+                .gap(px(16.0))
+                .child(div().flex_1().child(battery_with_bar))
+                .child(div().flex_1().child(conn_card)),
+        );
+
+        if let Some(err) = error_msg {
+            grid = grid.child(error_banner(&err, cx));
+        }
+
+        div()
+            .id("phone-scroll")
+            .size_full()
+            .overflow_y_scroll()
+            .bg(colors.surface)
+            .p(px(24.0))
+            .child(grid)
+            .into_any_element()
     }
 
     fn render_notifications_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let colors = cx.theme().colors.clone();
+        let typography = cx.theme().typography;
         let entity = cx.entity();
         let count = self.notifications.item_count();
-        let feature_status = self
-            .status
-            .feature(androidconnect_protocol::UtilityFeature::Notifications)
-            .cloned();
+        let feature_status = self.status.feature(UtilityFeature::Notifications).cloned();
 
-        let mut panel = div()
-            .id("notif-scroll")
-            .size_full()
-            .overflow_y_scroll()
+        if !self.connected() {
+            return div()
+                .size_full()
+                .bg(colors.surface)
+                .child(disconnected_placeholder(
+                    "bell",
+                    "Your phone's notifications, here",
+                    "Once paired, alerts from your phone show up here so you can read and reply without picking it up.",
+                    cx,
+                ))
+                .into_any_element();
+        }
+
+        let e_hide = entity.clone();
+        let header = div()
             .flex()
-            .flex_col()
-            .gap(px(4.0))
-            .p(px(12.0))
-            .bg(colors.surface)
+            .flex_row()
+            .items_center()
+            .gap(px(12.0))
+            .px(px(20.0))
+            .py(px(12.0))
+            .border_b_1()
+            .border_color(colors.stroke_neutral_subtle)
+            .child(Label::new("Notifications").size(LabelSize::Subtitle))
+            .child(
+                div()
+                    .min_w(px(20.0))
+                    .px(px(6.0))
+                    .py(px(1.0))
+                    .rounded(px(9999.0))
+                    .bg(colors.neutral)
+                    .border_1()
+                    .border_color(colors.stroke_neutral_subtle)
+                    .text_color(colors.on_subtle)
+                    .text_size(px(typography.caption.size))
+                    .child(format!("{count}")),
+            )
+            .child(div().flex_1())
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(8.0))
-                    .child(Label::new(format!("{count} notifications")).size(LabelSize::Subtitle))
-                    .child(div().flex_1())
-                    .child({
-                        let e = entity.clone();
-                        Button::new("hide-sensitive")
-                            .label(if self.notifications.hide_sensitive {
-                                "Showing filtered"
-                            } else {
-                                "Hide sensitive"
-                            })
-                            .appearance(ButtonAppearance::Subtle)
-                            .on_click(move |_: &ClickEvent, _, app: &mut App| {
-                                e.update(app, |m, cx| {
-                                    m.notifications.hide_sensitive =
-                                        !m.notifications.hide_sensitive;
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .text_color(colors.on_subtle)
+                            .text_size(px(typography.body.size))
+                            .child("Hide sensitive"),
+                    )
+                    .child(
+                        Switch::new("hide-sensitive-switch")
+                            .on(self.notifications.hide_sensitive)
+                            .on_click(move |new_val, _, _, app| {
+                                e_hide.update(app, |m, cx| {
+                                    m.notifications.hide_sensitive = new_val;
                                     cx.notify();
                                 });
-                            })
-                    }),
-            )
-            .child(Divider::horizontal());
+                            }),
+                    ),
+            );
+
+        let mut body = div()
+            .id("notif-scroll")
+            .flex_1()
+            .overflow_y_scroll()
+            .p(px(20.0))
+            .flex()
+            .flex_col()
+            .gap(px(8.0));
 
         if let Some(status) = feature_status.as_ref()
-            && let Some(placeholder) = feature_placeholder(
-                cx,
+            && let Some(banner) = permission_banner(
                 status,
-                "Enable Notification access on the phone.",
-                "notif-feature",
+                "Enable Notification access on the phone to see alerts here.",
+                cx,
             )
         {
-            panel = panel.child(placeholder);
+            body = body.child(banner);
         }
 
         if count == 0 {
-            panel = panel.child(
+            body = body.child(
                 div()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .p(px(40.0))
+                    .py(px(60.0))
+                    .flex_col()
+                    .gap(px(8.0))
                     .text_color(colors.on_subtle_disabled)
-                    .italic()
-                    .child("No active notifications"),
+                    .child(Icon::new("check").size(IconSize::Lg))
+                    .child(div().italic().child("You're all caught up.")),
             );
         } else {
-            for (id, notif) in self.notifications.iter_items() {
-                let id = id.clone();
-                let notif = notif.clone();
+            let items: Vec<_> = self
+                .notifications
+                .iter_items()
+                .map(|(id, n)| (id.clone(), n.clone()))
+                .collect();
+            for (id, notif) in items {
                 let suppressed = self.notifications.is_suppressed(&notif.app_package);
                 let hide = self.notifications.hide_sensitive && notif.sensitive;
-                let e = entity.clone();
                 let app_package = notif.app_package.clone();
                 let notif_id = notif.notification_id.clone();
+                let meta_time = relative_timestamp(notif.timestamp_unix_ms);
 
-                let mut card = div()
-                    .p(px(10.0))
-                    .rounded(px(4.0))
-                    .bg(colors.neutral)
+                let mut meta = div()
                     .flex()
-                    .flex_col()
-                    .gap(px(4.0))
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .text_size(px(typography.caption.size))
+                    .text_color(colors.on_subtle)
                     .child(
                         div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(8.0))
-                            .child(
-                                div()
-                                    .text_color(colors.on_neutral)
-                                    .text_size(px(13.0))
-                                    .font_weight(FontWeight::BOLD)
-                                    .child(notif.app_name.clone()),
-                            )
-                            .child(if suppressed {
-                                div()
-                                    .text_color(colors.on_subtle_disabled)
-                                    .text_size(px(11.0))
-                                    .italic()
-                                    .child("suppressed")
-                                    .into_any_element()
-                            } else {
-                                div().into_any_element()
-                            })
-                            .child(div().flex_1())
-                            .child(
-                                Button::new(SharedString::from(format!("notif-menu-{id}")))
-                                    .label("⋮")
-                                    .appearance(ButtonAppearance::Subtle)
-                                    .on_click(move |_: &ClickEvent, _, app: &mut App| {
-                                        let pkg = app_package.clone();
-                                        e.update(app, |m, cx| {
-                                            let enabled = m.notifications.is_suppressed(&pkg);
-                                            m.notifications.toggle_suppress(&pkg);
-                                            m.send_utility(Payload::NotificationFilterUpdate(
-                                                androidconnect_protocol::NotificationFilterUpdate {
-                                                    package_name: pkg.clone(),
-                                                    enabled,
-                                                },
-                                            ));
-                                            cx.notify();
-                                        });
-                                    }),
-                            ),
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(notif.app_name.clone()),
+                    )
+                    .child(div().child("·"))
+                    .child(div().child(meta_time));
+                if hide {
+                    meta = meta.child(
+                        div()
+                            .px(px(6.0))
+                            .py(px(1.0))
+                            .rounded(px(9999.0))
+                            .bg(colors.status_warning_bg)
+                            .text_color(colors.status_warning)
+                            .text_size(px(10.0))
+                            .child("sensitive"),
                     );
+                }
+                if suppressed {
+                    meta = meta.child(
+                        div()
+                            .px(px(6.0))
+                            .py(px(1.0))
+                            .rounded(px(9999.0))
+                            .bg(colors.neutral)
+                            .text_color(colors.on_subtle_disabled)
+                            .text_size(px(10.0))
+                            .child("muted"),
+                    );
+                }
 
-                if let Some(title) = &notif.title {
-                    let display = if hide {
-                        "[sensitive content hidden]".to_owned()
-                    } else {
-                        title.clone()
-                    };
-                    card = card.child(
+                let title_text = if hide {
+                    "Content hidden".to_owned()
+                } else {
+                    notif.title.clone().unwrap_or_default()
+                };
+
+                let mut body_col = div().flex_1().flex().flex_col().gap(px(3.0)).child(meta);
+                if !title_text.is_empty() {
+                    body_col = body_col.child(
                         div()
                             .text_color(colors.on_neutral)
-                            .font_weight(FontWeight::BOLD)
-                            .text_size(px(13.0))
-                            .child(display),
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(px(typography.body.size))
+                            .child(title_text),
                     );
                 }
                 if let Some(text) = &notif.text
                     && !hide
                     && !text.is_empty()
                 {
-                    card = card.child(
+                    body_col = body_col.child(
                         div()
                             .text_color(colors.on_subtle)
-                            .text_size(px(12.0))
+                            .text_size(px(typography.body.size))
                             .child(text.clone()),
                     );
                 }
 
-                // Action buttons + inline quick-reply for reply-capable actions.
-                if !notif.actions.is_empty() {
-                    let mut actions_row = div().flex().flex_row().gap(px(4.0));
+                // Action buttons
+                if !notif.actions.is_empty() && !hide {
+                    let mut actions_row = div().mt(px(4.0)).flex().flex_row().gap(px(4.0));
                     for action in &notif.actions {
                         let nid = notif_id.clone();
                         let aid = action.action_id.clone();
@@ -1198,14 +1859,14 @@ impl AppModel {
                         let e2 = entity.clone();
                         actions_row = actions_row.child(
                             Button::new(SharedString::from(format!("action-{nid}-{aid}")))
-                                .label(title.clone())
+                                .label(title)
                                 .appearance(ButtonAppearance::Subtle)
+                                .size(ButtonSize::Compact)
                                 .on_click(move |_: &ClickEvent, _, app: &mut App| {
                                     let nid2 = nid.clone();
                                     let aid2 = aid.clone();
                                     e2.update(app, |m, cx| {
                                         if allows_reply {
-                                            // Toggle the inline reply input for this action.
                                             let key = (nid2.clone(), aid2.clone());
                                             if m.quick_reply.open_on.as_ref() == Some(&key) {
                                                 m.quick_reply.open_on = None;
@@ -1230,20 +1891,15 @@ impl AppModel {
                                 }),
                         );
                     }
-                    card = card.child(actions_row);
+                    body_col = body_col.child(actions_row);
 
-                    // Render the inline quick-reply composer if this notification is the active
-                    // reply target. We need to remember which action_id to submit on Send.
                     if let Some((open_nid, open_aid)) = &self.quick_reply.open_on
                         && *open_nid == notif.notification_id
                     {
                         let nid_send = notif.notification_id.clone();
                         let aid_send = open_aid.clone();
-                        let nid_cancel = notif.notification_id.clone();
-                        let aid_cancel = open_aid.clone();
                         let e_send = entity.clone();
-                        let e_cancel = entity.clone();
-                        card = card.child(
+                        body_col = body_col.child(
                             div()
                                 .mt(px(4.0))
                                 .flex()
@@ -1252,13 +1908,11 @@ impl AppModel {
                                 .items_center()
                                 .child(div().flex_1().child(self.quick_reply_input.clone()))
                                 .child(
-                                    Button::new(SharedString::from(format!(
-                                        "qr-send-{nid_send}-{aid_send}"
-                                    )))
-                                    .label("Send")
-                                    .appearance(ButtonAppearance::Accent)
-                                    .on_click(
-                                        move |_: &ClickEvent, _, app: &mut App| {
+                                    Button::new(SharedString::from(format!("qr-send-{nid_send}")))
+                                        .label("Send")
+                                        .appearance(ButtonAppearance::Accent)
+                                        .size(ButtonSize::Compact)
+                                        .on_click(move |_: &ClickEvent, _, app: &mut App| {
                                             let nid = nid_send.clone();
                                             let aid = aid_send.clone();
                                             e_send.update(app, |m, cx| {
@@ -1280,39 +1934,102 @@ impl AppModel {
                                                 });
                                                 cx.notify();
                                             });
-                                        },
-                                    ),
-                                )
-                                .child(
-                                    Button::new(SharedString::from(format!(
-                                        "qr-cancel-{nid_cancel}-{aid_cancel}"
-                                    )))
-                                    .label("Cancel")
-                                    .appearance(ButtonAppearance::Subtle)
-                                    .on_click(
-                                        move |_: &ClickEvent, _, app: &mut App| {
-                                            e_cancel.update(app, |m, cx| {
-                                                m.quick_reply.open_on = None;
-                                                cx.notify();
-                                            });
-                                        },
-                                    ),
+                                        }),
                                 ),
                         );
                     }
                 }
 
-                panel = panel.child(card);
+                let pkg_for_mute = app_package.clone();
+                let e_mute = entity.clone();
+                let nid_for_dismiss = notif_id.clone();
+                let e_dismiss = entity.clone();
+
+                let actions_col = div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        Button::new(SharedString::from(format!("notif-mute-{}", id)))
+                            .label(if suppressed { "Unmute" } else { "Mute" })
+                            .appearance(ButtonAppearance::Subtle)
+                            .size(ButtonSize::Compact)
+                            .on_click(move |_, _, app| {
+                                let pkg = pkg_for_mute.clone();
+                                e_mute.update(app, |m, cx| {
+                                    let enabled = m.notifications.is_suppressed(&pkg);
+                                    m.notifications.toggle_suppress(&pkg);
+                                    m.send_utility(Payload::NotificationFilterUpdate(
+                                        androidconnect_protocol::NotificationFilterUpdate {
+                                            package_name: pkg,
+                                            enabled,
+                                        },
+                                    ));
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("notif-close-{}", id)))
+                            .label("✕")
+                            .appearance(ButtonAppearance::Subtle)
+                            .size(ButtonSize::Compact)
+                            .on_click(move |_, _, app| {
+                                let nid = nid_for_dismiss.clone();
+                                e_dismiss.update(app, |m, cx| {
+                                    m.notifications.removed(
+                                        androidconnect_protocol::NotificationRemoved {
+                                            notification_id: nid,
+                                        },
+                                    );
+                                    cx.notify();
+                                });
+                            }),
+                    );
+
+                let card = Card::new().padding(12.0).child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(12.0))
+                        .items_start()
+                        .child(AppDot::new(notif.app_name.clone()).size(28.0))
+                        .child(body_col)
+                        .child(actions_col),
+                );
+
+                body = body.child(card);
             }
         }
-        panel
+
+        div()
+            .size_full()
+            .bg(colors.surface)
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(body)
+            .into_any_element()
     }
 
     fn render_files_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let colors = cx.theme().colors.clone();
+        let typography = cx.theme().typography;
         let entity = cx.entity();
 
-        // Trigger initial browse if needed
+        if !self.connected() {
+            return div()
+                .size_full()
+                .bg(colors.surface)
+                .child(disconnected_placeholder(
+                    "folder",
+                    "Browse your phone's storage",
+                    "Drag and drop files between your phone and PC once paired.",
+                    cx,
+                ))
+                .into_any_element();
+        }
+
         if let Some(p) = self.files_state.ensure_initial_browse() {
             self.send_utility(p);
         }
@@ -1330,78 +2047,85 @@ impl AppModel {
         let e_new_folder = entity.clone();
         let path_for_refresh = current_path.clone();
 
-        let mut panel = div()
-            .id("files-scroll")
-            .size_full()
-            .overflow_y_scroll()
+        let toolbar = div()
             .flex()
-            .flex_col()
-            .gap(px(6.0))
-            .p(px(12.0))
-            .bg(colors.surface)
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(20.0))
+            .py(px(10.0))
+            .border_b_1()
+            .border_color(colors.stroke_neutral_subtle)
             .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(Label::new("Files").size(LabelSize::Subtitle))
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("files-back")
-                            .label("← Back")
-                            .appearance(ButtonAppearance::Subtle)
-                            .on_click(move |_: &ClickEvent, _, app: &mut App| {
-                                e_back.update(app, |m, cx| {
-                                    if let Some(p) = m.files_state.navigate_back() {
-                                        m.send_utility(p);
-                                    }
-                                    cx.notify();
-                                });
-                            }),
-                    )
-                    .child(
-                        Button::new("files-refresh")
-                            .label("↻ Refresh")
-                            .appearance(ButtonAppearance::Subtle)
-                            .on_click(move |_: &ClickEvent, _, app: &mut App| {
-                                let path = path_for_refresh.clone();
-                                e_refresh.update(app, |m, cx| {
-                                    let p = m.files_state.request_browse(path);
-                                    m.send_utility(p);
-                                    cx.notify();
-                                });
-                            }),
-                    )
-                    .child(
-                        Button::new("files-new-folder")
-                            .label("+ Folder")
-                            .appearance(ButtonAppearance::Subtle)
-                            .on_click(move |_: &ClickEvent, _, app: &mut App| {
-                                e_new_folder.update(app, |m, cx| {
-                                    m.file_action = FileActionDialog {
-                                        kind: Some(FileActionKind::CreateFolder),
-                                        target_path: Some(m.files_state.current_path.clone()),
-                                    };
-                                    m.file_action_input.update(cx, |t, cx| {
-                                        t.set_value("", cx);
-                                        t.set_placeholder("New folder name");
-                                        cx.notify();
-                                    });
-                                    cx.notify();
-                                });
-                            }),
-                    ),
+                Button::new("files-back")
+                    .icon("icons/back.svg")
+                    .label("Back")
+                    .appearance(ButtonAppearance::Subtle)
+                    .size(ButtonSize::Compact)
+                    .disabled(current_path == "/")
+                    .on_click(move |_, _, app| {
+                        e_back.update(app, |m, cx| {
+                            if let Some(p) = m.files_state.navigate_back() {
+                                m.send_utility(p);
+                            }
+                            cx.notify();
+                        });
+                    }),
             )
-            .child(Divider::horizontal())
+            .child(
+                Button::new("files-refresh")
+                    .icon("icons/refresh.svg")
+                    .label("Refresh")
+                    .appearance(ButtonAppearance::Subtle)
+                    .size(ButtonSize::Compact)
+                    .on_click(move |_, _, app| {
+                        let path = path_for_refresh.clone();
+                        e_refresh.update(app, |m, cx| {
+                            let p = m.files_state.request_browse(path);
+                            m.send_utility(p);
+                            cx.notify();
+                        });
+                    }),
+            )
+            .child(
+                Button::new("files-new-folder")
+                    .label("New folder")
+                    .appearance(ButtonAppearance::Subtle)
+                    .size(ButtonSize::Compact)
+                    .on_click(move |_, _, app| {
+                        e_new_folder.update(app, |m, cx| {
+                            m.file_action = FileActionDialog {
+                                kind: Some(FileActionKind::CreateFolder),
+                                target_path: Some(m.files_state.current_path.clone()),
+                            };
+                            m.file_action_input.update(cx, |t, cx| {
+                                t.set_value("", cx);
+                                t.set_placeholder("New folder name");
+                                cx.notify();
+                            });
+                            cx.notify();
+                        });
+                    }),
+            )
+            .child(div().flex_1())
             .child(
                 div()
                     .text_color(colors.on_subtle)
-                    .text_size(px(12.0))
-                    .child(format!("Path: {current_path}")),
+                    .text_size(px(typography.caption.size))
+                    .font_family("monospace")
+                    .child(current_path.clone()),
             );
 
-        // Inline action dialog (create folder / rename)
+        let mut body = div()
+            .id("files-scroll")
+            .flex_1()
+            .overflow_y_scroll()
+            .p(px(12.0))
+            .flex()
+            .flex_col()
+            .gap(px(2.0));
+
+        // Inline action dialog
         if let Some(kind) = self.file_action.kind {
             let title = match kind {
                 FileActionKind::CreateFolder => "New folder",
@@ -1410,142 +2134,116 @@ impl AppModel {
             let target = self.file_action.target_path.clone().unwrap_or_default();
             let e_submit = entity.clone();
             let e_cancel = entity.clone();
-            panel = panel.child(
-                div()
-                    .p(px(8.0))
-                    .rounded(px(4.0))
-                    .bg(colors.neutral)
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.0))
-                    .child(
-                        div()
-                            .text_color(colors.on_neutral)
-                            .font_weight(FontWeight::BOLD)
-                            .text_size(px(12.0))
-                            .child(format!("{title}: {target}")),
-                    )
-                    .child(self.file_action_input.clone())
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap(px(4.0))
-                            .child(
-                                Button::new("file-action-submit")
-                                    .label("Submit")
-                                    .appearance(ButtonAppearance::Accent)
-                                    .on_click(move |_: &ClickEvent, _, app: &mut App| {
-                                        e_submit.update(app, |m, cx| {
-                                            let value =
-                                                m.file_action_input.read(cx).text().to_string();
-                                            let trimmed = value.trim().to_owned();
-                                            if trimmed.is_empty() {
-                                                return;
+            body = body.child(
+                Card::new().padding(12.0).gap(8.0).child(
+                    div()
+                        .text_color(colors.on_neutral)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(format!("{title}: {target}")),
+                ).child(self.file_action_input.clone()).child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(6.0))
+                        .child(
+                            Button::new("file-action-submit")
+                                .label("Submit")
+                                .appearance(ButtonAppearance::Accent)
+                                .size(ButtonSize::Compact)
+                                .on_click(move |_, _, app| {
+                                    e_submit.update(app, |m, cx| {
+                                        let value = m.file_action_input.read(cx).text().to_string();
+                                        let trimmed = value.trim().to_owned();
+                                        if trimmed.is_empty() {
+                                            return;
+                                        }
+                                        let Some(kind) = m.file_action.kind else { return };
+                                        let Some(target) = m.file_action.target_path.clone() else {
+                                            return;
+                                        };
+                                        let parent_path = m.files_state.current_path.clone();
+                                        let payload = match kind {
+                                            FileActionKind::CreateFolder => Payload::FileMutation(
+                                                androidconnect_protocol::FileMutation {
+                                                    request_id: format!("mut-{}", new_request_token()),
+                                                    mutation:
+                                                        androidconnect_protocol::FileMutationKind::CreateFolder,
+                                                    path: target.clone(),
+                                                    new_path: Some(trimmed),
+                                                },
+                                            ),
+                                            FileActionKind::Rename => {
+                                                let new_path = if let Some(slash_idx) = target.rfind('/') {
+                                                    format!("{}/{trimmed}", &target[..slash_idx])
+                                                } else {
+                                                    trimmed
+                                                };
+                                                Payload::FileMutation(
+                                                    androidconnect_protocol::FileMutation {
+                                                        request_id: format!("mut-{}", new_request_token()),
+                                                        mutation:
+                                                            androidconnect_protocol::FileMutationKind::Rename,
+                                                        path: target.clone(),
+                                                        new_path: Some(new_path),
+                                                    },
+                                                )
                                             }
-                                            let Some(kind) = m.file_action.kind else {
-                                                return;
-                                            };
-                                            let Some(target) = m.file_action.target_path.clone()
-                                            else {
-                                                return;
-                                            };
-                                            let parent_path = m.files_state.current_path.clone();
-                                            let payload = match kind {
-                                                FileActionKind::CreateFolder => {
-                                                    Payload::FileMutation(
-                                                        androidconnect_protocol::FileMutation {
-                                                            request_id: format!(
-                                                                "mut-{}",
-                                                                new_request_token()
-                                                            ),
-                                                            mutation:
-                                                                androidconnect_protocol::FileMutationKind::CreateFolder,
-                                                            path: target.clone(),
-                                                            new_path: Some(trimmed),
-                                                        },
-                                                    )
-                                                }
-                                                FileActionKind::Rename => {
-                                                    let new_path = if let Some(slash_idx) =
-                                                        target.rfind('/')
-                                                    {
-                                                        format!(
-                                                            "{}/{trimmed}",
-                                                            &target[..slash_idx]
-                                                        )
-                                                    } else {
-                                                        trimmed
-                                                    };
-                                                    Payload::FileMutation(
-                                                        androidconnect_protocol::FileMutation {
-                                                            request_id: format!(
-                                                                "mut-{}",
-                                                                new_request_token()
-                                                            ),
-                                                            mutation:
-                                                                androidconnect_protocol::FileMutationKind::Rename,
-                                                            path: target.clone(),
-                                                            new_path: Some(new_path),
-                                                        },
-                                                    )
-                                                }
-                                            };
-                                            m.send_utility(payload);
-                                            // Re-browse the current path so the user sees the new state.
-                                            let refresh =
-                                                m.files_state.request_browse(parent_path);
-                                            m.send_utility(refresh);
-                                            m.file_action = FileActionDialog::default();
-                                            cx.notify();
-                                        });
-                                    }),
-                            )
-                            .child(
-                                Button::new("file-action-cancel")
-                                    .label("Cancel")
-                                    .appearance(ButtonAppearance::Subtle)
-                                    .on_click(move |_: &ClickEvent, _, app: &mut App| {
-                                        e_cancel.update(app, |m, cx| {
-                                            m.file_action = FileActionDialog::default();
-                                            cx.notify();
-                                        });
-                                    }),
-                            ),
-                    ),
+                                        };
+                                        m.send_utility(payload);
+                                        let refresh = m.files_state.request_browse(parent_path);
+                                        m.send_utility(refresh);
+                                        m.file_action = FileActionDialog::default();
+                                        cx.notify();
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new("file-action-cancel")
+                                .label("Cancel")
+                                .appearance(ButtonAppearance::Subtle)
+                                .size(ButtonSize::Compact)
+                                .on_click(move |_, _, app| {
+                                    e_cancel.update(app, |m, cx| {
+                                        m.file_action = FileActionDialog::default();
+                                        cx.notify();
+                                    });
+                                }),
+                        ),
+                ),
             );
         }
 
         if pending {
-            panel = panel.child(
+            body = body.child(
                 div()
                     .text_color(colors.on_subtle_disabled)
                     .italic()
+                    .py(px(20.0))
                     .child("Loading…"),
             );
         } else if let Some(resp) = response {
-            if let Some(placeholder) = feature_placeholder(
-                cx,
-                &resp.status,
-                "Cannot browse this folder.",
-                "files-status",
-            ) {
-                panel = panel.child(placeholder);
+            if let Some(banner) = permission_banner(&resp.status, "Cannot browse this folder.", cx)
+            {
+                body = body.child(banner);
             }
+
             for entry in &resp.entries {
                 let icon = match entry.entry_type {
-                    androidconnect_protocol::FileEntryType::Directory => "📁",
-                    androidconnect_protocol::FileEntryType::File => "📄",
-                    androidconnect_protocol::FileEntryType::Media => "🖼",
+                    androidconnect_protocol::FileEntryType::Directory => "folder",
+                    androidconnect_protocol::FileEntryType::File => "doc",
+                    androidconnect_protocol::FileEntryType::Media => "image",
+                };
+                let icon_color = match entry.entry_type {
+                    androidconnect_protocol::FileEntryType::Directory => colors.on_neutral_accent,
+                    _ => colors.on_subtle,
                 };
                 let size_label = entry
                     .size_bytes
                     .map(crate::status::format_bytes_short)
                     .unwrap_or_else(|| "—".to_owned());
-                let label_text =
-                    format!("{icon}  {:<48} {}", truncate(&entry.name, 46), size_label);
                 let entry_path = entry.path.clone();
                 let entry_type = entry.entry_type;
+                let entry_name = entry.name.clone();
                 let e_nav = entity.clone();
                 let e_del = entity.clone();
                 let e_rename = entity.clone();
@@ -1555,29 +2253,60 @@ impl AppModel {
                 let e_name_rename = entry.name.clone();
                 let e_path_download = entry.path.clone();
 
-                let mut row = div().flex().flex_row().items_center().gap(px(4.0)).child(
-                    div()
-                        .id(SharedString::from(format!("fentry-{entry_path}")))
-                        .flex_1()
-                        .text_color(colors.on_neutral)
-                        .text_size(px(12.0))
-                        .cursor_pointer()
-                        .on_click(move |_: &ClickEvent, _, app: &mut App| {
-                            if !matches!(
-                                entry_type,
-                                androidconnect_protocol::FileEntryType::Directory
-                            ) {
-                                return;
-                            }
-                            let p = entry_path.clone();
-                            e_nav.update(app, |m, cx| {
-                                let payload = m.files_state.navigate_to(p);
-                                m.send_utility(payload);
-                                cx.notify();
-                            });
-                        })
-                        .child(label_text),
-                );
+                let mut row = div()
+                    .id(SharedString::from(format!("fentry-{entry_path}")))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(10.0))
+                    .px(px(12.0))
+                    .py(px(6.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(colors.subtle_hover))
+                    .on_click(move |_, _, app| {
+                        if !matches!(
+                            entry_type,
+                            androidconnect_protocol::FileEntryType::Directory
+                        ) {
+                            return;
+                        }
+                        let p = entry_path.clone();
+                        e_nav.update(app, |m, cx| {
+                            let payload = m.files_state.navigate_to(p);
+                            m.send_utility(payload);
+                            cx.notify();
+                        });
+                    })
+                    .child(
+                        div()
+                            .text_color(icon_color)
+                            .child(Icon::new(icon).size(IconSize::Sm)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_color(colors.on_neutral)
+                            .font_weight(
+                                if matches!(
+                                    entry_type,
+                                    androidconnect_protocol::FileEntryType::Directory
+                                ) {
+                                    FontWeight::SEMIBOLD
+                                } else {
+                                    FontWeight::NORMAL
+                                },
+                            )
+                            .text_size(px(typography.body.size))
+                            .child(entry_name),
+                    )
+                    .child(
+                        div()
+                            .w(px(80.0))
+                            .text_color(colors.on_subtle)
+                            .text_size(px(typography.caption.size))
+                            .child(size_label),
+                    );
 
                 if !matches!(
                     entry_type,
@@ -1585,9 +2314,10 @@ impl AppModel {
                 ) {
                     row = row.child(
                         Button::new(SharedString::from(format!("dl-{}", entry.path)))
-                            .label("⬇")
+                            .label("Save to PC")
                             .appearance(ButtonAppearance::Subtle)
-                            .on_click(move |_: &ClickEvent, _, app: &mut App| {
+                            .size(ButtonSize::Compact)
+                            .on_click(move |_, _, app| {
                                 let path = e_path_download.clone();
                                 e_download.update(app, |m, cx| {
                                     m.request_download(path);
@@ -1600,9 +2330,10 @@ impl AppModel {
                 row = row
                     .child(
                         Button::new(SharedString::from(format!("rn-{}", entry.path)))
-                            .label("✎")
+                            .label("Rename")
                             .appearance(ButtonAppearance::Subtle)
-                            .on_click(move |_: &ClickEvent, _, app: &mut App| {
+                            .size(ButtonSize::Compact)
+                            .on_click(move |_, _, app| {
                                 let path = e_path_rename.clone();
                                 let name = e_name_rename.clone();
                                 e_rename.update(app, |m, cx| {
@@ -1621,9 +2352,10 @@ impl AppModel {
                     )
                     .child(
                         Button::new(SharedString::from(format!("del-{}", entry.path)))
-                            .label("✕")
+                            .label("Delete")
                             .appearance(ButtonAppearance::Subtle)
-                            .on_click(move |_: &ClickEvent, _, app: &mut App| {
+                            .size(ButtonSize::Compact)
+                            .on_click(move |_, _, app| {
                                 let path = e_path_del.clone();
                                 e_del.update(app, |m, cx| {
                                     let parent_path = m.files_state.current_path.clone();
@@ -1643,74 +2375,92 @@ impl AppModel {
                             }),
                     );
 
-                panel = panel.child(row);
+                body = body.child(row);
             }
         } else {
-            panel = panel.child(
+            body = body.child(
                 div()
                     .text_color(colors.on_subtle_disabled)
                     .italic()
+                    .py(px(20.0))
                     .child("No data for this path."),
             );
         }
-        panel
-    }
 
-    /// Open a native save-dialog for `path` and emit a `FileTransferRequest`. The incoming
-    /// transfer machinery in `network.rs` writes to its default download directory; the desktop
-    /// then moves the completed file to the user's chosen destination via
-    /// `download_destinations`.
-    fn request_download(&mut self, path: String) {
-        let suggested = path
-            .rsplit_once('/')
-            .map(|(_, name)| name)
-            .unwrap_or(&path)
-            .to_owned();
-        let chosen = rfd::FileDialog::new().set_file_name(&suggested).save_file();
-        let Some(dest) = chosen else { return };
-        if let Ok(mut map) = self.download_destinations.lock() {
-            map.insert(path.clone(), dest);
-        }
-        self.send_utility(Payload::FileTransferRequest(
-            androidconnect_protocol::FileTransferRequest {
-                request_id: format!("dl-{}", new_request_token()),
-                path,
-            },
-        ));
+        div()
+            .size_full()
+            .bg(colors.surface)
+            .flex()
+            .flex_col()
+            .child(toolbar)
+            .child(body)
+            .into_any_element()
     }
 
     fn render_messages_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let colors = cx.theme().colors.clone();
+        let typography = cx.theme().typography;
         let entity = cx.entity();
+
+        if !self.connected() {
+            return div()
+                .size_full()
+                .bg(colors.surface)
+                .child(disconnected_placeholder(
+                    "chat",
+                    "Your text threads, on your desktop",
+                    "Send and receive SMS / RCS messages through your paired phone.",
+                    cx,
+                ))
+                .into_any_element();
+        }
+
         let state = self.messages_state.clone();
         let composer = self.sms_composer.clone();
 
-        // Left column: thread list
+        // Thread list (left)
         let mut thread_list = div()
             .id("sms-thread-list")
-            .w(px(220.0))
+            .w(px(280.0))
             .h_full()
+            .bg(colors.panel_bg)
+            .border_r_1()
+            .border_color(colors.stroke_neutral_subtle)
+            .flex()
+            .flex_col();
+
+        thread_list = thread_list.child(
+            div()
+                .px(px(12.0))
+                .py(px(12.0))
+                .border_b_1()
+                .border_color(colors.stroke_neutral_subtle)
+                .child(Label::new("Messages").size(LabelSize::Subtitle)),
+        );
+
+        let mut list = div()
+            .id("sms-list-scroll")
+            .flex_1()
             .overflow_y_scroll()
-            .bg(colors.surface_dim)
             .flex()
             .flex_col()
-            .p(px(8.0))
-            .gap(px(2.0))
-            .child(Label::new("Threads").size(LabelSize::Subtitle));
+            .p(px(6.0))
+            .gap(px(2.0));
 
         if let Some(status) = &state.thread_status
-            && let Some(placeholder) =
-                feature_placeholder(cx, status, "SMS access required.", "sms-status")
+            && let Some(banner) =
+                permission_banner(status, "SMS access required — enable in onboarding.", cx)
         {
-            thread_list = thread_list.child(placeholder);
+            list = list.child(banner);
         }
 
         if state.threads.is_empty() {
-            thread_list = thread_list.child(
+            list = list.child(
                 div()
                     .text_color(colors.on_subtle_disabled)
                     .italic()
-                    .py(px(8.0))
+                    .py(px(20.0))
+                    .px(px(12.0))
                     .child("No threads yet."),
             );
         } else {
@@ -1724,33 +2474,45 @@ impl AppModel {
                     .unwrap_or_else(|| "(no preview)".to_owned());
                 let unread_badge: gpui::AnyElement = if thread.unread_count > 0 {
                     div()
+                        .min_w(px(20.0))
                         .px(px(6.0))
-                        .py(px(2.0))
-                        .rounded(px(8.0))
+                        .py(px(1.0))
+                        .rounded(px(9999.0))
                         .bg(colors.accent)
                         .text_color(colors.on_accent)
                         .text_size(px(10.0))
+                        .font_weight(FontWeight::BOLD)
                         .child(format!("{}", thread.unread_count))
                         .into_any_element()
                 } else {
                     div().into_any_element()
                 };
-                thread_list = thread_list.child(
+                let initials = device_initials(&thread.display_name);
+                let display_name = thread.display_name.clone();
+
+                list = list.child(
                     div()
                         .id(SharedString::from(format!("thread-{thread_id}")))
-                        .px(px(8.0))
-                        .py(px(6.0))
+                        .flex()
+                        .flex_row()
+                        .gap(px(10.0))
+                        .px(px(12.0))
+                        .py(px(10.0))
                         .rounded(px(4.0))
                         .bg(if is_active {
-                            colors.subtle_selected
+                            colors.neutral_selected
                         } else {
-                            colors.surface_dim
+                            gpui::transparent_black()
+                        })
+                        .hover(move |s| {
+                            if is_active {
+                                s
+                            } else {
+                                s.bg(colors.subtle_hover)
+                            }
                         })
                         .cursor_pointer()
-                        .flex()
-                        .flex_col()
-                        .gap(px(2.0))
-                        .on_click(move |_: &ClickEvent, _, app: &mut App| {
+                        .on_click(move |_, _, app| {
                             let id = thread_id.clone();
                             e.update(app, |m, cx| {
                                 if let Some(payload) = m.messages_state.open_thread(id) {
@@ -1759,31 +2521,45 @@ impl AppModel {
                                 cx.notify();
                             });
                         })
+                        .child(Avatar::initials(initials).size(36.0))
                         .child(
                             div()
+                                .flex_1()
                                 .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(4.0))
+                                .flex_col()
+                                .gap(px(2.0))
                                 .child(
                                     div()
-                                        .flex_1()
-                                        .text_color(colors.on_neutral)
-                                        .text_size(px(13.0))
-                                        .font_weight(FontWeight::BOLD)
-                                        .child(truncate(&thread.display_name, 22).to_owned()),
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(6.0))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .text_color(colors.on_neutral)
+                                                .text_size(px(typography.body.size))
+                                                .font_weight(if thread.unread_count > 0 {
+                                                    FontWeight::BOLD
+                                                } else {
+                                                    FontWeight::SEMIBOLD
+                                                })
+                                                .child(truncate(&display_name, 22).to_owned()),
+                                        )
+                                        .child(unread_badge),
                                 )
-                                .child(unread_badge),
-                        )
-                        .child(
-                            div()
-                                .text_color(colors.on_subtle)
-                                .text_size(px(11.0))
-                                .child(truncate(&snippet, 30).to_owned()),
+                                .child(
+                                    div()
+                                        .text_color(colors.on_subtle)
+                                        .text_size(px(typography.caption.size))
+                                        .child(truncate(&snippet, 36).to_owned()),
+                                ),
                         ),
                 );
             }
         }
+
+        thread_list = thread_list.child(list);
 
         // Right column: active conversation
         let conversation: gpui::AnyElement = if let Some(active_id) = &state.active_thread {
@@ -1806,34 +2582,51 @@ impl AppModel {
             let send_pending = state.pending_send.is_some();
             let send_error = state.send_error.clone();
 
-            let mut conv = div()
-                .flex_1()
-                .h_full()
-                .flex()
-                .flex_col()
-                .bg(colors.surface)
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(8.0))
-                        .p(px(10.0))
-                        .child(Label::new(display_name).size(LabelSize::Subtitle))
-                        .child(div().flex_1())
-                        .child(
-                            Button::new("close-thread")
-                                .label("Close")
-                                .appearance(ButtonAppearance::Subtle)
-                                .on_click(move |_: &ClickEvent, _, app: &mut App| {
-                                    e_close.update(app, |m, cx| {
-                                        m.messages_state.close_thread();
-                                        cx.notify();
-                                    });
-                                }),
-                        ),
-                )
-                .child(Divider::horizontal());
+            let mut conv = div().flex_1().h_full().flex().flex_col().bg(colors.surface);
+
+            // Header
+            conv = conv.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(10.0))
+                    .px(px(20.0))
+                    .py(px(12.0))
+                    .border_b_1()
+                    .border_color(colors.stroke_neutral_subtle)
+                    .child(Avatar::initials(device_initials(&display_name)).size(32.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_color(colors.on_neutral)
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(display_name),
+                            )
+                            .child(
+                                div()
+                                    .text_color(colors.on_subtle)
+                                    .text_size(px(typography.caption.size))
+                                    .child("SMS"),
+                            ),
+                    )
+                    .child(
+                        Button::new("close-thread")
+                            .label("Close")
+                            .appearance(ButtonAppearance::Subtle)
+                            .size(ButtonSize::Compact)
+                            .on_click(move |_, _, app| {
+                                e_close.update(app, |m, cx| {
+                                    m.messages_state.close_thread();
+                                    cx.notify();
+                                });
+                            }),
+                    ),
+            );
 
             let mut history = div()
                 .id("sms-history")
@@ -1841,18 +2634,14 @@ impl AppModel {
                 .overflow_y_scroll()
                 .flex()
                 .flex_col()
-                .gap(px(4.0))
-                .p(px(10.0));
+                .gap(px(6.0))
+                .px(px(20.0))
+                .py(px(16.0));
 
             if let Some(status) = detail_status
-                && let Some(placeholder) = feature_placeholder(
-                    cx,
-                    &status,
-                    "Cannot read this thread.",
-                    "sms-thread-status",
-                )
+                && let Some(banner) = permission_banner(&status, "Cannot read this thread.", cx)
             {
-                history = history.child(placeholder);
+                history = history.child(banner);
             }
 
             if pending_load && messages.is_empty() {
@@ -1874,9 +2663,9 @@ impl AppModel {
                     let outbound = matches!(entry.direction, MessageDirection::Outbound);
                     let bubble = div()
                         .max_w(px(420.0))
-                        .px(px(10.0))
-                        .py(px(6.0))
-                        .rounded(px(8.0))
+                        .px(px(12.0))
+                        .py(px(8.0))
+                        .rounded(px(14.0))
                         .bg(if outbound {
                             colors.accent
                         } else {
@@ -1887,7 +2676,7 @@ impl AppModel {
                         } else {
                             colors.on_neutral
                         })
-                        .text_size(px(12.0))
+                        .text_size(px(typography.body.size))
                         .child(entry.body.clone());
                     let mut row = div().flex().flex_row().gap(px(4.0));
                     if outbound {
@@ -1899,22 +2688,26 @@ impl AppModel {
                 }
             }
 
-            conv = conv.child(history).child(Divider::horizontal());
+            conv = conv.child(history);
 
             // Composer
             let composer_row = div()
                 .flex()
                 .flex_row()
-                .gap(px(6.0))
+                .gap(px(8.0))
                 .items_center()
-                .p(px(10.0))
+                .px(px(20.0))
+                .py(px(12.0))
+                .border_t_1()
+                .border_color(colors.stroke_neutral_subtle)
                 .child(div().flex_1().child(composer_for_send))
                 .child(
                     Button::new("sms-send")
+                        .icon("icons/send.svg")
                         .label(if send_pending { "Sending…" } else { "Send" })
                         .appearance(ButtonAppearance::Accent)
                         .disabled(send_pending)
-                        .on_click(move |_: &ClickEvent, _, app: &mut App| {
+                        .on_click(move |_, _, app| {
                             e_send.update(app, |m, cx| {
                                 let body = m.sms_composer.read(cx).text().to_string();
                                 if let Some(payload) = m.messages_state.build_send(body) {
@@ -1929,14 +2722,7 @@ impl AppModel {
                 );
             conv = conv.child(composer_row);
             if let Some(err) = send_error {
-                conv = conv.child(
-                    div()
-                        .px(px(10.0))
-                        .pb(px(8.0))
-                        .text_color(gpui::rgb(0xff5555u32))
-                        .text_size(px(11.0))
-                        .child(err),
-                );
+                conv = conv.child(error_banner(&err, cx));
             }
             conv.into_any_element()
         } else {
@@ -1949,7 +2735,7 @@ impl AppModel {
                 .text_color(colors.on_subtle_disabled)
                 .italic()
                 .bg(colors.surface)
-                .child("Select a thread to view the conversation.")
+                .child("Pick a conversation to view the thread.")
                 .into_any_element()
         };
 
@@ -1959,58 +2745,35 @@ impl AppModel {
             .flex_row()
             .bg(colors.surface)
             .child(thread_list)
-            .child(Divider::vertical())
             .child(conversation)
+            .into_any_element()
     }
-}
 
-/// Returns a small placeholder card describing a non-Available `FeatureStatus`. Returns `None`
-/// when the feature is `Available` (caller should render normal content).
-fn feature_placeholder(
-    cx: &mut Context<AppModel>,
-    status: &androidconnect_protocol::FeatureStatus,
-    fallback_message: &str,
-    id_prefix: &'static str,
-) -> Option<gpui::AnyElement> {
-    use androidconnect_protocol::FeatureState;
-    let colors = cx.theme().colors.clone();
-    let message = status.message.clone();
-    let body = if message.is_empty() {
-        fallback_message.to_owned()
-    } else {
-        message
-    };
-    let heading = match status.state {
-        FeatureState::Available => return None,
-        FeatureState::PermissionRequired => "Permission required",
-        FeatureState::Disabled => "Feature disabled",
-        FeatureState::Unsupported => "Not supported on this device",
-        FeatureState::Error => "Error",
-    };
-    Some(
-        div()
-            .id(SharedString::from(format!("{id_prefix}-placeholder")))
-            .p(px(12.0))
-            .rounded(px(4.0))
-            .bg(colors.neutral)
-            .flex()
-            .flex_col()
-            .gap(px(4.0))
-            .child(
-                div()
-                    .text_color(colors.on_neutral)
-                    .font_weight(FontWeight::BOLD)
-                    .text_size(px(13.0))
-                    .child(heading),
-            )
-            .child(
-                div()
-                    .text_color(colors.on_subtle)
-                    .text_size(px(12.0))
-                    .child(body),
-            )
-            .into_any_element(),
-    )
+    /// Open a native save-dialog for `path` and emit a `FileTransferRequest`. The incoming
+    /// transfer machinery in `network.rs` writes to its default download directory; the desktop
+    /// then moves the completed file to the user's chosen destination via
+    /// `download_destinations`.
+    fn request_download(&mut self, path: String) {
+        let suggested = path
+            .rsplit_once('/')
+            .map(|(_, name)| name)
+            .unwrap_or(&path)
+            .to_owned();
+        let chosen = rfd::FileDialog::new().set_file_name(&suggested).save_file();
+        let Some(dest) = chosen else { return };
+        if let Ok(mut map) = self.download_destinations.lock() {
+            map.insert(path.clone(), dest);
+        }
+        self.send_utility(Payload::FileTransferRequest(
+            androidconnect_protocol::FileTransferRequest {
+                request_id: format!("dl-{}", new_request_token()),
+                path: path.clone(),
+            },
+        ));
+        let filename = path.rsplit_once('/').map(|(_, n)| n).unwrap_or(&path);
+        self.activity
+            .push(ActivityIcon::Download, format!("Saved {filename}"));
+    }
 }
 
 impl Render for AppModel {
@@ -2031,13 +2794,14 @@ impl Render for AppModel {
         }
 
         let top_bar = self.render_top_bar(cx);
-        let nav_rail = self.render_nav_rail(cx);
+        let sidebar = self.render_sidebar(cx);
         let status_bar = self.render_status_bar(cx);
 
         let content = if !connected {
             self.render_pair_panel(cx).into_any_element()
         } else {
             match self.active_panel {
+                Panel::Overview => self.render_overview_panel(cx).into_any_element(),
                 Panel::Mirror => self.render_mirror_panel(cx).into_any_element(),
                 Panel::Notifications => self.render_notifications_panel(cx).into_any_element(),
                 Panel::Messages => self.render_messages_panel(cx).into_any_element(),
@@ -2051,6 +2815,7 @@ impl Render for AppModel {
             .flex_col()
             .size_full()
             .bg(colors.surface)
+            .child(self.title_bar.clone())
             .child(top_bar)
             .child(
                 div()
@@ -2058,7 +2823,7 @@ impl Render for AppModel {
                     .flex()
                     .flex_row()
                     .min_h_0()
-                    .child(nav_rail)
+                    .child(sidebar)
                     .child(div().flex_1().min_w_0().child(content)),
             )
             .child(status_bar)
@@ -2211,6 +2976,822 @@ fn format_socket_addr(ip: IpAddr, port: u16) -> String {
     }
 }
 
+// ── Render helpers ────────────────────────────────────────────────────────
+
+fn section_header(title: &'static str, cx: &Context<AppModel>) -> impl IntoElement {
+    let colors = cx.theme().colors.clone();
+    let typography = cx.theme().typography;
+    div()
+        .px(px(16.0))
+        .pt(px(12.0))
+        .pb(px(6.0))
+        .text_color(colors.on_subtle)
+        .text_size(px(typography.caption.size))
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(title.to_uppercase())
+}
+
+fn action_icon_button(
+    id: &'static str,
+    icon_name: &'static str,
+    cx: &Context<AppModel>,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let colors = cx.theme().colors.clone();
+    div()
+        .id(id)
+        .size(px(28.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(4.0))
+        .text_color(colors.on_subtle)
+        .cursor_pointer()
+        .hover(move |s| s.bg(colors.subtle_hover))
+        .on_click(on_click)
+        .child(Icon::new(icon_name).size(IconSize::Sm))
+}
+
+fn mirror_chip_icon(
+    id: &'static str,
+    icon_name: &'static str,
+    _cx: &Context<AppModel>,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .size(px(28.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(6.0))
+        .text_color(gpui::white())
+        .cursor_pointer()
+        .hover(|s| s.bg(hsla(0.0, 0.0, 1.0, 0.12)))
+        .child(Icon::new(icon_name).size(IconSize::Sm))
+}
+
+fn stat_chip(icon_name: &'static str, value: &str, cx: &Context<AppModel>) -> impl IntoElement {
+    let colors = cx.theme().colors.clone();
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(4.0))
+        .text_color(colors.on_subtle)
+        .child(Icon::new(icon_name).size(IconSize::Sm))
+        .child(div().child(value.to_owned()))
+}
+
+fn pending_dot(cx: &Context<AppModel>) -> impl IntoElement {
+    let colors = cx.theme().colors.clone();
+    div().size(px(10.0)).rounded(px(9999.0)).bg(colors.accent)
+}
+
+fn error_banner(msg: &str, cx: &Context<AppModel>) -> impl IntoElement {
+    let colors = cx.theme().colors.clone();
+    let typography = cx.theme().typography;
+    div()
+        .px(px(12.0))
+        .py(px(8.0))
+        .rounded(px(4.0))
+        .bg(colors.status_error_bg)
+        .border_1()
+        .border_color(colors.status_error_border)
+        .text_color(colors.status_error)
+        .text_size(px(typography.caption.size))
+        .child(msg.to_owned())
+}
+
+fn permission_banner(
+    status: &FeatureStatus,
+    fallback: &str,
+    cx: &Context<AppModel>,
+) -> Option<gpui::AnyElement> {
+    if matches!(status.state, FeatureState::Available) {
+        return None;
+    }
+    let colors = cx.theme().colors.clone();
+    let typography = cx.theme().typography;
+    let heading = match status.state {
+        FeatureState::Available => return None,
+        FeatureState::PermissionRequired => "Permission required",
+        FeatureState::Disabled => "Feature disabled",
+        FeatureState::Unsupported => "Not supported on this device",
+        FeatureState::Error => "Error",
+    };
+    let message = if status.message.is_empty() {
+        fallback.to_owned()
+    } else {
+        status.message.clone()
+    };
+    Some(
+        div()
+            .flex()
+            .flex_row()
+            .gap(px(10.0))
+            .items_start()
+            .p(px(12.0))
+            .rounded(px(4.0))
+            .bg(colors.status_info_bg)
+            .border_l_2()
+            .border_color(colors.status_info)
+            .child(Icon::new("bell").size(IconSize::Sm))
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .text_color(colors.on_neutral)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(px(typography.body.size))
+                            .child(heading),
+                    )
+                    .child(
+                        div()
+                            .text_color(colors.on_subtle)
+                            .text_size(px(typography.caption.size))
+                            .child(message),
+                    ),
+            )
+            .into_any_element(),
+    )
+}
+
+fn disconnected_placeholder(
+    icon: &'static str,
+    title: &'static str,
+    body: &'static str,
+    cx: &Context<AppModel>,
+) -> impl IntoElement {
+    let colors = cx.theme().colors.clone();
+    let typography = cx.theme().typography;
+    div()
+        .size_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(12.0))
+                .max_w(px(380.0))
+                .text_color(colors.on_subtle)
+                .child(
+                    div()
+                        .size(px(56.0))
+                        .rounded(px(14.0))
+                        .bg(colors.neutral)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(colors.on_subtle)
+                        .child(Icon::new(icon).size(IconSize::Lg)),
+                )
+                .child(Label::new(title).size(LabelSize::Subtitle))
+                .child(
+                    div()
+                        .text_color(colors.on_subtle)
+                        .text_size(px(typography.body.size))
+                        .child(body),
+                ),
+        )
+}
+
+fn quick_action(
+    id: &'static str,
+    icon: &'static str,
+    title: &'static str,
+    sub: &'static str,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &Context<AppModel>,
+) -> impl IntoElement {
+    let colors = cx.theme().colors.clone();
+    let typography = cx.theme().typography;
+    div()
+        .id(id)
+        .flex_1()
+        .p(px(14.0))
+        .rounded(px(4.0))
+        .bg(colors.neutral)
+        .border_1()
+        .border_color(colors.stroke_neutral_subtle)
+        .cursor_pointer()
+        .hover(move |s| {
+            s.bg(colors.neutral_hover)
+                .border_color(colors.stroke_neutral)
+        })
+        .on_click(on_click)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(12.0))
+        .child(
+            div()
+                .size(px(36.0))
+                .rounded(px(8.0))
+                .bg(colors.surface_dim)
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(colors.on_neutral_accent)
+                .child(Icon::new(icon).size(IconSize::Md)),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_color(colors.on_neutral)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_size(px(typography.body.size))
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .text_color(colors.on_subtle)
+                        .text_size(px(typography.caption.size))
+                        .child(sub),
+                ),
+        )
+}
+
+fn device_summary_card(
+    device_name: &str,
+    state: ConnectionBadgeState,
+    battery_pct: Option<u8>,
+    wifi: Option<&str>,
+    bluetooth: Option<bool>,
+    cx: &Context<AppModel>,
+) -> impl IntoElement {
+    let colors = cx.theme().colors.clone();
+    let typography = cx.theme().typography;
+    let battery_label = battery_pct
+        .map(|p| format!("{p}%"))
+        .unwrap_or_else(|| "—".to_owned());
+    let battery_bar_color = match battery_pct {
+        Some(p) if p > 20 => colors.status_success,
+        Some(_) => colors.status_warning,
+        None => colors.stroke_neutral_subtle,
+    };
+    let battery_width = battery_pct.unwrap_or(0).min(100) as f32 / 100.0 * 320.0;
+
+    let mut conn_row = div().flex().flex_row().items_center().gap(px(8.0)).child(
+        div()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_size(px(typography.subtitle.size))
+            .child(device_name.to_owned()),
+    );
+    conn_row = conn_row.child(ConnectionBadge::new("hero-conn", state));
+
+    let stats_row = div()
+        .flex()
+        .flex_row()
+        .gap(px(24.0))
+        .child(stat_block("Wi-Fi", wifi.unwrap_or("—"), cx))
+        .child(stat_block(
+            "Bluetooth",
+            match bluetooth {
+                Some(true) => "On",
+                Some(false) => "Off",
+                None => "—",
+            },
+            cx,
+        ))
+        .child(stat_block("Charging", "—", cx));
+
+    Card::new()
+        .padding(20.0)
+        .gap(16.0)
+        .child(conn_row)
+        .child(
+            // Battery block
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .child(
+                            div()
+                                .flex_1()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.0))
+                                .text_color(colors.on_subtle)
+                                .child(Icon::new("battery").size(IconSize::Sm))
+                                .child(
+                                    div()
+                                        .text_size(px(typography.caption.size))
+                                        .child("BATTERY"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_color(colors.on_neutral)
+                                .text_size(px(typography.display.size))
+                                .font_weight(FontWeight::BOLD)
+                                .child(battery_label),
+                        ),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .h(px(8.0))
+                        .rounded(px(6.0))
+                        .bg(colors.surface_dim)
+                        .border_1()
+                        .border_color(colors.stroke_neutral_subtle)
+                        .child(
+                            div()
+                                .w(px(battery_width))
+                                .h_full()
+                                .rounded(px(6.0))
+                                .bg(battery_bar_color),
+                        ),
+                ),
+        )
+        .child(stats_row)
+}
+
+fn stat_block(label: &str, value: &str, cx: &Context<AppModel>) -> impl IntoElement {
+    let colors = cx.theme().colors.clone();
+    let typography = cx.theme().typography;
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(2.0))
+        .child(
+            div()
+                .text_color(colors.on_subtle)
+                .text_size(px(typography.caption.size))
+                .child(label.to_uppercase()),
+        )
+        .child(
+            div()
+                .text_color(colors.on_neutral)
+                .text_size(px(typography.body.size))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(value.to_owned()),
+        )
+}
+
+fn now_playing_card(media: &crate::status::MediaInfo, cx: &Context<AppModel>) -> impl IntoElement {
+    let colors = cx.theme().colors.clone();
+    let typography = cx.theme().typography;
+    let title = media.title.clone().unwrap_or_else(|| "Unknown".to_owned());
+    let artist = media.artist.clone().unwrap_or_default();
+    let app_name = media.app_name.clone().unwrap_or_default();
+    let is_playing = matches!(
+        media.playback_state,
+        MediaPlaybackState::Playing | MediaPlaybackState::Buffering
+    );
+
+    Card::new().padding(16.0).gap(12.0).child(
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(12.0))
+            .child(
+                div()
+                    .size(px(80.0))
+                    .rounded(px(8.0))
+                    .bg(colors.surface_dim)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(colors.on_neutral_accent)
+                    .child(Icon::new("play").size(IconSize::Lg)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .text_color(colors.on_subtle)
+                            .text_size(px(typography.caption.size))
+                            .child(format!("NOW PLAYING · {app_name}")),
+                    )
+                    .child(
+                        div()
+                            .text_color(colors.on_neutral)
+                            .text_size(px(typography.subtitle.size))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_color(colors.on_subtle)
+                            .text_size(px(typography.body.size))
+                            .child(artist),
+                    ),
+            )
+            .child(
+                Button::new("now-play")
+                    .label(if is_playing { "⏸" } else { "▶" })
+                    .appearance(ButtonAppearance::Accent)
+                    .shape(ButtonShape::Circular)
+                    .on_click(|_, _, _| { /* wired separately on Phone panel */ }),
+            ),
+    )
+}
+
+fn recent_notifications(
+    model: &AppModel,
+    limit: usize,
+    cx: &Context<AppModel>,
+) -> Vec<gpui::AnyElement> {
+    let colors = cx.theme().colors.clone();
+    let typography = cx.theme().typography;
+    let mut out = Vec::new();
+    let items: Vec<_> = model
+        .notifications
+        .iter_items()
+        .take(limit)
+        .map(|(_, n)| n.clone())
+        .collect();
+    if items.is_empty() {
+        out.push(
+            div()
+                .text_color(colors.on_subtle_disabled)
+                .italic()
+                .py(px(6.0))
+                .child("No recent notifications.")
+                .into_any_element(),
+        );
+        return out;
+    }
+    for n in items {
+        let title = n.title.clone().unwrap_or_default();
+        let body = n.text.clone().unwrap_or_default();
+        let when = relative_timestamp(n.timestamp_unix_ms);
+        out.push(
+            div()
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap(px(10.0))
+                .py(px(6.0))
+                .child(AppDot::new(n.app_name.clone()).size(24.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap(px(1.0))
+                        .child(
+                            div()
+                                .text_size(px(typography.caption.size))
+                                .text_color(colors.on_subtle)
+                                .child(n.app_name.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_color(colors.on_neutral)
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_size(px(typography.body.size))
+                                .child(truncate(&title, 48)),
+                        )
+                        .child(
+                            div()
+                                .text_color(colors.on_subtle)
+                                .text_size(px(typography.caption.size))
+                                .child(truncate(&body, 60)),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_color(colors.on_subtle_disabled)
+                        .text_size(px(typography.caption.size))
+                        .child(when),
+                )
+                .into_any_element(),
+        );
+    }
+    out
+}
+
+fn recent_messages(
+    model: &AppModel,
+    limit: usize,
+    cx: &Context<AppModel>,
+) -> Vec<gpui::AnyElement> {
+    let colors = cx.theme().colors.clone();
+    let typography = cx.theme().typography;
+    let mut out = Vec::new();
+    let items: Vec<_> = model
+        .messages_state
+        .threads
+        .iter()
+        .take(limit)
+        .cloned()
+        .collect();
+    if items.is_empty() {
+        out.push(
+            div()
+                .text_color(colors.on_subtle_disabled)
+                .italic()
+                .py(px(6.0))
+                .child("No recent messages.")
+                .into_any_element(),
+        );
+        return out;
+    }
+    for t in items {
+        let snippet = t
+            .last_message
+            .clone()
+            .unwrap_or_else(|| "(no preview)".to_owned());
+        let when = t
+            .timestamp_unix_ms
+            .map(relative_timestamp)
+            .unwrap_or_default();
+        out.push(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.0))
+                .py(px(6.0))
+                .child(Avatar::initials(device_initials(&t.display_name)).size(28.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap(px(1.0))
+                        .child(
+                            div()
+                                .text_color(colors.on_neutral)
+                                .font_weight(if t.unread_count > 0 {
+                                    FontWeight::BOLD
+                                } else {
+                                    FontWeight::SEMIBOLD
+                                })
+                                .text_size(px(typography.body.size))
+                                .child(truncate(&t.display_name, 24)),
+                        )
+                        .child(
+                            div()
+                                .text_color(colors.on_subtle)
+                                .text_size(px(typography.caption.size))
+                                .child(truncate(&snippet, 40)),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_color(colors.on_subtle_disabled)
+                        .text_size(px(typography.caption.size))
+                        .child(when),
+                )
+                .into_any_element(),
+        );
+    }
+    out
+}
+
+fn activity_rows(model: &AppModel, limit: usize, cx: &Context<AppModel>) -> Vec<gpui::AnyElement> {
+    let colors = cx.theme().colors.clone();
+    let typography = cx.theme().typography;
+    let mut out = Vec::new();
+    if model.activity.is_empty() {
+        out.push(
+            div()
+                .text_color(colors.on_subtle_disabled)
+                .italic()
+                .py(px(6.0))
+                .child("Nothing yet — your recent file transfers, replies, and pairings will show up here.")
+                .into_any_element(),
+        );
+        return out;
+    }
+    for ev in model.activity.iter().take(limit) {
+        let when = ev
+            .timestamp
+            .duration_since(UNIX_EPOCH)
+            .map(|d| relative_timestamp(d.as_millis() as u64))
+            .unwrap_or_default();
+        out.push(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.0))
+                .py(px(6.0))
+                .child(
+                    div()
+                        .size(px(28.0))
+                        .rounded(px(9999.0))
+                        .bg(colors.surface_dim)
+                        .border_1()
+                        .border_color(colors.stroke_neutral_subtle)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(colors.on_neutral_accent)
+                        .child(Icon::new(ev.icon.icon_name()).size(IconSize::Sm)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .text_color(colors.on_neutral)
+                        .text_size(px(typography.body.size))
+                        .child(ev.text.clone()),
+                )
+                .child(
+                    div()
+                        .text_color(colors.on_subtle_disabled)
+                        .text_size(px(typography.caption.size))
+                        .child(when),
+                )
+                .into_any_element(),
+        );
+    }
+    out
+}
+
+fn numbered_step(n: usize, title: &str, body: &str, cx: &Context<AppModel>) -> impl IntoElement {
+    let colors = cx.theme().colors.clone();
+    let typography = cx.theme().typography;
+    div()
+        .flex()
+        .flex_row()
+        .gap(px(14.0))
+        .items_start()
+        .child(
+            div()
+                .size(px(26.0))
+                .rounded(px(9999.0))
+                .bg(colors.neutral)
+                .border_1()
+                .border_color(colors.stroke_neutral)
+                .text_color(colors.on_neutral_accent)
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(typography.caption.size))
+                .font_weight(FontWeight::BOLD)
+                .child(format!("{n}")),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_color(colors.on_neutral)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_size(px(typography.body.size))
+                        .child(title.to_owned()),
+                )
+                .child(
+                    div()
+                        .text_color(colors.on_subtle)
+                        .text_size(px(typography.caption.size))
+                        .child(body.to_owned()),
+                ),
+        )
+}
+
+// ── Small data helpers ──────────────────────────────────────────────────────
+
+fn device_initials(name: &str) -> String {
+    let mut initials = String::new();
+    for w in name.split_whitespace().take(2) {
+        if let Some(c) = w.chars().next() {
+            initials.push(c.to_ascii_uppercase());
+        }
+    }
+    if initials.is_empty() {
+        "•".to_owned()
+    } else {
+        initials
+    }
+}
+
+fn parse_battery_percent(s: Option<&str>) -> Option<u8> {
+    let s = s?;
+    let n: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    n.parse().ok()
+}
+
+fn relative_timestamp(ms: u64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(ms);
+    let diff_secs = now.saturating_sub(ms) / 1000;
+    if diff_secs < 60 {
+        "just now".to_owned()
+    } else if diff_secs < 3600 {
+        format!("{}m ago", diff_secs / 60)
+    } else if diff_secs < 86400 {
+        format!("{}h ago", diff_secs / 3600)
+    } else {
+        format!("{}d ago", diff_secs / 86400)
+    }
+}
+
+fn local_greeting() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Local hour without tz lookup — assume system clock is local enough.
+    let hour = ((secs % 86400) / 3600) as u8;
+    let phase = if hour < 5 {
+        "Good evening"
+    } else if hour < 12 {
+        "Good morning"
+    } else if hour < 18 {
+        "Good afternoon"
+    } else {
+        "Good evening"
+    };
+    phase.to_owned()
+}
+
+fn today_string() -> String {
+    // Lightweight ISO-style date without `chrono`. Computes Y-M-D from epoch
+    // seconds; weekday derived via Zeller's congruence.
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86400) as i64;
+    let (y, m, d) = civil_from_days(days);
+    let day_name = weekday_name(y, m, d);
+    let month_name = month_name(m);
+    format!("{day_name}, {month_name} {d}")
+}
+
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719468;
+    let era = if z >= 0 {
+        z / 146097
+    } else {
+        (z - 146096) / 146097
+    };
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = (yoe as i64 + era * 400) as i32;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+fn weekday_name(y: i32, m: u32, d: u32) -> &'static str {
+    let (y, m) = if m < 3 { (y - 1, m + 12) } else { (y, m) };
+    let k = y % 100;
+    let j = y / 100;
+    let h = (d as i32 + 13 * (m as i32 + 1) / 5 + k + k / 4 + j / 4 + 5 * j) % 7;
+    match h {
+        0 => "Saturday",
+        1 => "Sunday",
+        2 => "Monday",
+        3 => "Tuesday",
+        4 => "Wednesday",
+        5 => "Thursday",
+        _ => "Friday",
+    }
+}
+
+fn month_name(m: u32) -> &'static str {
+    match m {
+        1 => "January",
+        2 => "February",
+        3 => "March",
+        4 => "April",
+        5 => "May",
+        6 => "June",
+        7 => "July",
+        8 => "August",
+        9 => "September",
+        10 => "October",
+        11 => "November",
+        12 => "December",
+        _ => "",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2266,5 +3847,20 @@ mod tests {
             Some("desktop-host".to_owned()),
         );
         assert_eq!(addresses, vec!["desktop-host:48172".to_owned()]);
+    }
+
+    #[test]
+    fn parses_battery_percent_from_status_string() {
+        assert_eq!(parse_battery_percent(Some("78%")), Some(78));
+        assert_eq!(parse_battery_percent(Some("12% charging")), Some(12));
+        assert_eq!(parse_battery_percent(None), None);
+        assert_eq!(parse_battery_percent(Some("—")), None);
+    }
+
+    #[test]
+    fn device_initials_takes_up_to_two_word_first_letters() {
+        assert_eq!(device_initials("Pixel 8 Pro"), "P8");
+        assert_eq!(device_initials("nexus"), "N");
+        assert_eq!(device_initials("   "), "•");
     }
 }
