@@ -28,6 +28,23 @@ steps:
       - ./tools/build-android-native.sh
       - cd apps/android && ./gradlew assembleDebug
 
+  - name: publish-apk
+    image: alpine/curl
+    environment:
+      FORGEJO_TOKEN:
+        from_secret: forgejo_token
+    commands:
+      - |
+        APK=apps/android/app/build/outputs/apk/debug/app-debug.apk
+        HASH=$(echo $CI_COMMIT_SHA | cut -c1-7)
+        BASE="http://100.92.54.45:3002/api/packages/indexarr/generic/androidconnect-apk"
+        curl -sf -T "$APK" -H "Authorization: token $FORGEJO_TOKEN" \
+          "$BASE/latest/androidconnect-debug.apk"
+        curl -sf -T "$APK" -H "Authorization: token $FORGEJO_TOKEN" \
+          "$BASE/$HASH/androidconnect-debug.apk"
+    when:
+      - status: [success]
+
   - name: discord-success
     image: alpine/curl
     environment:
