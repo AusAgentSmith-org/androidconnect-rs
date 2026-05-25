@@ -6,7 +6,7 @@ use thiserror::Error;
 
 pub mod qr;
 
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 pub const DEFAULT_CONTROL_PORT: u16 = 48172;
 pub const DEFAULT_VIDEO_PORT: u16 = 48173;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 256 * 1024;
@@ -84,6 +84,7 @@ pub enum Payload {
     RelayStatus(RelayStatus),
     ClientList(ClientList),
     ClientRoleUpdate(ClientRoleUpdate),
+    MirrorRequest(MirrorRequest),
     Ping { nonce: u64 },
     Pong { nonce: u64 },
     Error { message: String },
@@ -729,6 +730,11 @@ pub enum MessageSendResult {
 
 /// Sent desktop → Android to request download of a single file/path.
 /// Android replies by starting a `FileTransferStart` (AndroidToDesktop) for that file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MirrorRequest {
+    pub request_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileTransferRequest {
     pub request_id: String,

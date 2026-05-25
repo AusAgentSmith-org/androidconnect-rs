@@ -33,6 +33,7 @@ pub struct DesktopStatus {
     pub last_pong_nonce: Option<u64>,
     pub last_error: Option<String>,
     pub battery_status: Option<String>,
+    pub charging: Option<bool>,
     pub feature_summary: Option<String>,
     pub features: Vec<FeatureStatus>,
     pub storage: Option<StorageBreakdown>,
@@ -67,6 +68,7 @@ impl DesktopStatus {
             last_pong_nonce: None,
             last_error: None,
             battery_status: None,
+            charging: None,
             feature_summary: None,
             features: Vec::new(),
             storage: None,
@@ -100,6 +102,7 @@ impl DesktopStatus {
                 self.video_format = None;
                 self.last_pong_nonce = None;
                 self.last_error = None;
+                self.charging = None;
                 self.clear_utility_status();
             }
             network::NetworkStatus::ClientConnected { peer } => {
@@ -110,6 +113,7 @@ impl DesktopStatus {
                 self.video_format = None;
                 self.last_pong_nonce = None;
                 self.last_error = None;
+                self.charging = None;
                 self.clear_utility_status();
             }
             network::NetworkStatus::DeviceHello { device_name } => {
@@ -151,6 +155,7 @@ impl DesktopStatus {
                 self.video_format = None;
                 self.last_pong_nonce = None;
                 self.last_error = None;
+                self.charging = None;
                 self.clear_utility_status();
             }
             network::NetworkStatus::ClientError { message } => {
@@ -169,6 +174,7 @@ impl DesktopStatus {
                 dnd_mode,
                 volume_percent,
             } => {
+                self.charging = charging;
                 self.battery_status = battery_percent.map(|percent| {
                     if charging.unwrap_or(false) {
                         format!("{percent}% charging")

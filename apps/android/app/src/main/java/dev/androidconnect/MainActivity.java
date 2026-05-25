@@ -73,6 +73,7 @@ public final class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         NativeBridge.addStatusListener(nativeStatusListener);
+        NativeBridge.setMirrorRequestListener(this::requestScreenCapture);
         AndroidUtilityBridge.rememberContext(this);
         updateStatus();
         statusHandler.removeCallbacks(statusRefresh);
@@ -82,6 +83,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onPause() {
         NativeBridge.removeStatusListener(nativeStatusListener);
+        NativeBridge.setMirrorRequestListener(null);
         statusHandler.removeCallbacks(statusRefresh);
         super.onPause();
     }

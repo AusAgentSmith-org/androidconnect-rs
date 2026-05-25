@@ -23,8 +23,8 @@ use qrcode::{Color as QrColor, QrCode};
 use androidconnect_protocol::{
     AudioControl, AudioControlCommand, DndMode, FeatureState, FeatureStatus, FileEntry,
     FileEntryType, InputEvent, MediaControl, MediaControlAction, MediaPlaybackState,
-    MessageDirection, MessageSendResult, Payload, PointerButton, PointerEvent, PointerPhase,
-    StorageBreakdown, UtilityFeature,
+    MessageDirection, MessageSendResult, MirrorRequest, Payload, PointerButton, PointerEvent,
+    PointerPhase, StorageBreakdown, UtilityFeature,
     qr::{QrPairingPayload, encode_qr_payload},
 };
 
@@ -1031,6 +1031,7 @@ impl AppModel {
             &device_name,
             self.badge_state(),
             battery_pct,
+            self.status.charging,
             self.status.wifi_summary.as_deref(),
             self.status.bluetooth_enabled,
             cx,
@@ -1203,6 +1204,7 @@ impl AppModel {
         }
 
         if video_id.is_none() || frame_data.is_none() {
+            let start_entity = entity.clone();
             return div()
                 .size_full()
                 .flex()
@@ -1226,7 +1228,31 @@ impl AppModel {
                     div()
                         .text_color(colors.on_subtle)
                         .text_size(px(typography.body.size))
-                        .child("Waiting for first frame…"),
+                        .child("Tap Start mirroring on your phone, or use the button below."),
+                )
+                .child(
+                    Button::new("mirror-start-stream")
+                        .label("Start mirroring")
+                        .appearance(ButtonAppearance::Accent)
+                        .on_click(move |_, _, app| {
+                            start_entity.update(app, |m, cx| {
+                                let request_id = format!(
+                                    "mirror-{}",
+                                    SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .map(|d| d.as_micros())
+                                        .unwrap_or_default()
+                                );
+                                m.send_utility(Payload::MirrorRequest(MirrorRequest {
+                                    request_id,
+                                }));
+                                m.activity.push(
+                                    ActivityIcon::Send,
+                                    "Requested screen mirroring from phone".to_owned(),
+                                );
+                                cx.notify();
+                            });
+                        }),
                 )
                 .into_any_element();
         }
@@ -4677,6 +4703,7 @@ fn device_summary_card(
     device_name: &str,
     state: ConnectionBadgeState,
     battery_pct: Option<u8>,
+    charging: Option<bool>,
     wifi: Option<&str>,
     bluetooth: Option<bool>,
     cx: &Context<AppModel>,
@@ -4692,7 +4719,7 @@ fn device_summary_card(
         Some(_) => colors.status_warning,
         None => colors.stroke_neutral_subtle,
     };
-    let battery_width = battery_pct.unwrap_or(0).min(100) as f32 / 100.0 * 320.0;
+    let battery_fraction = battery_pct.unwrap_or(0).min(100) as f32 / 100.0;
 
     let mut conn_row = div()
         .flex()
@@ -4703,6 +4730,7 @@ fn device_summary_card(
             div()
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_size(px(typography.subtitle.size))
+                .text_color(colors.on_neutral)
                 .child(device_name.to_owned()),
         );
     conn_row = conn_row.child(ConnectionBadge::new("hero-conn", state));
@@ -4721,7 +4749,15 @@ fn device_summary_card(
             },
             cx,
         ))
-        .child(stat_block("Charging", "—", cx));
+        .child(stat_block(
+            "Charging",
+            match charging {
+                Some(true) => "Yes",
+                Some(false) => "No",
+                None => "—",
+            },
+            cx,
+        ));
 
     Card::new().padding(20.0).child(
         div()
@@ -4778,7 +4814,7 @@ fn device_summary_card(
                                     .border_color(colors.stroke_neutral_subtle)
                                     .child(
                                         div()
-                                            .w(px(battery_width))
+                                            .w(relative(battery_fraction))
                                             .h_full()
                                             .rounded(px(6.0))
                                             .bg(battery_bar_color),
@@ -4887,20 +4923,27 @@ fn now_playing_card(
                     ),
             )
             .child(if let Some((action, label)) = control {
-                Button::new("now-play")
-                    .label(label)
-                    .appearance(ButtonAppearance::Accent)
-                    .size(ButtonSize::Compact)
-                    .on_click(move |_, _, app| {
-                        entity.update(app, |m, cx| {
-                            m.send_utility(Payload::MediaControl(MediaControl { action }));
-                            m.activity.push(
-                                ActivityIcon::Send,
-                                format!("Sent media {} command", label.to_ascii_lowercase()),
-                            );
-                            cx.notify();
-                        });
-                    })
+                div()
+                    .flex_none()
+                    .child(
+                        Button::new("now-play")
+                            .label(label)
+                            .appearance(ButtonAppearance::Accent)
+                            .size(ButtonSize::Compact)
+                            .on_click(move |_, _, app| {
+                                entity.update(app, |m, cx| {
+                                    m.send_utility(Payload::MediaControl(MediaControl { action }));
+                                    m.activity.push(
+                                        ActivityIcon::Send,
+                                        format!(
+                                            "Sent media {} command",
+                                            label.to_ascii_lowercase()
+                                        ),
+                                    );
+                                    cx.notify();
+                                });
+                            }),
+                    )
                     .into_any_element()
             } else {
                 div().into_any_element()

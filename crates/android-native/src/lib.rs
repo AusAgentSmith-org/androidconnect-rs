@@ -1249,6 +1249,7 @@ fn is_desktop_utility_payload(payload: &Payload) -> bool {
             | Payload::PhotoAssetTransfer(_)
             | Payload::RelayOffer(_)
             | Payload::ClientRoleUpdate(_)
+            | Payload::MirrorRequest(_)
     )
 }
 
@@ -1344,6 +1345,7 @@ fn handle_desktop_utility_payload(
             "onClientRoleUpdate",
             serde_json::to_string(&update).unwrap_or_default(),
         ),
+        Payload::MirrorRequest(_) => call_static_void_no_args(env, bridge_class, "onMirrorRequest"),
         _ => Ok(()),
     };
 
@@ -2291,6 +2293,19 @@ fn call_static_void_string(
         clear_pending_exception(env);
         format!("{name} dispatch failed: {error}")
     })
+}
+
+fn call_static_void_no_args(
+    env: &mut JNIEnv<'_>,
+    class: &GlobalRef,
+    name: &str,
+) -> Result<(), String> {
+    env.call_static_method(class, name, "()V", &[])
+        .map(|_| ())
+        .map_err(|error| {
+            clear_pending_exception(env);
+            format!("{name} dispatch failed: {error}")
+        })
 }
 
 fn call_static_void_strings(

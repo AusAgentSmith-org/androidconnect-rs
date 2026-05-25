@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use androidconnect_protocol::{
@@ -18,6 +18,10 @@ pub struct MessagesState {
     pub pending_send: Option<PendingSend>,
     pub send_error: Option<String>,
     pub last_send_result: Option<MessageSendResult>,
+    /// Thread IDs the user has opened on the desktop this session. Used to locally
+    /// suppress unread badges after viewing — Android can't mark messages read unless
+    /// it's the default SMS app, so we track this client-side.
+    pub viewed_threads: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -30,6 +34,11 @@ pub struct PendingSend {
 impl MessagesState {
     pub fn apply_thread_list(&mut self, list: MessageThreadList) {
         self.threads = list.threads;
+        for thread in &mut self.threads {
+            if self.viewed_threads.contains(&thread.thread_id) {
+                thread.unread_count = 0;
+            }
+        }
         self.thread_status = Some(list.status);
     }
 
@@ -94,7 +103,7 @@ impl MessagesState {
 
     pub fn open_thread(&mut self, thread_id: String) -> Option<Payload> {
         self.active_thread = Some(thread_id.clone());
-        // Clear unread count locally so the badge disappears immediately on open.
+        self.viewed_threads.insert(thread_id.clone());
         if let Some(thread) = self.threads.iter_mut().find(|t| t.thread_id == thread_id) {
             thread.unread_count = 0;
         }

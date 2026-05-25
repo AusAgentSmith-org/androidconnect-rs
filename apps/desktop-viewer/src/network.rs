@@ -410,6 +410,7 @@ fn is_desktop_utility_payload(payload: &Payload) -> bool {
             | Payload::PhotoAssetTransfer(_)
             | Payload::RelayOffer(_)
             | Payload::ClientRoleUpdate(_)
+            | Payload::MirrorRequest(_)
     )
 }
 
@@ -736,7 +737,8 @@ fn read_client_loop(
             | Payload::CallAction(_)
             | Payload::PhotoAssetTransfer(_)
             | Payload::RelayOffer(_)
-            | Payload::ClientRoleUpdate(_) => {}
+            | Payload::ClientRoleUpdate(_)
+            | Payload::MirrorRequest(_) => {}
             Payload::MessageEvent(message) => {
                 info!(
                     "message_event: thread={} sender={} chars={}",

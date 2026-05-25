@@ -3,10 +3,13 @@ package dev.androidconnect;
 import android.Manifest;
 import android.content.Context;
 import android.content.pm.PackageManager;
+import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
+import android.util.Log;
 
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -15,11 +18,22 @@ import java.util.Set;
 import java.util.concurrent.CopyOnWriteArraySet;
 
 public final class NativeBridge {
+    private static final String TAG = "AndroidConnectNative";
     private static final boolean AVAILABLE;
     private static final Handler MAIN_HANDLER = new Handler(Looper.getMainLooper());
     private static final Set<StatusListener> STATUS_LISTENERS = new CopyOnWriteArraySet<>();
     private static volatile Context appContext;
     private static volatile boolean utilitiesPrimedForConnection;
+
+    // Wake + wifi locks held for the duration of an authenticated control connection
+    // (screen-off drops the TCP socket on Samsung/Xiaomi without these).
+    private static volatile PowerManager.WakeLock connectionWakeLock;
+    private static volatile WifiManager.WifiLock connectionWifiLock;
+
+    public interface MirrorRequestListener {
+        void onMirrorRequested();
+    }
+    private static volatile MirrorRequestListener mirrorRequestListener;
 
     // Scale factors from video space → physical display space, used by input dispatch.
     static volatile float inputScaleX = 1.0f;
@@ -97,12 +111,58 @@ public final class NativeBridge {
         return context.getFilesDir();
     }
 
+    public static void setMirrorRequestListener(MirrorRequestListener listener) {
+        mirrorRequestListener = listener;
+    }
+
     public static void disconnect() {
         utilitiesPrimedForConnection = false;
         SmsBridge.stopObserver();
         DeviceStateMonitor.stopForConnection();
+        releaseConnectionLocks();
         if (AVAILABLE) {
             nativeDisconnect();
+        }
+    }
+
+    private static void acquireConnectionLocks() {
+        Context ctx = appContext;
+        if (ctx == null) return;
+        if (connectionWakeLock == null) {
+            PowerManager power = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
+            if (power != null) {
+                connectionWakeLock = power.newWakeLock(
+                        PowerManager.PARTIAL_WAKE_LOCK, "AndroidConnect::Connection");
+                connectionWakeLock.setReferenceCounted(false);
+                connectionWakeLock.acquire();
+                Log.i(TAG, "acquired connection wake lock");
+            }
+        }
+        if (connectionWifiLock == null) {
+            WifiManager wifi = (WifiManager) ctx.getApplicationContext()
+                    .getSystemService(Context.WIFI_SERVICE);
+            if (wifi != null) {
+                int mode = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+                        ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                        : WifiManager.WIFI_MODE_FULL_HIGH_PERF;
+                connectionWifiLock = wifi.createWifiLock(mode, "AndroidConnect::Connection");
+                connectionWifiLock.setReferenceCounted(false);
+                connectionWifiLock.acquire();
+                Log.i(TAG, "acquired connection wifi lock (mode=" + mode + ")");
+            }
+        }
+    }
+
+    private static void releaseConnectionLocks() {
+        if (connectionWakeLock != null) {
+            if (connectionWakeLock.isHeld()) connectionWakeLock.release();
+            connectionWakeLock = null;
+            Log.i(TAG, "released connection wake lock");
+        }
+        if (connectionWifiLock != null) {
+            if (connectionWifiLock.isHeld()) connectionWifiLock.release();
+            connectionWifiLock = null;
+            Log.i(TAG, "released connection wifi lock");
         }
     }
 
@@ -254,6 +314,7 @@ public final class NativeBridge {
             if (!connected) {
                 SmsBridge.stopObserver();
                 DeviceStateMonitor.stopForConnection();
+                releaseConnectionLocks();
             }
             return;
         }
@@ -261,6 +322,7 @@ public final class NativeBridge {
             return;
         }
         utilitiesPrimedForConnection = true;
+        acquireConnectionLocks();
         MAIN_HANDLER.post(() -> {
             DeviceStateMonitor.startForConnection(context);
             AndroidUtilityBridge.refreshAll(context);
@@ -334,6 +396,17 @@ public final class NativeBridge {
 
     static void onPhotoAssetTransfer(String transferJson) {
         AndroidUtilityBridge.pushPhotosPermissionStatus();
+    }
+
+    static void onMirrorRequest() {
+        MAIN_HANDLER.post(() -> {
+            MirrorRequestListener l = mirrorRequestListener;
+            if (l != null) {
+                l.onMirrorRequested();
+            } else {
+                Log.w(TAG, "onMirrorRequest: no listener registered (app in background?)");
+            }
+        });
     }
 
     static void onRelayOffer(String offerJson) {
