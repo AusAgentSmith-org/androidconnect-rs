@@ -53,6 +53,9 @@ pub struct DesktopStatus {
     pub bluetooth_enabled: Option<bool>,
     pub dnd_mode: Option<DndMode>,
     pub volume_percent: Option<u8>,
+    pub keep_awake_enabled: Option<bool>,
+    pub connection_locks_held: Option<bool>,
+    pub storage_root: Option<String>,
 }
 
 impl DesktopStatus {
@@ -88,6 +91,9 @@ impl DesktopStatus {
             bluetooth_enabled: None,
             dnd_mode: None,
             volume_percent: None,
+            keep_awake_enabled: None,
+            connection_locks_held: None,
+            storage_root: None,
         }
     }
 
@@ -173,6 +179,9 @@ impl DesktopStatus {
                 bluetooth_enabled,
                 dnd_mode,
                 volume_percent,
+                keep_awake_enabled,
+                connection_locks_held,
+                storage_root,
             } => {
                 self.charging = charging;
                 self.battery_status = battery_percent.map(|percent| {
@@ -188,6 +197,9 @@ impl DesktopStatus {
                 self.bluetooth_enabled = bluetooth_enabled;
                 self.dnd_mode = dnd_mode;
                 self.volume_percent = volume_percent;
+                self.keep_awake_enabled = keep_awake_enabled;
+                self.connection_locks_held = connection_locks_held;
+                self.storage_root = storage_root;
                 self.connection = ConnectionState::Connected;
             }
             network::NetworkStatus::MediaStatus {
@@ -326,6 +338,9 @@ impl DesktopStatus {
         self.bluetooth_enabled = None;
         self.dnd_mode = None;
         self.volume_percent = None;
+        self.keep_awake_enabled = None;
+        self.connection_locks_held = None;
+        self.storage_root = None;
     }
 }
 

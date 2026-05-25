@@ -89,6 +89,9 @@ public final class AndroidUtilityBridge {
             putNullable(json, "battery_percent", battery.percent);
             putNullable(json, "charging", battery.charging);
             putNullable(json, "interactive", isInteractive(context));
+            putNullable(json, "keep_awake_enabled", NativeBridge.isKeepConnectionAwakeEnabled());
+            putNullable(json, "connection_locks_held", NativeBridge.connectionLocksHeld());
+            putNullable(json, "storage_root", NativeBridge.fileBrowserRootLabel(context));
             json.put("features", buildFeatureStatuses(context));
             JSONObject wifi = readWifiState(context);
             if (wifi != null) {
@@ -688,7 +691,7 @@ public final class AndroidUtilityBridge {
         features.put(featureStatus("FileTransfer", "Available",
                 "Explicit share and app-private received files are supported"));
         features.put(featureStatus("FileBrowser", "Available",
-                "Remote browsing is limited to AndroidConnect app storage until a document tree is granted"));
+                NativeBridge.fileBrowserRootLabel(context) + " is exposed to the desktop file browser"));
         features.put(featureStatus("Notifications",
                 notificationListenerEnabled(context) ? "Available" : "PermissionRequired",
                 notificationListenerEnabled(context)

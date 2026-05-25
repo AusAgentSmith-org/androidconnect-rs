@@ -1,7 +1,12 @@
 package dev.androidconnect;
 
 import android.Manifest;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.content.Context;
+import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.net.wifi.WifiManager;
 import android.os.Build;
@@ -19,6 +24,8 @@ import java.util.concurrent.CopyOnWriteArraySet;
 
 public final class NativeBridge {
     private static final String TAG = "AndroidConnectNative";
+    private static final String MIRROR_REQUEST_CHANNEL_ID = "mirror_requests";
+    private static final int MIRROR_REQUEST_NOTIFICATION_ID = 18;
     private static final boolean AVAILABLE;
     private static final Handler MAIN_HANDLER = new Handler(Looper.getMainLooper());
     private static final Set<StatusListener> STATUS_LISTENERS = new CopyOnWriteArraySet<>();
@@ -29,9 +36,11 @@ public final class NativeBridge {
     // (screen-off drops the TCP socket on Samsung/Xiaomi without these).
     private static volatile PowerManager.WakeLock connectionWakeLock;
     private static volatile WifiManager.WifiLock connectionWifiLock;
+    private static volatile boolean keepConnectionAwake = true;
+    private static volatile String pendingMirrorRequestId;
 
     public interface MirrorRequestListener {
-        void onMirrorRequested();
+        void onMirrorRequested(String requestId);
     }
     private static volatile MirrorRequestListener mirrorRequestListener;
 
@@ -111,8 +120,49 @@ public final class NativeBridge {
         return context.getFilesDir();
     }
 
+    public static String fileBrowserRootLabel(Context context) {
+        java.io.File root = getFileBrowserRoot(context);
+        if (root.equals(Environment.getExternalStorageDirectory())) {
+            return "Full external storage";
+        }
+        return "App storage";
+    }
+
     public static void setMirrorRequestListener(MirrorRequestListener listener) {
         mirrorRequestListener = listener;
+        if (listener != null) {
+            String requestId = pendingMirrorRequestId;
+            pendingMirrorRequestId = null;
+            if (requestId != null) {
+                MAIN_HANDLER.post(() -> dispatchMirrorRequest(requestId));
+            }
+        }
+    }
+
+    public static void clearPendingMirrorRequest(String requestId) {
+        if (requestId == null || requestId.equals(pendingMirrorRequestId)) {
+            pendingMirrorRequestId = null;
+        }
+    }
+
+    public static boolean isKeepConnectionAwakeEnabled() {
+        return keepConnectionAwake;
+    }
+
+    public static boolean connectionLocksHeld() {
+        return (connectionWakeLock != null && connectionWakeLock.isHeld())
+                || (connectionWifiLock != null && connectionWifiLock.isHeld());
+    }
+
+    public static void setKeepConnectionAwakeEnabled(boolean enabled) {
+        keepConnectionAwake = enabled;
+        if (!enabled) {
+            releaseConnectionLocks();
+            return;
+        }
+        if (isConnectedAndAuthenticated()) {
+            acquireConnectionLocks();
+        }
     }
 
     public static void disconnect() {
@@ -126,6 +176,9 @@ public final class NativeBridge {
     }
 
     private static void acquireConnectionLocks() {
+        if (!keepConnectionAwake) {
+            return;
+        }
         Context ctx = appContext;
         if (ctx == null) return;
         if (connectionWakeLock == null) {
@@ -163,6 +216,19 @@ public final class NativeBridge {
             if (connectionWifiLock.isHeld()) connectionWifiLock.release();
             connectionWifiLock = null;
             Log.i(TAG, "released connection wifi lock");
+        }
+    }
+
+    private static boolean isConnectedAndAuthenticated() {
+        if (!AVAILABLE) {
+            return false;
+        }
+        try {
+            JSONObject stats = new JSONObject(nativeStatsJson());
+            return stats.optBoolean("connected", false)
+                    && stats.optBoolean("input_authenticated", false);
+        } catch (JSONException ignored) {
+            return false;
         }
     }
 
@@ -270,6 +336,25 @@ public final class NativeBridge {
 
     public static boolean pushMessageSendResponseJson(String json) {
         return AVAILABLE && nativePushMessageSendResponse(json);
+    }
+
+    public static boolean pushMirrorRequestResult(
+            String requestId,
+            String state,
+            String message
+    ) {
+        if (!AVAILABLE) {
+            return false;
+        }
+        JSONObject json = new JSONObject();
+        try {
+            json.put("request_id", requestId == null ? "" : requestId);
+            json.put("state", state == null ? "Unavailable" : state);
+            json.put("message", message == null ? "" : message);
+        } catch (JSONException ignored) {
+            return false;
+        }
+        return nativePushMirrorRequestResult(json.toString());
     }
 
     public static boolean pushCallStateJson(String json) {
@@ -398,15 +483,42 @@ public final class NativeBridge {
         AndroidUtilityBridge.pushPhotosPermissionStatus();
     }
 
-    static void onMirrorRequest() {
-        MAIN_HANDLER.post(() -> {
-            MirrorRequestListener l = mirrorRequestListener;
-            if (l != null) {
-                l.onMirrorRequested();
-            } else {
-                Log.w(TAG, "onMirrorRequest: no listener registered (app in background?)");
-            }
-        });
+    static void onMirrorRequest(String requestJson) {
+        String requestId = "";
+        try {
+            JSONObject json = new JSONObject(requestJson == null ? "{}" : requestJson);
+            requestId = json.optString("request_id", "");
+        } catch (JSONException ignored) {
+        }
+        if (requestId.isEmpty()) {
+            requestId = "mirror-" + System.currentTimeMillis();
+        }
+        String finalRequestId = requestId;
+        MAIN_HANDLER.post(() -> dispatchMirrorRequest(finalRequestId));
+    }
+
+    private static void dispatchMirrorRequest(String requestId) {
+        MirrorRequestListener l = mirrorRequestListener;
+        if (l != null) {
+            pushMirrorRequestResult(
+                    requestId,
+                    "PromptShown",
+                    "Screen capture prompt shown on phone.");
+            l.onMirrorRequested(requestId);
+            return;
+        }
+
+        pendingMirrorRequestId = requestId;
+        pushMirrorRequestResult(
+                requestId,
+                "Queued",
+                "Open AndroidConnect on your phone to approve screen capture.");
+        Context context = appContext;
+        if (context != null) {
+            showMirrorRequestNotification(context, requestId);
+        } else {
+            Log.w(TAG, "onMirrorRequest: no app context available");
+        }
     }
 
     static void onRelayOffer(String offerJson) {
@@ -415,6 +527,57 @@ public final class NativeBridge {
 
     static void onClientRoleUpdate(String updateJson) {
         AndroidUtilityBridge.pushDeviceStatus(appContext);
+    }
+
+    private static void showMirrorRequestNotification(Context context, String requestId) {
+        NotificationManager manager =
+                (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
+        if (manager == null) {
+            return;
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                && context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+            Log.w(TAG, "mirror request notification skipped: POST_NOTIFICATIONS not granted");
+            return;
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationChannel channel = new NotificationChannel(
+                    MIRROR_REQUEST_CHANNEL_ID,
+                    "Mirror requests",
+                    NotificationManager.IMPORTANCE_HIGH);
+            manager.createNotificationChannel(channel);
+        }
+
+        Intent intent = new Intent(context, MainActivity.class);
+        intent.setAction(MainActivity.ACTION_MIRROR_REQUEST);
+        intent.putExtra(MainActivity.EXTRA_MIRROR_REQUEST_ID, requestId);
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            flags |= PendingIntent.FLAG_IMMUTABLE;
+        }
+        PendingIntent openApp = PendingIntent.getActivity(
+                context,
+                MIRROR_REQUEST_NOTIFICATION_ID,
+                intent,
+                flags);
+
+        Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                ? new Notification.Builder(context, MIRROR_REQUEST_CHANNEL_ID)
+                : new Notification.Builder(context);
+        Notification notification = builder
+                .setSmallIcon(android.R.drawable.presence_video_online)
+                .setContentTitle("Screen mirroring requested")
+                .setContentText("Open AndroidConnect to approve screen capture")
+                .setContentIntent(openApp)
+                .setAutoCancel(true)
+                .build();
+        try {
+            manager.notify(MIRROR_REQUEST_NOTIFICATION_ID, notification);
+        } catch (SecurityException error) {
+            Log.w(TAG, "mirror request notification failed", error);
+        }
     }
 
     private static void rememberContext(Context context) {
@@ -486,6 +649,7 @@ public final class NativeBridge {
     private static native boolean nativePushMessageThreadDetail(String detailJson);
     private static native boolean nativePushMessageEvent(String eventJson);
     private static native boolean nativePushMessageSendResponse(String responseJson);
+    private static native boolean nativePushMirrorRequestResult(String resultJson);
     private static native boolean nativePushCallState(String stateJson);
     private static native boolean nativePushRelayStatus(String statusJson);
     private static native String nativeStatsJson();

@@ -11,9 +11,9 @@ use androidconnect_protocol::{
     AUTH_CHALLENGE_BYTES, AuthMethod, AuthResponse, ClipboardSource, DndMode, Envelope,
     FeatureStatus, FileBrowseResponse, FileTransferChunk, FileTransferComplete, FileTransferStart,
     InputEvent, MAX_VIDEO_FRAME_BYTES, MediaControlAction, MediaPlaybackState, MediaStatus,
-    MessageEvent, MessageSendResponse, MessageThreadDetail, MessageThreadList, NotificationPosted,
-    NotificationRemoved, PAIRED_SECRET_BYTES, PROTOCOL_VERSION, Payload, StorageBreakdown,
-    TransferDirection, TransferStatus, WireError, bytes_to_hex, derive_session_key,
+    MessageEvent, MessageSendResponse, MessageThreadDetail, MessageThreadList, MirrorRequestResult,
+    NotificationPosted, NotificationRemoved, PAIRED_SECRET_BYTES, PROTOCOL_VERSION, Payload,
+    StorageBreakdown, TransferDirection, TransferStatus, WireError, bytes_to_hex, derive_session_key,
     paired_secret_from_pairing_code, pairing_auth_response, read_length_prefixed,
     session_key_fingerprint, trusted_session_auth_response, write_length_prefixed,
 };
@@ -68,6 +68,9 @@ pub enum NetworkStatus {
         bluetooth_enabled: Option<bool>,
         dnd_mode: Option<DndMode>,
         volume_percent: Option<u8>,
+        keep_awake_enabled: Option<bool>,
+        connection_locks_held: Option<bool>,
+        storage_root: Option<String>,
     },
     Storage {
         primary: StorageBreakdown,
@@ -147,6 +150,7 @@ pub enum DesktopEvent {
     MessageEvent(MessageEvent),
     MessageThreadDetail(MessageThreadDetail),
     MessageSendResponse(MessageSendResponse),
+    MirrorRequestResult(MirrorRequestResult),
     SessionLost,
 }
 
@@ -653,6 +657,9 @@ fn read_client_loop(
                         bluetooth_enabled: bt_enabled,
                         dnd_mode,
                         volume_percent,
+                        keep_awake_enabled: status.keep_awake_enabled,
+                        connection_locks_held: status.connection_locks_held,
+                        storage_root: status.storage_root.clone(),
                     },
                 );
             }
@@ -757,6 +764,13 @@ fn read_client_loop(
                     resp.thread_id, resp.result
                 );
                 let _ = event_tx.send(DesktopEvent::MessageSendResponse(resp));
+            }
+            Payload::MirrorRequestResult(result) => {
+                info!(
+                    "mirror_request_result: request={} state={:?} message={}",
+                    result.request_id, result.state, result.message
+                );
+                let _ = event_tx.send(DesktopEvent::MirrorRequestResult(result));
             }
             Payload::FileBrowseResponse(response) => {
                 send_status(

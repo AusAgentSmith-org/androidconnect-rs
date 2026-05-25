@@ -23,8 +23,8 @@ use qrcode::{Color as QrColor, QrCode};
 use androidconnect_protocol::{
     AudioControl, AudioControlCommand, DndMode, FeatureState, FeatureStatus, FileEntry,
     FileEntryType, InputEvent, MediaControl, MediaControlAction, MediaPlaybackState,
-    MessageDirection, MessageSendResult, MirrorRequest, Payload, PointerButton, PointerEvent,
-    PointerPhase, StorageBreakdown, UtilityFeature,
+    MessageDirection, MessageSendResult, MirrorRequest, MirrorRequestResult, MirrorRequestState,
+    Payload, PointerButton, PointerEvent, PointerPhase, StorageBreakdown, UtilityFeature,
     qr::{QrPairingPayload, encode_qr_payload},
 };
 
@@ -88,6 +88,7 @@ pub struct AppModel {
     mirror_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
     left_pressed: bool,
     last_mirror_mouse_move: Option<Instant>,
+    mirror_request_feedback: Option<MirrorRequestFeedback>,
 
     // Panel states
     notifications: NotificationsState,
@@ -121,6 +122,13 @@ pub struct QuickReplyState {
 pub struct FileActionDialog {
     pub kind: Option<FileActionKind>,
     pub target_path: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirrorRequestFeedback {
+    pub state: MirrorRequestState,
+    pub message: String,
+    pub updated_at: Instant,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -229,6 +237,7 @@ impl AppModel {
             mirror_bounds: Arc::new(Mutex::new(None)),
             left_pressed: false,
             last_mirror_mouse_move: None,
+            mirror_request_feedback: None,
             notifications: NotificationsState::default(),
             phone_state: PhoneState::default(),
             files_state,
@@ -254,6 +263,7 @@ impl AppModel {
         self.frame_w = frame.width;
         self.frame_h = frame.height;
         self.frame_data = Some(Arc::new(frame.data));
+        self.mirror_request_feedback = None;
         cx.notify();
     }
 
@@ -306,6 +316,9 @@ impl AppModel {
                     self.activity.push(ActivityIcon::Send, "Sent reply via SMS");
                 }
             }
+            network::DesktopEvent::MirrorRequestResult(result) => {
+                self.apply_mirror_request_result(result);
+            }
             network::DesktopEvent::SessionLost => {
                 self.reconnecting = true;
                 self.notifications.clear();
@@ -319,6 +332,7 @@ impl AppModel {
                 self.frame_w = 0;
                 self.frame_h = 0;
                 self.video_texture = None;
+                self.mirror_request_feedback = None;
                 self.video_alloc_w = 0;
                 self.video_alloc_h = 0;
                 if let Ok(mut g) = self.mirror_bounds.lock() {
@@ -348,6 +362,31 @@ impl AppModel {
 
     fn send_refresh_ping(&self) {
         let _ = self.command_tx.try_send(network::DesktopCommand::PingNow);
+    }
+
+    fn apply_mirror_request_result(&mut self, result: MirrorRequestResult) {
+        let message = if result.message.is_empty() {
+            match result.state {
+                MirrorRequestState::Queued => {
+                    "Open AndroidConnect on your phone to approve mirroring.".to_owned()
+                }
+                MirrorRequestState::PromptShown => "Screen capture prompt shown on phone.".to_owned(),
+                MirrorRequestState::Started => "Screen mirroring is starting.".to_owned(),
+                MirrorRequestState::Denied => "Screen mirroring was not approved.".to_owned(),
+                MirrorRequestState::Unavailable => "Screen capture is unavailable.".to_owned(),
+            }
+        } else {
+            result.message
+        };
+        self.activity.push(
+            ActivityIcon::Send,
+            format!("Mirror request: {message}"),
+        );
+        self.mirror_request_feedback = Some(MirrorRequestFeedback {
+            state: result.state,
+            message,
+            updated_at: Instant::now(),
+        });
     }
 
     fn set_active_panel(&mut self, panel: Panel) {
@@ -1032,6 +1071,8 @@ impl AppModel {
             self.badge_state(),
             battery_pct,
             self.status.charging,
+            self.status.keep_awake_enabled,
+            self.status.connection_locks_held,
             self.status.wifi_summary.as_deref(),
             self.status.bluetooth_enabled,
             cx,
@@ -1205,6 +1246,15 @@ impl AppModel {
 
         if video_id.is_none() || frame_data.is_none() {
             let start_entity = entity.clone();
+            let mirror_feedback = self.mirror_request_feedback.clone();
+            let mirror_request_pending = mirror_feedback.as_ref().is_some_and(|feedback| {
+                matches!(
+                    feedback.state,
+                    MirrorRequestState::Queued
+                        | MirrorRequestState::PromptShown
+                        | MirrorRequestState::Started
+                ) && feedback.updated_at.elapsed() < Duration::from_secs(30)
+            });
             return div()
                 .size_full()
                 .flex()
@@ -1232,8 +1282,13 @@ impl AppModel {
                 )
                 .child(
                     Button::new("mirror-start-stream")
-                        .label("Start mirroring")
+                        .label(if mirror_request_pending {
+                            "Request sent"
+                        } else {
+                            "Start mirroring"
+                        })
                         .appearance(ButtonAppearance::Accent)
+                        .disabled(mirror_request_pending)
                         .on_click(move |_, _, app| {
                             start_entity.update(app, |m, cx| {
                                 let request_id = format!(
@@ -1244,8 +1299,14 @@ impl AppModel {
                                         .unwrap_or_default()
                                 );
                                 m.send_utility(Payload::MirrorRequest(MirrorRequest {
-                                    request_id,
+                                    request_id: request_id.clone(),
                                 }));
+                                m.mirror_request_feedback = Some(MirrorRequestFeedback {
+                                    state: MirrorRequestState::Queued,
+                                    message: "Request sent. Approve screen capture on your phone."
+                                        .to_owned(),
+                                    updated_at: Instant::now(),
+                                });
                                 m.activity.push(
                                     ActivityIcon::Send,
                                     "Requested screen mirroring from phone".to_owned(),
@@ -1254,6 +1315,11 @@ impl AppModel {
                             });
                         }),
                 )
+                .child(if let Some(feedback) = mirror_feedback {
+                    mirror_request_feedback_view(&feedback, cx).into_any_element()
+                } else {
+                    div().into_any_element()
+                })
                 .into_any_element();
         }
 
@@ -2011,7 +2077,7 @@ impl AppModel {
                     .border_color(colors.stroke_neutral_subtle)
                     .child(
                         div()
-                            .w(px(PAIR_QR_SIDE * (p as f32) / 100.0))
+                            .w(relative((p.min(100) as f32) / 100.0))
                             .h_full()
                             .rounded(px(6.0))
                             .bg(if p > 20 {
@@ -2537,6 +2603,11 @@ impl AppModel {
         let path_for_refresh = current_path.clone();
         let view_mode = self.files_state.view_mode;
         let breadcrumb = files_breadcrumb(&current_path, entity.clone(), cx);
+        let storage_root = self
+            .status
+            .storage_root
+            .clone()
+            .unwrap_or_else(|| "Storage root pending".to_owned());
         let e_list = entity.clone();
         let e_grid = entity.clone();
 
@@ -2601,6 +2672,12 @@ impl AppModel {
                     }),
             )
             .child(breadcrumb)
+            .child(
+                div()
+                    .text_color(colors.on_subtle)
+                    .text_size(px(typography.caption.size))
+                    .child(storage_root),
+            )
             .child(div().flex_1())
             .child(
                 ToggleButton::new("files-view-list")
@@ -3761,6 +3838,25 @@ fn mirror_chip_hover_fill() -> Hsla {
     hsla(0.0, 0.0, 1.0, 0.12)
 }
 
+fn mirror_request_feedback_view(
+    feedback: &MirrorRequestFeedback,
+    cx: &Context<AppModel>,
+) -> impl IntoElement {
+    let colors = cx.theme().colors.clone();
+    let typography = cx.theme().typography;
+    let tone = match feedback.state {
+        MirrorRequestState::Denied | MirrorRequestState::Unavailable => colors.status_error,
+        MirrorRequestState::Started => colors.status_success,
+        MirrorRequestState::Queued | MirrorRequestState::PromptShown => colors.on_subtle,
+    };
+    div()
+        .max_w(px(420.0))
+        .text_align(gpui::TextAlign::Center)
+        .text_color(tone)
+        .text_size(px(typography.caption.size))
+        .child(feedback.message.clone())
+}
+
 fn stat_chip(icon_name: &'static str, value: &str, cx: &Context<AppModel>) -> impl IntoElement {
     let colors = cx.theme().colors.clone();
     let spacing = cx.theme().spacing;
@@ -4455,6 +4551,19 @@ fn storage_card(
                         .child(format!("GB used of {}", storage_gb_label(storage.total))),
                 ),
         )
+        .child(
+            div()
+                .text_color(colors.on_subtle)
+                .text_size(px(typography.caption.size))
+                .child(format!(
+                    "File browser root: {}",
+                    model
+                        .status
+                        .storage_root
+                        .as_deref()
+                        .unwrap_or("pending")
+                )),
+        )
         .child(storage_segmented_bar(storage, cx))
         .child(storage_legend(storage, cx));
 
@@ -4699,11 +4808,14 @@ fn phone_illustration(cx: &Context<AppModel>) -> impl IntoElement {
         )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn device_summary_card(
     device_name: &str,
     state: ConnectionBadgeState,
     battery_pct: Option<u8>,
     charging: Option<bool>,
+    keep_awake_enabled: Option<bool>,
+    connection_locks_held: Option<bool>,
     wifi: Option<&str>,
     bluetooth: Option<bool>,
     cx: &Context<AppModel>,
@@ -4755,6 +4867,16 @@ fn device_summary_card(
                 Some(true) => "Yes",
                 Some(false) => "No",
                 None => "—",
+            },
+            cx,
+        ))
+        .child(stat_block(
+            "Keep awake",
+            match (keep_awake_enabled, connection_locks_held) {
+                (Some(false), _) => "Off",
+                (Some(true), Some(true)) => "Held",
+                (Some(true), Some(false)) => "On",
+                _ => "—",
             },
             cx,
         ));

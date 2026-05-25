@@ -763,6 +763,20 @@ pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativePushMessageSen
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativePushMirrorRequestResult(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    result_json: JString<'_>,
+) -> jboolean {
+    push_json_payload::<androidconnect_protocol::MirrorRequestResult>(
+        &mut env,
+        result_json,
+        "mirror request result",
+        Payload::MirrorRequestResult,
+    )
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_androidconnect_NativeBridge_nativePushCallState(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
@@ -834,6 +848,12 @@ struct DeviceStatusUpdate {
     battery_percent: Option<u8>,
     charging: Option<bool>,
     interactive: Option<bool>,
+    #[serde(default)]
+    keep_awake_enabled: Option<bool>,
+    #[serde(default)]
+    connection_locks_held: Option<bool>,
+    #[serde(default)]
+    storage_root: Option<String>,
     features: Vec<FeatureStatus>,
     #[serde(default)]
     wifi_state: Option<androidconnect_protocol::WifiState>,
@@ -899,6 +919,9 @@ fn push_device_status_json(json: &str) -> Result<(), String> {
         battery_percent: update.battery_percent,
         charging: update.charging,
         interactive: update.interactive,
+        keep_awake_enabled: update.keep_awake_enabled,
+        connection_locks_held: update.connection_locks_held,
+        storage_root: update.storage_root,
         features: update.features,
         wifi_state: update.wifi_state,
         bluetooth_state: update.bluetooth_state,
@@ -1345,7 +1368,12 @@ fn handle_desktop_utility_payload(
             "onClientRoleUpdate",
             serde_json::to_string(&update).unwrap_or_default(),
         ),
-        Payload::MirrorRequest(_) => call_static_void_no_args(env, bridge_class, "onMirrorRequest"),
+        Payload::MirrorRequest(request) => call_static_void_string(
+            env,
+            bridge_class,
+            "onMirrorRequest",
+            serde_json::to_string(&request).unwrap_or_default(),
+        ),
         _ => Ok(()),
     };
 
@@ -1532,10 +1560,24 @@ fn send_file_browse_error(
 fn handle_file_mutation(generation: u64, mutation: FileMutation) -> Result<(), String> {
     let root = active_storage_dir()?;
     let path = resolve_storage_path(&root, &mutation.path)?;
+    let mut changed_path = path.clone();
     match mutation.mutation {
         FileMutationKind::CreateFolder => {
-            fs::create_dir_all(&path)
-                .map_err(|error| format!("create {} failed: {error}", path.display()))?;
+            changed_path = if let Some(new_path) = mutation
+                .new_path
+                .as_deref()
+                .filter(|path| !path.trim().is_empty())
+            {
+                if Path::new(new_path).is_absolute() {
+                    resolve_storage_path(&root, new_path)?
+                } else {
+                    resolve_storage_path(&path, new_path)?
+                }
+            } else {
+                path.clone()
+            };
+            fs::create_dir_all(&changed_path)
+                .map_err(|error| format!("create {} failed: {error}", changed_path.display()))?;
         }
         FileMutationKind::Delete => {
             if path.is_dir() {
@@ -1560,7 +1602,7 @@ fn handle_file_mutation(generation: u64, mutation: FileMutation) -> Result<(), S
             })?;
         }
     }
-    let parent = path
+    let parent = changed_path
         .parent()
         .map(|parent| relative_storage_path(&root, parent))
         .unwrap_or_default();
@@ -2295,19 +2337,6 @@ fn call_static_void_string(
     })
 }
 
-fn call_static_void_no_args(
-    env: &mut JNIEnv<'_>,
-    class: &GlobalRef,
-    name: &str,
-) -> Result<(), String> {
-    env.call_static_method(class, name, "()V", &[])
-        .map(|_| ())
-        .map_err(|error| {
-            clear_pending_exception(env);
-            format!("{name} dispatch failed: {error}")
-        })
-}
-
 fn call_static_void_strings(
     env: &mut JNIEnv<'_>,
     class: &GlobalRef,
@@ -2655,6 +2684,20 @@ mod tests {
         assert!(!should_reconnect_after_error(
             "unsupported protocol version 2"
         ));
+    }
+
+    #[test]
+    fn create_folder_new_path_resolves_below_current_directory() {
+        let root = PathBuf::from("/storage/emulated/0");
+        let current = resolve_storage_path(&root, "/Download").expect("current path");
+        let created = resolve_storage_path(&current, "New Folder").expect("created path");
+
+        assert_eq!(created, root.join("Download").join("New Folder"));
+        assert_eq!(
+            resolve_storage_path(&root, "/Pictures").expect("absolute display path"),
+            root.join("Pictures")
+        );
+        assert!(resolve_storage_path(&current, "../Pictures").is_err());
     }
 
     fn stats_value() -> serde_json::Value {

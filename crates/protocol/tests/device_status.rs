@@ -15,6 +15,9 @@ fn populated_device_status() -> DeviceStatus {
         battery_percent: Some(72),
         charging: Some(false),
         interactive: Some(true),
+        keep_awake_enabled: Some(true),
+        connection_locks_held: Some(false),
+        storage_root: Some("App storage".to_owned()),
         features: vec![FeatureStatus::available(UtilityFeature::DeviceStatus)],
         wifi_state: Some(WifiState {
             connected: true,
@@ -57,6 +60,9 @@ fn device_status_round_trips_with_only_legacy_fields() {
         battery_percent: Some(72),
         charging: Some(false),
         interactive: Some(true),
+        keep_awake_enabled: None,
+        connection_locks_held: None,
+        storage_root: None,
         features: vec![FeatureStatus::available(UtilityFeature::DeviceStatus)],
         wifi_state: None,
         bluetooth_state: None,
@@ -131,6 +137,12 @@ struct CurrentDeviceStatusJson {
     dnd_state: Option<DndState>,
     #[serde(default)]
     volume: Option<VolumeState>,
+    #[serde(default)]
+    keep_awake_enabled: Option<bool>,
+    #[serde(default)]
+    connection_locks_held: Option<bool>,
+    #[serde(default)]
+    storage_root: Option<String>,
 }
 
 #[test]
@@ -151,4 +163,7 @@ fn legacy_json_payload_still_parses_into_current_schema() {
     assert!(parsed.bluetooth_state.is_none());
     assert!(parsed.dnd_state.is_none());
     assert!(parsed.volume.is_none());
+    assert!(parsed.keep_awake_enabled.is_none());
+    assert!(parsed.connection_locks_held.is_none());
+    assert!(parsed.storage_root.is_none());
 }

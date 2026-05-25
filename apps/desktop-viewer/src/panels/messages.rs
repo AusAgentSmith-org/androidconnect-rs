@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use androidconnect_protocol::{
@@ -18,10 +18,10 @@ pub struct MessagesState {
     pub pending_send: Option<PendingSend>,
     pub send_error: Option<String>,
     pub last_send_result: Option<MessageSendResult>,
-    /// Thread IDs the user has opened on the desktop this session. Used to locally
-    /// suppress unread badges after viewing — Android can't mark messages read unless
-    /// it's the default SMS app, so we track this client-side.
-    pub viewed_threads: HashSet<String>,
+    /// Last message timestamp visible to the user per thread. Android cannot mark
+    /// SMS read unless it is the default SMS app, so the desktop suppresses unread
+    /// badges only while the phone-reported latest message is not newer than this.
+    pub viewed_thread_timestamps: HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,7 +35,12 @@ impl MessagesState {
     pub fn apply_thread_list(&mut self, list: MessageThreadList) {
         self.threads = list.threads;
         for thread in &mut self.threads {
-            if self.viewed_threads.contains(&thread.thread_id) {
+            let latest = thread.timestamp_unix_ms.unwrap_or_default();
+            if self
+                .viewed_thread_timestamps
+                .get(&thread.thread_id)
+                .is_some_and(|seen| latest <= *seen)
+            {
                 thread.unread_count = 0;
             }
         }
@@ -44,6 +49,7 @@ impl MessagesState {
 
     pub fn apply_event(&mut self, event: MessageEvent) {
         let thread_id = event.thread_id.clone();
+        let body = event.body.clone();
         let entries = self.thread_messages.entry(thread_id.clone()).or_default();
         let entry = MessageEntry {
             message_id: format!("evt-{}-{}", thread_id, event.timestamp_unix_ms),
@@ -61,6 +67,17 @@ impl MessagesState {
             entries.push(entry);
             entries.sort_by_key(|e| e.timestamp_unix_ms);
         }
+        if self.active_thread.as_deref() == Some(thread_id.as_str()) {
+            self.viewed_thread_timestamps
+                .insert(thread_id.clone(), event.timestamp_unix_ms);
+            if let Some(thread) = self.threads.iter_mut().find(|t| t.thread_id == thread_id) {
+                thread.unread_count = 0;
+                thread.timestamp_unix_ms = Some(event.timestamp_unix_ms);
+                thread.last_message = Some(body);
+            }
+        } else {
+            self.viewed_thread_timestamps.remove(&thread_id);
+        }
     }
 
     pub fn apply_thread_detail(&mut self, detail: MessageThreadDetail) {
@@ -71,6 +88,22 @@ impl MessagesState {
         messages.sort_by_key(|m| m.timestamp_unix_ms);
         self.thread_messages
             .insert(detail.thread_id.clone(), messages);
+        if self.active_thread.as_deref() == Some(detail.thread_id.as_str()) {
+            let latest = self
+                .thread_messages
+                .get(&detail.thread_id)
+                .and_then(|messages| messages.iter().map(|m| m.timestamp_unix_ms).max())
+                .unwrap_or_default();
+            self.viewed_thread_timestamps
+                .insert(detail.thread_id.clone(), latest);
+            if let Some(thread) = self
+                .threads
+                .iter_mut()
+                .find(|t| t.thread_id == detail.thread_id)
+            {
+                thread.unread_count = 0;
+            }
+        }
         self.thread_detail_status
             .insert(detail.thread_id, detail.status);
     }
@@ -103,7 +136,19 @@ impl MessagesState {
 
     pub fn open_thread(&mut self, thread_id: String) -> Option<Payload> {
         self.active_thread = Some(thread_id.clone());
-        self.viewed_threads.insert(thread_id.clone());
+        let latest = self
+            .threads
+            .iter()
+            .find(|t| t.thread_id == thread_id)
+            .and_then(|t| t.timestamp_unix_ms)
+            .or_else(|| {
+                self.thread_messages
+                    .get(&thread_id)
+                    .and_then(|messages| messages.iter().map(|m| m.timestamp_unix_ms).max())
+            })
+            .unwrap_or_default();
+        self.viewed_thread_timestamps
+            .insert(thread_id.clone(), latest);
         if let Some(thread) = self.threads.iter_mut().find(|t| t.thread_id == thread_id) {
             thread.unread_count = 0;
         }
@@ -197,5 +242,70 @@ mod tests {
 
         assert_eq!(request.thread_id.as_deref(), Some("42"));
         assert!(request.recipients.is_empty());
+    }
+
+    #[test]
+    fn viewed_thread_does_not_hide_newer_unread_messages() {
+        let mut state = MessagesState::default();
+        state.apply_thread_list(MessageThreadList {
+            threads: vec![MessageThreadSummary {
+                thread_id: "42".to_owned(),
+                display_name: "Ada".to_owned(),
+                last_message: Some("old".to_owned()),
+                timestamp_unix_ms: Some(1_000),
+                unread_count: 3,
+            }],
+            status: FeatureStatus::available(androidconnect_protocol::UtilityFeature::Messages),
+        });
+
+        let _ = state.open_thread("42".to_owned());
+        state.close_thread();
+        state.apply_thread_list(MessageThreadList {
+            threads: vec![MessageThreadSummary {
+                thread_id: "42".to_owned(),
+                display_name: "Ada".to_owned(),
+                last_message: Some("new".to_owned()),
+                timestamp_unix_ms: Some(2_000),
+                unread_count: 1,
+            }],
+            status: FeatureStatus::available(androidconnect_protocol::UtilityFeature::Messages),
+        });
+
+        assert_eq!(state.threads[0].unread_count, 1);
+    }
+
+    #[test]
+    fn active_thread_event_stays_read_locally() {
+        let mut state = MessagesState {
+            threads: vec![MessageThreadSummary {
+                thread_id: "42".to_owned(),
+                display_name: "Ada".to_owned(),
+                last_message: Some("old".to_owned()),
+                timestamp_unix_ms: Some(1_000),
+                unread_count: 2,
+            }],
+            active_thread: Some("42".to_owned()),
+            ..MessagesState::default()
+        };
+
+        state.apply_event(MessageEvent {
+            thread_id: "42".to_owned(),
+            sender: "Ada".to_owned(),
+            body: "new".to_owned(),
+            timestamp_unix_ms: 2_000,
+            attachments: Vec::new(),
+        });
+        state.apply_thread_list(MessageThreadList {
+            threads: vec![MessageThreadSummary {
+                thread_id: "42".to_owned(),
+                display_name: "Ada".to_owned(),
+                last_message: Some("new".to_owned()),
+                timestamp_unix_ms: Some(2_000),
+                unread_count: 1,
+            }],
+            status: FeatureStatus::available(androidconnect_protocol::UtilityFeature::Messages),
+        });
+
+        assert_eq!(state.threads[0].unread_count, 0);
     }
 }

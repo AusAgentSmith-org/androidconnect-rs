@@ -6,7 +6,7 @@ use thiserror::Error;
 
 pub mod qr;
 
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
 pub const DEFAULT_CONTROL_PORT: u16 = 48172;
 pub const DEFAULT_VIDEO_PORT: u16 = 48173;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 256 * 1024;
@@ -85,6 +85,7 @@ pub enum Payload {
     ClientList(ClientList),
     ClientRoleUpdate(ClientRoleUpdate),
     MirrorRequest(MirrorRequest),
+    MirrorRequestResult(MirrorRequestResult),
     Ping { nonce: u64 },
     Pong { nonce: u64 },
     Error { message: String },
@@ -334,6 +335,12 @@ pub struct DeviceStatus {
     pub battery_percent: Option<u8>,
     pub charging: Option<bool>,
     pub interactive: Option<bool>,
+    #[serde(default)]
+    pub keep_awake_enabled: Option<bool>,
+    #[serde(default)]
+    pub connection_locks_held: Option<bool>,
+    #[serde(default)]
+    pub storage_root: Option<String>,
     pub features: Vec<FeatureStatus>,
     #[serde(default)]
     pub wifi_state: Option<WifiState>,
@@ -733,6 +740,22 @@ pub enum MessageSendResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MirrorRequest {
     pub request_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MirrorRequestResult {
+    pub request_id: String,
+    pub state: MirrorRequestState,
+    pub message: String,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MirrorRequestState {
+    Queued,
+    PromptShown,
+    Started,
+    Denied,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1240,6 +1263,9 @@ mod tests {
                 battery_percent: Some(86),
                 charging: Some(true),
                 interactive: Some(true),
+                keep_awake_enabled: Some(true),
+                connection_locks_held: Some(true),
+                storage_root: Some("Full external storage".to_owned()),
                 features: vec![
                     FeatureStatus::available(UtilityFeature::DeviceStatus),
                     FeatureStatus::permission_required(
@@ -1261,6 +1287,25 @@ mod tests {
         assert_eq!(decoded.sequence, 8);
         assert_eq!(decoded.payload, envelope.payload);
         assert!(UtilityFeature::mvp2_all().contains(&UtilityFeature::Storage));
+    }
+
+    #[test]
+    fn mirror_request_result_round_trips() {
+        let envelope = Envelope::new(
+            10,
+            Payload::MirrorRequestResult(MirrorRequestResult {
+                request_id: "mirror-1".to_owned(),
+                state: MirrorRequestState::Queued,
+                message: "Open AndroidConnect on your phone to approve mirroring.".to_owned(),
+            }),
+        );
+
+        let bytes = encode_envelope(&envelope).expect("encode");
+        let decoded = decode_envelope(&bytes).expect("decode");
+
+        assert_eq!(decoded.version, PROTOCOL_VERSION);
+        assert_eq!(decoded.sequence, 10);
+        assert_eq!(decoded.payload, envelope.payload);
     }
 
     #[test]

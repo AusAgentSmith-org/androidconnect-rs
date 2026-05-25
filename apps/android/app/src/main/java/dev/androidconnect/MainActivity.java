@@ -25,6 +25,8 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 public final class MainActivity extends Activity {
+    static final String ACTION_MIRROR_REQUEST = "dev.androidconnect.action.MIRROR_REQUEST";
+    static final String EXTRA_MIRROR_REQUEST_ID = "dev.androidconnect.extra.MIRROR_REQUEST_ID";
     private static final int REQUEST_MEDIA_PROJECTION = 1001;
     private static final int REQUEST_NOTIFICATIONS = 1002;
     private static final int REQUEST_PICK_FILE = 1003;
@@ -35,9 +37,11 @@ public final class MainActivity extends Activity {
     private static final long STATUS_REFRESH_MS = 1_000L;
 
     private TextView statusView;
+    private Button keepAwakeButton;
     private EditText hostField;
     private EditText portField;
     private EditText pairingField;
+    private String pendingMirrorRequestId;
     private final Handler statusHandler = new Handler(Looper.getMainLooper());
     private final NativeBridge.StatusListener nativeStatusListener =
             new NativeBridge.StatusListener() {
@@ -66,6 +70,7 @@ public final class MainActivity extends Activity {
         requestNotificationsIfNeeded();
         AndroidUtilityBridge.rememberContext(this);
         AndroidUtilityBridge.handleShareIntent(this, getIntent());
+        handleMirrorRequestIntent(getIntent());
         updateStatus();
     }
 
@@ -73,7 +78,7 @@ public final class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         NativeBridge.addStatusListener(nativeStatusListener);
-        NativeBridge.setMirrorRequestListener(this::requestScreenCapture);
+        NativeBridge.setMirrorRequestListener(this::requestScreenCaptureFromDesktop);
         AndroidUtilityBridge.rememberContext(this);
         updateStatus();
         statusHandler.removeCallbacks(statusRefresh);
@@ -93,6 +98,7 @@ public final class MainActivity extends Activity {
         super.onNewIntent(intent);
         setIntent(intent);
         AndroidUtilityBridge.handleShareIntent(this, intent);
+        handleMirrorRequestIntent(intent);
         updateStatus();
     }
 
@@ -159,6 +165,15 @@ public final class MainActivity extends Activity {
             updateStatus();
         });
         content.addView(disconnect, matchWrap());
+
+        keepAwakeButton = new Button(this);
+        keepAwakeButton.setOnClickListener(view -> {
+            NativeBridge.setKeepConnectionAwakeEnabled(
+                    !NativeBridge.isKeepConnectionAwakeEnabled());
+            AndroidUtilityBridge.pushDeviceStatus(this);
+            updateStatus();
+        });
+        content.addView(keepAwakeButton, matchWrap());
 
         Button start = new Button(this);
         start.setText(getString(R.string.start_mirroring));
@@ -323,10 +338,31 @@ public final class MainActivity extends Activity {
         connectDesktop();
     }
 
+    private void handleMirrorRequestIntent(Intent intent) {
+        if (intent == null || !ACTION_MIRROR_REQUEST.equals(intent.getAction())) {
+            return;
+        }
+        String requestId = intent.getStringExtra(EXTRA_MIRROR_REQUEST_ID);
+        NativeBridge.clearPendingMirrorRequest(requestId);
+        requestScreenCaptureFromDesktop(requestId);
+    }
+
+    private void requestScreenCaptureFromDesktop(String requestId) {
+        pendingMirrorRequestId = requestId;
+        requestScreenCapture();
+    }
+
     private void requestScreenCapture() {
         MediaProjectionManager manager =
                 (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
         if (manager == null) {
+            if (pendingMirrorRequestId != null) {
+                NativeBridge.pushMirrorRequestResult(
+                        pendingMirrorRequestId,
+                        "Unavailable",
+                        "MediaProjection is unavailable on this device.");
+                pendingMirrorRequestId = null;
+            }
             showError("MediaProjection is unavailable on this device.");
             return;
         }
@@ -351,6 +387,13 @@ public final class MainActivity extends Activity {
             return;
         }
         if (resultCode != RESULT_OK || data == null) {
+            if (pendingMirrorRequestId != null) {
+                NativeBridge.pushMirrorRequestResult(
+                        pendingMirrorRequestId,
+                        "Denied",
+                        "Screen capture was not approved on the phone.");
+                pendingMirrorRequestId = null;
+            }
             updateStatus();
             return;
         }
@@ -362,6 +405,13 @@ public final class MainActivity extends Activity {
             startForegroundService(service);
         } else {
             startService(service);
+        }
+        if (pendingMirrorRequestId != null) {
+            NativeBridge.pushMirrorRequestResult(
+                    pendingMirrorRequestId,
+                    "Started",
+                    "Screen mirroring is starting.");
+            pendingMirrorRequestId = null;
         }
         updateStatus();
     }
@@ -408,6 +458,11 @@ public final class MainActivity extends Activity {
 
         String status = buildStatusText();
         statusView.setText(prefix == null ? status : prefix + "\n" + status);
+        if (keepAwakeButton != null) {
+            keepAwakeButton.setText(NativeBridge.isKeepConnectionAwakeEnabled()
+                    ? "Keep connection awake: On"
+                    : "Keep connection awake: Off");
+        }
     }
 
     private String buildStatusText() {
@@ -487,6 +542,9 @@ public final class MainActivity extends Activity {
 
             status.append("\nInput service: ");
             status.append(inputState);
+            status.append("\nKeep awake: ");
+            status.append(NativeBridge.isKeepConnectionAwakeEnabled() ? "on" : "off");
+            status.append(NativeBridge.connectionLocksHeld() ? " (locks held)" : " (locks idle)");
             status.append("\nHeartbeat: ");
             status.append(receivedPings);
             status.append(" pings / ");
